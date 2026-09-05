@@ -1099,6 +1099,10 @@ impl CrossCountMismatch {
 /// optimization, which would otherwise resolve the hint and then discard it,
 /// silently comparing an index to itself; measured by the GH#213 reporter).
 /// Any disagreement is returned as a [`CrossCountMismatch`].
+/// All probes share a read snapshot: a writer committing between the table
+/// and index scans must not turn a healthy database into a corruption finding.
+/// A savepoint preserves an existing caller transaction and is released even
+/// if a query fails. It neither enables writes nor reserves a writer lock.
 ///
 /// Skipped, by design:
 /// - missing tables (fresh/partial schemas are not findings);
@@ -1114,6 +1118,20 @@ impl CrossCountMismatch {
 /// where table and indexes are mutually consistent but acknowledged rows are
 /// absent — only a client-side acknowledgement ledger sees that.
 pub fn index_table_cross_count(
+    conn: &impl crate::pool::SyncQuery,
+    tables: &[&str],
+) -> DbResult<Vec<CrossCountMismatch>> {
+    conn.execute_raw("SAVEPOINT am_integrity_cross_count")
+        .map_err(|error| DbError::Sqlite(format!("cross-count snapshot start failed: {error}")))?;
+    let result = index_table_cross_count_snapshot(conn, tables);
+    // Release only our savepoint, including on the error path. An enclosing
+    // transaction remains owned by the caller; never COMMIT or ROLLBACK it.
+    conn.execute_raw("RELEASE SAVEPOINT am_integrity_cross_count")
+        .map_err(|error| DbError::Sqlite(format!("cross-count snapshot release failed: {error}")))?;
+    result
+}
+
+fn index_table_cross_count_snapshot(
     conn: &impl crate::pool::SyncQuery,
     tables: &[&str],
 ) -> DbResult<Vec<CrossCountMismatch>> {
@@ -2063,6 +2081,187 @@ mod tests {
         assert!(
             mismatches.is_empty(),
             "healthy table must not report desync: {mismatches:?}"
+        );
+    }
+
+    /// Runs every query against the real reader, committing one real writer
+    /// insert after the table scan. No query results or errors are substituted.
+    struct CrossCountConcurrentInsert<'a, C> {
+        reader: &'a C,
+        writer: &'a C,
+        inserted: std::cell::Cell<bool>,
+    }
+
+    impl<C: crate::pool::SyncQuery> crate::pool::SyncQuery for CrossCountConcurrentInsert<'_, C> {
+        fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, sqlmodel_core::Error> {
+            let rows = self.reader.query_sync(sql, params)?;
+            if sql.contains("NOT INDEXED") && !self.inserted.replace(true) {
+                self.writer
+                    .execute_raw("INSERT INTO cc_race (name) VALUES ('committed-between-scans')")?;
+            }
+            Ok(rows)
+        }
+
+        fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+            self.reader.execute_raw(sql)
+        }
+    }
+
+    fn cross_count_concurrent_insert_is_not_corruption<C: crate::pool::SyncQuery>(
+        reader: &C,
+        writer: &C,
+    ) {
+        writer
+            .execute_raw("PRAGMA journal_mode=WAL")
+            .expect("enable concurrent WAL reads");
+        writer
+            .execute_raw("CREATE TABLE cc_race (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create real table");
+        writer
+            .execute_raw("CREATE INDEX idx_cc_race_name ON cc_race(name)")
+            .expect("create real index");
+        reader
+            .execute_raw("PRAGMA query_only=ON")
+            .expect("keep the observer query-only");
+        let scheduled = CrossCountConcurrentInsert {
+            reader,
+            writer,
+            inserted: std::cell::Cell::new(false),
+        };
+        let mismatches = index_table_cross_count(&scheduled, &["cc_race"])
+            .expect("cross-count concurrent real writer");
+        assert!(scheduled.inserted.get(), "the competing write must execute");
+        let durable = writer
+            .query_sync("SELECT count(*) AS c FROM cc_race", &[])
+            .expect("independent committed row witness");
+        assert_eq!(durable[0].get_named::<i64>("c").expect("row count"), 1);
+        assert!(
+            mismatches.is_empty(),
+            "a committed insert between probes is not corruption: {mismatches:?}"
+        );
+        // Ending the diagnostic snapshot must expose the committed row to the
+        // next observer query without making the observer writable.
+        let visible = reader
+            .query_sync("SELECT count(*) AS c FROM cc_race", &[])
+            .expect("read after diagnostic snapshot");
+        assert_eq!(visible[0].get_named::<i64>("c").expect("row count"), 1);
+        assert!(
+            reader
+                .execute_raw("INSERT INTO cc_race (name) VALUES ('forbidden-observer-write')")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cross_count_canonical_concurrent_insert_is_not_corruption() {
+        let directory = tempfile::tempdir().expect("retained canonical fixture").keep();
+        let path = directory.join("canonical-cross-count.sqlite3");
+        let writer = crate::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
+            .expect("open canonical writer");
+        let reader = crate::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
+            .expect("open canonical reader");
+        cross_count_concurrent_insert_is_not_corruption(&reader, &writer);
+    }
+
+    #[test]
+    fn cross_count_franken_concurrent_insert_is_not_corruption() {
+        let directory = tempfile::tempdir().expect("retained runtime fixture").keep();
+        let path = directory.join("franken-cross-count.sqlite3");
+        let writer = DbConn::open_file(path.to_string_lossy().as_ref()).expect("open runtime writer");
+        let reader = DbConn::open_file(path.to_string_lossy().as_ref()).expect("open runtime reader");
+        cross_count_concurrent_insert_is_not_corruption(&reader, &writer);
+    }
+
+    fn cross_count_preserves_caller_transaction(conn: &impl crate::pool::SyncQuery) {
+        conn.execute_raw("CREATE TABLE cc_scope (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create transaction fixture");
+        conn.execute_raw("CREATE INDEX idx_cc_scope_name ON cc_scope(name)")
+            .expect("create transaction fixture index");
+        conn.execute_raw("BEGIN").expect("begin caller transaction");
+        conn.execute_raw("INSERT INTO cc_scope (name) VALUES ('caller-owned')")
+            .expect("write uncommitted caller row");
+        assert!(
+            index_table_cross_count(conn, &["cc_scope"])
+                .expect("probe inside caller transaction")
+                .is_empty()
+        );
+        conn.execute_raw("ROLLBACK")
+            .expect("caller still owns its transaction");
+        let rows = conn
+            .query_sync("SELECT count(*) AS c FROM cc_scope", &[])
+            .expect("read rolled-back caller state");
+        assert_eq!(rows[0].get_named::<i64>("c").expect("row count"), 0);
+    }
+
+    #[test]
+    fn cross_count_canonical_preserves_caller_transaction() {
+        cross_count_preserves_caller_transaction(
+            &crate::CanonicalDbConn::open_memory().expect("canonical transaction fixture"),
+        );
+    }
+
+    #[test]
+    fn cross_count_franken_preserves_caller_transaction() {
+        cross_count_preserves_caller_transaction(
+            &DbConn::open_memory().expect("runtime transaction fixture"),
+        );
+    }
+
+    /// Exercise cleanup with a real SQL query error, rather than a synthetic
+    /// error value. All transaction control is still delegated unchanged.
+    struct CrossCountQueryError<'a, C>(&'a C);
+
+    impl<C: crate::pool::SyncQuery> crate::pool::SyncQuery for CrossCountQueryError<'_, C> {
+        fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, sqlmodel_core::Error> {
+            if sql.contains("NOT INDEXED") {
+                self.0
+                    .query_sync("SELECT missing FROM nonexistent_cross_count_fixture", &[])
+            } else {
+                self.0.query_sync(sql, params)
+            }
+        }
+
+        fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+            self.0.execute_raw(sql)
+        }
+    }
+
+    fn cross_count_releases_snapshot_after_query_error(conn: &impl crate::pool::SyncQuery) {
+        conn.execute_raw("CREATE TABLE cc_error (id INTEGER PRIMARY KEY)")
+            .expect("create real query-error fixture");
+        let error = index_table_cross_count(&CrossCountQueryError(conn), &["cc_error"])
+            .expect_err("actual engine error must propagate");
+        assert!(error.to_string().contains("NOT INDEXED scan of cc_error failed"));
+        conn.execute_raw("BEGIN")
+            .expect("diagnostic must release its snapshot on error");
+        conn.execute_raw("INSERT INTO cc_error (id) VALUES (1)")
+            .expect("write caller transaction");
+        index_table_cross_count(&CrossCountQueryError(conn), &["cc_error"])
+            .expect_err("nested diagnostic query error");
+        conn.execute_raw("ROLLBACK")
+            .expect("nested diagnostic must leave caller transaction open");
+        let rows = conn
+            .query_sync("SELECT count(*) AS c FROM cc_error", &[])
+            .expect("read rollback witness");
+        assert_eq!(rows[0].get_named::<i64>("c").expect("row count"), 0);
+        assert!(
+            index_table_cross_count(conn, &["cc_error"])
+                .expect("connection remains usable after diagnostic errors")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cross_count_canonical_releases_snapshot_after_query_error() {
+        cross_count_releases_snapshot_after_query_error(
+            &crate::CanonicalDbConn::open_memory().expect("canonical error fixture"),
+        );
+    }
+
+    #[test]
+    fn cross_count_franken_releases_snapshot_after_query_error() {
+        cross_count_releases_snapshot_after_query_error(
+            &DbConn::open_memory().expect("runtime error fixture"),
         );
     }
 
