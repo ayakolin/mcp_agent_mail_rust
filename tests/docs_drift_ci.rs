@@ -859,7 +859,7 @@ mod dist_release_contract {
         require_once(workflow, &format!("BEADS_RUST_COMMIT: {BEADS_RUST_COMMIT}"))?;
         require_exactly(
             workflow,
-            "# Cargo.lock resolves beads_rust 0.5.4, so the workspace patch",
+            "# Retain this pin for the installer's source-receipt contract.",
             3,
         )?;
         require_exactly(

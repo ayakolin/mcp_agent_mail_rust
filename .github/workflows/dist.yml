@@ -143,8 +143,8 @@ jobs:
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
-          # Cargo.lock resolves beads_rust 0.5.4, so the workspace patch
-          # requires this pinned sibling checkout to remain on version 0.5.4.
+          # Retain this pin for the installer's source-receipt contract.
+          # Compiled beads_rust resolves from the registry via Cargo.lock.
           checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install system dependencies
@@ -214,8 +214,8 @@ jobs:
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
-          # Cargo.lock resolves beads_rust 0.5.4, so the workspace patch
-          # requires this pinned sibling checkout to remain on version 0.5.4.
+          # Retain this pin for the installer's source-receipt contract.
+          # Compiled beads_rust resolves from the registry via Cargo.lock.
           checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install system dependencies
@@ -300,8 +300,8 @@ jobs:
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
-          # Cargo.lock resolves beads_rust 0.5.4, so the workspace patch
-          # requires this pinned sibling checkout to remain on version 0.5.4.
+          # Retain this pin for the installer's source-receipt contract.
+          # Compiled beads_rust resolves from the registry via Cargo.lock.
           checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install pinned Rust toolchain
