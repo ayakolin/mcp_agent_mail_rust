@@ -1,5 +1,14 @@
 # MCP Agent Mail (Rust)
 
+> **Fork additions — ayakolin:** This fork includes optional automatic-wake
+> integrations for **OMP, Codex, Claude Code, and Kimi Code**. Agent Mail stores
+> the messages; the adapters deliver new mail into the corresponding live sessions.
+> See the [中文 fork 说明](README.zh-CN.md),
+> [integration README](integrations/agent-mail-wake/README.md), and
+> [installation instructions](integrations/agent-mail-wake/README.zh-CN.md).
+> The upstream installer below installs Agent Mail itself; the wake integrations
+> have a separate installer. Grok Build automatic wake is not implemented.
+
 <div align="center">
   <img src="docs/assets/am_illustration.webp" alt="MCP Agent Mail - A mail-like coordination layer for AI coding agents">
 </div>

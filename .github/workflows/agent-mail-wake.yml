@@ -1,0 +1,33 @@
+name: Agent Mail Wake integrations
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'integrations/agent-mail-wake/**'
+      - '.github/workflows/agent-mail-wake.yml'
+  pull_request:
+    paths:
+      - 'integrations/agent-mail-wake/**'
+      - '.github/workflows/agent-mail-wake.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Test watcher, adapters and installer
+        run: node --test integrations/agent-mail-wake/test/*.test.mjs
+      - name: Check module syntax
+        run: |
+          for file in integrations/agent-mail-wake/*.mjs; do
+            node --check "$file"
+          done

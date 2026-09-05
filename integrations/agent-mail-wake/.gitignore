@@ -1,0 +1,16 @@
+# Runtime data belongs in the user data directory, never in source control.
+state/
+bindings/
+logs/
+backups/
+test-state/
+node_modules/
+*.log
+*.token
+*.lock
+*.tmp
+*-test-result.json
+*-events-result.json
+verification.json
+install-backup.txt
+.env*

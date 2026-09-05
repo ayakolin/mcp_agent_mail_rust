@@ -1,0 +1,9 @@
+{
+  "name": "agent-mail-wake-integrations",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional OMP, Codex, Claude Code and Kimi Code wake adapters for MCP Agent Mail",
+  "engines": { "node": ">=24" },
+  "scripts": { "test": "node --test test/*.test.mjs" }
+}
