@@ -273,6 +273,9 @@ fn error_code_catalog_is_stable() {
         "INVALID_PROJECT_KEY",
         "INVALID_THREAD_ID",
         "INVALID_TIMESTAMP",
+        // GH#310 caller tmux server: a present-but-malformed
+        // `tmux_socket_path` argument is a typed argument refusal.
+        "INVALID_TMUX_SOCKET_PATH",
         // GH#259 durable message topics: malformed `topic` values are a
         // typed argument refusal.
         "INVALID_TOPIC",
