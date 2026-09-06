@@ -104,7 +104,9 @@ Kimi 适配器管理 Web/API 会话，不会同时接管另一个正在运行的
 ## 默认行为和控制
 
 - 每 3 秒检查收件事件，每批最多合并 5 条；检查本身不调用模型。
-- OMP、Codex、Kimi 等待会话可接收后提交；Claude 由 Channels 原生机制投递。
+- OMP、Kimi 等待会话可接收后提交；Codex 通过 `turn/steer` 把邮件直接插入正在进行的
+  回合，无需等待当前回合结束（仅当会话处于错误状态、或正处于不可转向的
+  review/compact 回合时才等待）；Claude 由 Channels 原生机制投递。
 - 持久保存已处理游标和待投递批次，使用 delivery cursor，不使用 message_id 作为游标。
 - 网络失败保留待处理批次；游标缺口会暂停，不会静默跳过历史。
 - 连续 8 批自动唤醒后暂停；显式恢复会清零计数。OMP 正常用户输入会重置尚未暂停会话的计数。
@@ -150,7 +152,8 @@ Agent Mail 主服务独立运行，不受启动器退出影响。
 
 ## 投递保证与限制
 
-Codex 查询会话历史、Kimi 使用稳定的 `prompt_id`、Grok 在启动器本地绑定账簿中记录已受理
+Codex 查询会话历史（转向投递的批次还会在生成的用户消息上携带 `clientUserMessageId` 批次 ID）、
+Kimi 使用稳定的 `prompt_id`、Grok 在启动器本地绑定账簿中记录已受理
 批次 ID、OpenCode 扫描会话历史中的投递标记、OMP 查询自定义消息记录来减少重试重复。
 这些措施不保证 Agent 执行工具的 exactly-once 语义。
 Claude Channel 的成功表示通知已写入 MCP 通道；崩溃发生在这个边界时，唤醒可能重复或遗漏一次，

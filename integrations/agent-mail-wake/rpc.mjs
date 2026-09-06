@@ -15,7 +15,11 @@ export class CodexRPC extends EventEmitter {
       let message; try { message = JSON.parse(event.data); } catch { return; }
       if (message.id !== undefined && this.pending.has(message.id) && !message.method) {
         const p = this.pending.get(message.id); this.pending.delete(message.id); clearTimeout(p.timeout);
-        message.error ? p.reject(new Error(message.error.message)) : p.resolve(message.result);
+        if (message.error) {
+          const error = new Error(message.error.message);
+          error.code = message.error.code; error.data = message.error.data;
+          p.reject(error);
+        } else p.resolve(message.result);
       } else if (message.method) this.emit('notification', message);
     });
     this.ws.addEventListener('close', () => {
@@ -41,17 +45,51 @@ export class CodexRPC extends EventEmitter {
 }
 
 export class CodexAdapter {
-  constructor(rpc, session) { this.rpc = rpc; this.session = session; this.busy = false; }
+  constructor(rpc, session) { this.rpc = rpc; this.session = session; }
+  async readThread(includeTurns) {
+    const { thread } = await this.rpc.request('thread/read', { threadId: this.session, includeTurns });
+    return thread;
+  }
   async canDeliver() {
-    const { thread } = await this.rpc.request('thread/read', { threadId: this.session, includeTurns: false });
-    return !['active', 'systemError'].includes(thread.status?.type);
+    const thread = await this.readThread(false);
+    // An active turn accepts steered input (turn/steer), so mail is deliverable
+    // mid-conversation instead of waiting for the turn to finish. Only error
+    // and unloaded states block delivery.
+    return !['systemError', 'notLoaded'].includes(thread.status?.type);
   }
   async deliver(text, batch) {
+    const marker = `[Agent Mail delivery ${batch.id}]`;
+    const delivered = thread => JSON.stringify(thread.turns || []).includes(marker);
     // Recover an accepted turn after a watcher restart without appending the same batch again.
-    const { thread } = await this.rpc.request('thread/read', { threadId: this.session, includeTurns: true });
-    if (JSON.stringify(thread.turns || []).includes(`[Agent Mail delivery ${batch.id}]`)) return;
-    if (thread.status?.type === 'active') throw new Error('Codex became busy; delivery remains pending');
-    await this.rpc.request('turn/start', { threadId: this.session, input: [{ type: 'text', text }] });
+    let thread = await this.readThread(true);
+    if (delivered(thread)) return;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const status = thread.status?.type;
+      if (status === 'idle') {
+        await this.rpc.request('turn/start', { threadId: this.session, input: [{ type: 'text', text }] });
+        return;
+      }
+      if (status === 'active') {
+        const turn = (thread.turns || []).find(candidate => candidate.status === 'inProgress');
+        if (!turn) throw new Error('Codex active turn is not steerable yet; delivery remains pending');
+        try {
+          await this.rpc.request('turn/steer', { threadId: this.session, clientUserMessageId: batch.id,
+            input: [{ type: 'text', text }], expectedTurnId: turn.id });
+          return;
+        } catch (error) {
+          // The active turn completed or rotated between the read and the steer
+          // ("no active turn to steer" / turn-id mismatch). Re-read once: start a
+          // fresh turn when the thread went idle, retry the steer when a different
+          // turn is now active, and re-check the marker in case the steered item
+          // materialized before the failure surfaced.
+          thread = await this.readThread(true);
+          if (delivered(thread)) return;
+        }
+        continue;
+      }
+      throw new Error(`Codex thread is ${status || 'unavailable'}; delivery remains pending`);
+    }
+    throw new Error('Codex turn state kept changing; delivery remains pending');
   }
 }
 

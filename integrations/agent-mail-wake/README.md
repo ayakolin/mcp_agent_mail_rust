@@ -94,16 +94,22 @@ when the turn completes (`--session ID` reuses a stored session).
 Default polling is 3 seconds, with at most 5 events per batch and a pause after 8
 automatic deliveries. The polling itself does not invoke a model. Configure with
 `AGENT_MAIL_WAKE_INTERVAL_MS` and `AGENT_MAIL_WAKE_MAX_TURNS`.
+Codex deliveries steer into an active turn (`turn/steer`): incoming mail is
+injected into the running conversation within one poll interval instead of
+waiting for the current turn to finish. Only threads in an error state (or a
+brief non-steerable review/compact turn) still defer delivery.
 See the Chinese guide for full session-resume commands and lifecycle details.
 
 ## Persistence and delivery limits
 
 The watcher stores a delivery cursor and pending batch before submission. It
 advances the cursor only after the receiving adapter accepts the batch. Codex
-checks thread history, Kimi uses a stable `prompt_id`, Grok records accepted batch
-IDs in its launcher-local binding ledger, OpenCode scans its session history for
-the delivery marker, and OMP checks custom-message records when reconciling
-retries. A cursor gap pauses instead of skipping history.
+checks thread history (steered batches also carry the batch ID as
+`clientUserMessageId` on the materialized user message), Kimi uses a stable
+`prompt_id`, Grok records accepted batch IDs in its launcher-local binding
+ledger, OpenCode scans its session history for the delivery marker, and OMP
+checks custom-message records when reconciling retries. A cursor gap pauses
+instead of skipping history.
 These mechanisms do not provide exactly-once execution of an agent's tools.
 
 Claude Channel success means the notification was written to MCP, not that the

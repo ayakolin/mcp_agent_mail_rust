@@ -44,6 +44,35 @@ mail, and the woken agent fetched its inbox and replied through the
 marker). `POST /session/:id/message` blocks until the turn completes, so no SSE
 event stream is required by the adapter.
 
+## Codex mid-turn steer delivery (2026-09-07)
+
+The Codex adapter previously refused delivery while a turn was active, so mail
+waited for the whole turn. It now injects into the running turn via the App
+Server's `turn/steer`. Verified live against Codex 0.153.4
+(`codex app-server --listen ws://127.0.0.1:PORT`, `experimentalApi` negotiated):
+
+- `turn/steer` on an active turn with the correct `expectedTurnId` is accepted
+  (`{"turnId": ...}`); the steered text materializes as a `userMessage` inside
+  the same turn and the model reacts to it within that turn (observed markers:
+  `STEERED-OK`, `MID-TURN-SEEN`, `VIA-START`).
+- `turn/steer` on an idle thread fails with `no active turn to steer`; a stale
+  `expectedTurnId` fails with a mismatch naming the currently active turn. The
+  adapter re-reads once on steer failure and falls back to `turn/start` when the
+  thread went idle.
+- `clientUserMessageId` is persisted on the materialized item (`clientId`) but
+  is NOT deduplicated server-side: a duplicate steer lands twice. Delivery
+  remains at-least-once; the durable pending batch plus the
+  `[Agent Mail delivery <id>]` marker reconcile watcher restarts.
+- End to end: with a long essay turn running, mail sent to the watcher's
+  mailbox was steered into the active turn ~0.6 s after `send_message`
+  (poll interval 1 s in the probe), inside the same turn; the delivery cursor
+  advanced only after the steer was accepted.
+
+`thread/read` on an active thread does not expose a steered message in `turns`
+until the model consumes it, so a steer accepted immediately before a watcher
+crash can be re-steered once on restart; the batch prompt instructs the model
+to process each message once.
+
 ## Fork packaging checks
 
 The fork preserves the original adapter sources and makes a small packaging
