@@ -130,6 +130,51 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **The reservation parity fixer reconciles the artifact the detector flagged,
+  never prior-generation history (GH#311).** `am doctor fix --only
+  fm-db-state-files-reservation-db-archive-parity` resolved the archive
+  artifact to rewrite with the generation-blind `find_reservation_artifact`,
+  which prefers *any* `id-<id>-g<generation>.json` — including debris from a
+  superseded DB generation that the detector had explicitly excluded from
+  comparison. With a released live row, a stale legacy `id-<id>.json` and a
+  foreign-generation artifact sharing the id, one pass rewrote the foreign
+  artifact's `released_ts` representation, left the legacy artifact unchanged
+  and reported `actions_taken: 1` while the drift persisted. The parity report
+  now carries the `live_generation` the detector attributed artifacts against,
+  and the fixer (release rewrite and GH#167 collision quarantine alike)
+  resolves through the new generation-aware
+  `find_reservation_artifact_for_generation`: current-generation or legacy
+  artifact only, foreign artifacts left byte-identical, and an explicit skip
+  when the flagged file cannot be identified unambiguously (an unseeded
+  generation with several stamped candidates). A legacy-named artifact whose
+  embedded `db_generation` is foreign is refused the same way. Regression
+  coverage: released row + stale legacy + foreign stamped id → only the legacy
+  artifact changes, the foreign bytes are identical, and the second detector
+  pass is clean.
+- **`am doctor fix --only <fm-id>` exits with the envelope's `exit_code`
+  (GH#311).** The JSON envelope already reported `ok: false, exit_code: 1`
+  when findings survived the fix, but the process exited 0, so shell callers
+  had to parse the JSON to notice. The process now exits `1`
+  (`findings_present_no_fix`: findings remain, nothing mutated) or `2`
+  (`fix_partial`: actions taken, findings remain) per the published
+  `am doctor capabilities` exit table; `--dry-run` and a clean post-fix
+  detection still exit 0. Documented in `--help` and the robot handbook.
+- **Pane identity lookups run on the caller's tmux server, not the daemon's
+  (GH#310).** tmux pane ids are only unique per server. The `am` CLI sent only
+  `X-Tmux-Pane: %N` and the `serve-http` daemon queried `%N` on its own
+  ambient tmux, so a caller under a different server (a `-L`/`-S` socket, an
+  orchestrator's private tmux) whose `%N` collided with a pane on the daemon's
+  server got a *verified* identity binding for the wrong pane; a
+  non-colliding id merely degraded to `legacy-unverified`. The CLI now also
+  sends `X-Tmux-Socket` (the first `$TMUX` field, validated to an absolute,
+  bounded, CR/LF/NUL-free path — malformed values omit the header rather than
+  failing the request), the daemon validates it and injects it as the
+  transport-owned `tmux_socket_path` argument of the identity tools (any
+  body-supplied value is discarded over HTTP), and every pane-facts query —
+  registration, `macro_start_session` reuse, lifecycle authentication,
+  `resolve_pane_identity`, bare/composite normalization and the GH#252
+  live-holder check — runs `tmux -S <socket>` when present. Without `$TMUX`
+  nothing changes.
 - **Canonical schema init no longer fails on a pre-v27/v28 database.** The
   CLI ran the whole base DDL blob before migrations, so on a Python-era or
   pre-v27/v28 mailbox it created `idx_messages_project_topic` and

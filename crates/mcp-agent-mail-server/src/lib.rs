@@ -16759,6 +16759,28 @@ fn tmux_pane_header(req: &Http1Request) -> Option<String> {
         })
 }
 
+/// The JSON argument the daemon fills from a trusted `X-Tmux-Socket` header.
+///
+/// tmux pane ids are only unique per tmux server, so a `%N` from the
+/// `X-Tmux-Pane` header can only be looked up correctly on the *caller's*
+/// server (GH#310). Over HTTP this argument is transport-derived: any value
+/// present in the JSON body is discarded and replaced by the validated header
+/// (or removed when the header is absent), so a client can never point the
+/// daemon's `tmux -S` at a socket its own environment did not vouch for.
+const TMUX_SOCKET_PATH_ARG: &str = "tmux_socket_path";
+
+/// The caller's tmux server socket from the `X-Tmux-Socket` header, or `None`
+/// when absent or malformed (relative, over-long, control characters). Like
+/// `tmux_pane_header`, an untrusted value is ignored rather than injected: the
+/// call then proceeds exactly as a request from a CLI that predates the
+/// header.
+fn tmux_socket_header(req: &Http1Request) -> Option<String> {
+    req.headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-tmux-socket"))
+        .find_map(|(_, value)| mcp_agent_mail_core::validate_tmux_socket_path(value).ok())
+}
+
 fn accepts_pane_id_header(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -16776,9 +16798,8 @@ fn inject_tmux_pane_header(mut request: JsonRpcRequest, req: &Http1Request) -> J
     if request.method != "tools/call" {
         return request;
     }
-    let Some(pane_id) = tmux_pane_header(req) else {
-        return request;
-    };
+    let pane_id = tmux_pane_header(req);
+    let socket_path = tmux_socket_header(req);
     let Some(params) = request
         .params
         .as_mut()
@@ -16790,6 +16811,19 @@ fn inject_tmux_pane_header(mut request: JsonRpcRequest, req: &Http1Request) -> J
         return request;
     };
     if !accepts_pane_id_header(tool_name) {
+        return request;
+    }
+
+    if pane_id.is_none() && socket_path.is_none() {
+        // No trusted transport context: nothing to inject. The body may still
+        // not name a socket for the daemon to dial (GH#310) — strip it and
+        // otherwise leave the arguments exactly as sent.
+        if let Some(args) = params
+            .get_mut("arguments")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            args.remove(TMUX_SOCKET_PATH_ARG);
+        }
         return request;
     }
 
@@ -16807,8 +16841,19 @@ fn inject_tmux_pane_header(mut request: JsonRpcRequest, req: &Http1Request) -> J
         .get("pane_id")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|value| !value.trim().is_empty());
-    if !caller_supplied_pane {
+    if let Some(pane_id) = pane_id
+        && !caller_supplied_pane
+    {
         args.insert("pane_id".to_string(), serde_json::Value::String(pane_id));
+    }
+    // GH#310: the socket is owned by the transport. Whatever the body said is
+    // dropped; the validated header (if any) is the only source.
+    args.remove(TMUX_SOCKET_PATH_ARG);
+    if let Some(socket_path) = socket_path {
+        args.insert(
+            TMUX_SOCKET_PATH_ARG.to_string(),
+            serde_json::Value::String(socket_path),
+        );
     }
     request
 }
@@ -20943,6 +20988,177 @@ first body
 
         let injected = inject_tmux_pane_header(json_rpc, &req);
         assert_eq!(injected_pane_id(&injected), Some("%23"));
+    }
+
+    fn injected_tmux_socket_path(request: &JsonRpcRequest) -> Option<&str> {
+        request
+            .params
+            .as_ref()?
+            .get("arguments")?
+            .get(TMUX_SOCKET_PATH_ARG)?
+            .as_str()
+    }
+
+    fn identity_call(arguments: serde_json::Value) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "register_agent",
+                "arguments": arguments,
+            })),
+            1,
+        )
+    }
+
+    #[test]
+    fn x_tmux_socket_header_is_injected_alongside_the_pane() {
+        // GH#310: the caller's tmux server travels with its pane id, so the
+        // daemon asks `tmux -S <caller socket>` about `%23` instead of its own
+        // ambient server.
+        let req = make_request(
+            Http1Method::Post,
+            "/mcp/",
+            &[
+                ("X-Tmux-Pane", "%23"),
+                ("X-Tmux-Socket", "  /tmp/tmux-1000/ntm  "),
+            ],
+        );
+        let injected = inject_tmux_pane_header(
+            identity_call(serde_json::json!({"project_key": "/tmp/project"})),
+            &req,
+        );
+        assert_eq!(injected_pane_id(&injected), Some("%23"));
+        assert_eq!(
+            injected_tmux_socket_path(&injected),
+            Some("/tmp/tmux-1000/ntm"),
+            "validated header value is trimmed and injected"
+        );
+    }
+
+    #[test]
+    fn x_tmux_socket_header_overrides_a_body_supplied_socket() {
+        // The socket is transport-owned: a body value never survives, whether
+        // a trusted header replaces it or no header exists at all.
+        let with_header = make_request(
+            Http1Method::Post,
+            "/mcp/",
+            &[
+                ("X-Tmux-Pane", "%23"),
+                ("X-Tmux-Socket", "/tmp/tmux-1000/real"),
+            ],
+        );
+        let injected = inject_tmux_pane_header(
+            identity_call(serde_json::json!({
+                "project_key": "/tmp/project",
+                "tmux_socket_path": "/tmp/tmux-1000/forged"
+            })),
+            &with_header,
+        );
+        assert_eq!(
+            injected_tmux_socket_path(&injected),
+            Some("/tmp/tmux-1000/real")
+        );
+
+        for headers in [
+            &[][..],
+            &[("X-Tmux-Pane", "%23")][..],
+            &[("X-Tmux-Socket", "relative/socket")][..],
+        ] {
+            let req = make_request(Http1Method::Post, "/mcp/", headers);
+            let injected = inject_tmux_pane_header(
+                identity_call(serde_json::json!({
+                    "project_key": "/tmp/project",
+                    "pane_id": "%23",
+                    "tmux_socket_path": "/tmp/tmux-1000/forged"
+                })),
+                &req,
+            );
+            assert_eq!(
+                injected_tmux_socket_path(&injected),
+                None,
+                "body socket must be stripped over HTTP (headers={headers:?})"
+            );
+            assert_eq!(
+                injected_pane_id(&injected),
+                Some("%23"),
+                "the caller's explicit pane id is left alone (headers={headers:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn x_tmux_socket_header_ignores_untrusted_values() {
+        let too_long = format!("/{}", "x".repeat(2000));
+        for value in [
+            "relative/socket",
+            "",
+            "   ",
+            "/tmp/ok\r\nX-Injected: 1",
+            "/tmp/nul\0byte",
+            too_long.as_str(),
+        ] {
+            let req = make_request(
+                Http1Method::Post,
+                "/mcp/",
+                &[("X-Tmux-Pane", "%23"), ("X-Tmux-Socket", value)],
+            );
+            let injected = inject_tmux_pane_header(
+                identity_call(serde_json::json!({"project_key": "/tmp/project"})),
+                &req,
+            );
+            assert_eq!(
+                injected_tmux_socket_path(&injected),
+                None,
+                "untrusted X-Tmux-Socket value was injected: {value:?}"
+            );
+            // The pane header is independent: it still lands (legacy path).
+            assert_eq!(injected_pane_id(&injected), Some("%23"));
+        }
+    }
+
+    #[test]
+    fn x_tmux_socket_header_first_trusted_value_wins() {
+        let req = make_request(
+            Http1Method::Post,
+            "/mcp/",
+            &[
+                ("X-Tmux-Pane", "%23"),
+                ("X-Tmux-Socket", "not/absolute"),
+                ("X-Tmux-Socket", "/tmp/tmux-1000/first"),
+                ("X-Tmux-Socket", "/tmp/tmux-1000/second"),
+            ],
+        );
+        let injected = inject_tmux_pane_header(
+            identity_call(serde_json::json!({"project_key": "/tmp/project"})),
+            &req,
+        );
+        assert_eq!(
+            injected_tmux_socket_path(&injected),
+            Some("/tmp/tmux-1000/first")
+        );
+    }
+
+    #[test]
+    fn x_tmux_socket_header_is_ignored_for_non_identity_tools() {
+        let req = make_request(
+            Http1Method::Post,
+            "/mcp/",
+            &[
+                ("X-Tmux-Pane", "%23"),
+                ("X-Tmux-Socket", "/tmp/tmux-1000/ntm"),
+            ],
+        );
+        let json_rpc = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "send_message",
+                "arguments": {"project_key": "/tmp/project"}
+            })),
+            1,
+        );
+        let injected = inject_tmux_pane_header(json_rpc, &req);
+        assert_eq!(injected_pane_id(&injected), None);
+        assert_eq!(injected_tmux_socket_path(&injected), None);
     }
 
     #[test]

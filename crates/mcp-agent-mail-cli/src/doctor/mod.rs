@@ -770,8 +770,11 @@ pub fn handle_fixers(format: Option<CliOutputFormat>) -> CliResult<()> {
 /// `Config::from_env()` + cwd + the operator's well-known config dirs,
 /// scaffolds a `.doctor/runs/<run-id>/` directory, runs the dispatcher,
 /// and emits a JSON envelope to stdout. Exit codes follow the doctor
-/// contract: 0 (ok), 3 (mutate failed), 4 (refused unsafe / out-of-scope),
-/// 64 (unknown id or missing required input).
+/// contract and always equal the envelope's `exit_code`: 0 (clean after
+/// the fix, or `--dry-run`), 1 (findings remain and nothing was mutated),
+/// 2 (actions taken but findings remain — partial fix), 3 (mutate failed),
+/// 4 (refused unsafe / out-of-scope), 64 (unknown id or missing required
+/// input).
 pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> CliResult<()> {
     use std::sync::Mutex;
     use std::time::Instant;
@@ -957,27 +960,34 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         .unwrap_or(outcome.findings_count);
 
     // Pass-34D fresh-eyes (Codex F5): decouple "the command
-    // succeeded" from "no findings remain." Three cases:
+    // succeeded" from "no findings remain." Four cases, using the
+    // exit-code table published by `am doctor capabilities`:
     //
     // 1. `--dry-run`: the dry-run itself is the success
     //    condition. Remaining findings are *expected* (the
     //    chokepoint didn't mutate anything). exit_code 0.
     //
-    // 2. detect-only FM (spec.auto_fixable == false): the FM
-    //    can never repair itself; findings remaining is a
-    //    "needs operator action" signal, not a command
-    //    failure. We surface exit_code 1 IFF findings exist
-    //    (matches `am doctor`'s legacy "findings = 1"
-    //    convention), exit_code 0 if clean.
+    // 2. Nothing was mutated and findings remain (a detect-only
+    //    FM, or an auto-fixable FM that skipped every action as
+    //    ambiguous): "needs operator action", not a command
+    //    failure. exit_code 1 = `findings_present_no_fix`
+    //    (matches `am doctor check`'s "findings = 1" convention).
     //
-    // 3. auto-fixable FM with --fix: succeed iff no findings
-    //    remain after the fix.
-    let exit_code: i32 = if dry_run {
+    // 3. Actions were taken but findings remain after the
+    //    post-fix detection: exit_code 2 = `fix_partial`.
+    //
+    // 4. Clean after the fix (or clean to begin with): 0.
+    //
+    // The process exits with this same code (GH#311): previously
+    // the envelope reported `ok: false, exit_code: 1` while the
+    // process exited 0, so shell callers had to parse the JSON to
+    // notice that drift survived the fix.
+    let exit_code: i32 = if dry_run || remaining_findings == 0 {
         0
-    } else if remaining_findings > 0 {
-        1
+    } else if actions_taken > 0 {
+        2
     } else {
-        0
+        1
     };
     let ok = exit_code == 0;
 
@@ -1040,7 +1050,12 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         serde_json::to_string_pretty(&envelope)
             .map_err(|e| CliError::Other(format!("serializing fix-only envelope: {e}")))?
     );
-    Ok(())
+    if exit_code == 0 {
+        Ok(())
+    } else {
+        // Envelope already printed; `CliError::ExitCode` is silent on stderr.
+        Err(CliError::ExitCode(exit_code))
+    }
 }
 
 /// Summary returned to the legacy `archive-normalize` verb after it routes the
@@ -3711,6 +3726,7 @@ mod tests {
             schema_version:
                 mcp_agent_mail_tools::reservation_parity::RESERVATION_PARITY_SCHEMA_VERSION,
             ok: false,
+            live_generation: None,
             db_reservations: 2,
             archive_reservations: 0,
             drift: mcp_agent_mail_tools::reservation_parity::ReservationParityDriftSummary {
@@ -3729,6 +3745,7 @@ mod tests {
             schema_version:
                 mcp_agent_mail_tools::reservation_parity::RESERVATION_PARITY_SCHEMA_VERSION,
             ok: false,
+            live_generation: None,
             db_reservations: 1,
             archive_reservations: 1,
             drift: mcp_agent_mail_tools::reservation_parity::ReservationParityDriftSummary {

@@ -210,12 +210,9 @@ inherits = "release"     # Benchmarks use same optimizations as release
 #   cleanup trigger fired, so those eight patch lines are gone too.
 # - fastmcp family resolves from crates.io (0.7.1).
 #
-# beads_rust 0.5.4 stays path-patched to the ../beads_rust checkout because
-# that release is not published yet. Keep the requirement, lockfile, sibling
-# checkout, and dist workflow's exact source commit in lockstep; Cargo ignores
-# a patch whose package version does not satisfy the declared requirement.
-# Cleanup trigger: beads_rust 0.5.x published to crates.io.
-beads_rust = { path = "../beads_rust" }
+# beads_rust =0.5.4 is published and resolves from crates.io. Do not patch it
+# to a mutable sibling: even an unused patch adds that checkout to remote
+# source discovery, and a matching sibling version changes locked resolution.
 # ftui 0.5.0, franken-agent-detection 0.2.2, and tru 0.2.3 resolve from
 # crates.io. Their former path patches made builds depend on whatever state
 # each machine's sibling checkout happened to be in.

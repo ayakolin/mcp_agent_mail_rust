@@ -273,6 +273,9 @@ fn error_code_catalog_is_stable() {
         "INVALID_PROJECT_KEY",
         "INVALID_THREAD_ID",
         "INVALID_TIMESTAMP",
+        // GH#310 caller tmux server: a present-but-malformed
+        // `tmux_socket_path` argument is a typed argument refusal.
+        "INVALID_TMUX_SOCKET_PATH",
         // GH#259 durable message topics: malformed `topic` values are a
         // typed argument refusal.
         "INVALID_TOPIC",
@@ -355,6 +358,7 @@ fn validation_and_lookup_errors_have_expected_envelope_shape() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("empty program must fail");
@@ -368,6 +372,7 @@ fn validation_and_lookup_errors_have_expected_envelope_shape() {
             String::new(),
             Some("BlueLake".to_string()),
             Some("error code parity".to_string()),
+            None,
             None,
             None,
             None,
@@ -507,6 +512,7 @@ fn not_found_without_suggestions_and_missing_agent_have_expected_payload_fields(
             "gpt-5".to_string(),
             Some("BlueLake".to_string()),
             Some("error code parity".to_string()),
+            None,
             None,
             None,
             None,

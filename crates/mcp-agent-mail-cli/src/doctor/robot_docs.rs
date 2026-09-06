@@ -102,7 +102,7 @@ quarantines via rename.
 | `am doctor check` (`--json`) | Run all detectors. Read-only. | No | 0 healthy / 1 findings |
 | `am doctor fix --yes` | Run detectors + apply fixers. Backups first. | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
 | `am doctor fix --dry-run` | Print the fix plan; do not execute. | No | 0 |
-| `am doctor fix --only <fm-id>` | Run a single registered FM through the chokepoint. | Yes (via `mutate()`) | 0 / 3 / 4 / 64 |
+| `am doctor fix --only <fm-id>` | Run a single registered FM through the chokepoint. Exit equals the envelope's `exit_code`: 1 = findings remain, nothing mutated; 2 = partial fix. | Yes (via `mutate()`) | 0 / 1 / 2 / 3 / 4 / 64 |
 | `am doctor fix --only <fm-id> --list` | Detect a single FM only — no chokepoint. | No | 0 |
 | `am doctor fix --list` | Detect every registered FM in one round-trip. | No | 0 |
 | `am doctor undo <run-id>` | Restore from `.doctor/runs/<run-id>/backups/`. | Yes (restore-only) | 0 / 3 |

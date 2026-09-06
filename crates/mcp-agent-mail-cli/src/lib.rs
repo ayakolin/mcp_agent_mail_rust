@@ -2695,6 +2695,11 @@ pub enum DoctorCommand {
         /// Skips the legacy multi-detector `fix` flow and routes through
         /// `mutate()` for the single FM. Use `am doctor fixers` to list
         /// valid ids. Unknown ids exit 64 with a hint.
+        ///
+        /// The process exit code equals the JSON envelope's `exit_code`:
+        /// 0 when no findings remain (or with `--dry-run`), 1 when findings
+        /// remain and nothing was mutated, 2 when actions were taken but
+        /// findings remain (partial fix), 3/4 on mutate failure/refusal.
         #[arg(long)]
         only: Option<String>,
         /// Detect-only, no `fix()` call. Two operating modes:
@@ -39770,6 +39775,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .map_err(mcp_error_to_cli_error)?;
@@ -41218,6 +41224,48 @@ mod mail_server_cli_bridge_tests {
         assert_eq!(payload["result"]["ok"].as_bool(), Some(true));
 
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn caller_tmux_headers_carry_pane_and_validated_socket() {
+        use crate::caller_tmux_headers;
+        // GH#310: inside tmux both headers go out, the socket being the first
+        // `$TMUX` field (trimmed).
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMUX", " /tmp/tmux-1000/ntm ,4242,3"), ("TMUX_PANE", "%7")],
+            || {
+                let headers = caller_tmux_headers();
+                let socket = headers
+                    .iter()
+                    .find(|(name, _)| *name == "X-Tmux-Socket")
+                    .map(|(_, value)| value.as_str());
+                assert_eq!(socket, Some("/tmp/tmux-1000/ntm"));
+                assert!(
+                    headers
+                        .iter()
+                        .all(|(_, value)| !value.contains(['\r', '\n'])),
+                    "header values must be CRLF-free: {headers:?}"
+                );
+            },
+        );
+        // A malformed `$TMUX` (relative socket, CRLF, empty) omits the socket
+        // header instead of failing the request — legacy behavior preserved.
+        for hostile in ["relative/sock,1,0", "/tmp/ok\r\nX-Evil: 1,1,0", "", ",1,0"] {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("TMUX", hostile), ("TMUX_PANE", "%7")],
+                || {
+                    let headers = caller_tmux_headers();
+                    assert!(
+                        headers.iter().all(|(name, _)| *name != "X-Tmux-Socket"),
+                        "malformed TMUX must not produce a socket header: {hostile:?} -> {headers:?}"
+                    );
+                    assert!(
+                        headers.iter().any(|(name, _)| *name == "X-Tmux-Pane"),
+                        "the pane header is independent of the socket header"
+                    );
+                },
+            );
+        }
     }
 
     #[test]
@@ -85048,7 +85096,36 @@ fn trusted_tmux_pane_header_value(raw: Option<&str>) -> Option<String> {
 /// daemon injects this into identity-tool args so pane-identity reuse works for
 /// CLI-routed identity calls.
 fn caller_tmux_pane_header() -> Option<String> {
-    trusted_tmux_pane_header_value(std::env::var("TMUX_PANE").ok().as_deref())
+    trusted_tmux_pane_header_value(
+        mcp_agent_mail_core::config::process_env_value("TMUX_PANE").as_deref(),
+    )
+}
+
+/// The caller's tmux server socket as a trusted `X-Tmux-Socket` header value.
+///
+/// tmux pane ids are only unique per server, so `X-Tmux-Pane` alone lets the
+/// daemon look `%N` up on *its* ambient server — which, when the caller runs
+/// under a different server (a `-L`/`-S` socket, an orchestrator's private
+/// tmux), either fails or, worse, describes an unrelated pane that shares the
+/// number (GH#310). The socket comes from the first field of `$TMUX`
+/// (`<socket>,<server_pid>,<session_index>`) and is validated to an absolute,
+/// bounded, control-character-free path before it touches the wire; a missing
+/// or malformed `$TMUX` simply omits the header, preserving the pre-GH#310
+/// behavior rather than failing the whole request.
+fn caller_tmux_socket_header() -> Option<String> {
+    mcp_agent_mail_core::tmux_env_socket_path_validated()
+}
+
+/// Both tmux transport headers, in the order they are written to the wire.
+fn caller_tmux_headers() -> Vec<(&'static str, String)> {
+    let mut headers = Vec::with_capacity(2);
+    if let Some(pane) = caller_tmux_pane_header() {
+        headers.push(("X-Tmux-Pane", pane));
+    }
+    if let Some(socket) = caller_tmux_socket_header() {
+        headers.push(("X-Tmux-Socket", socket));
+    }
+    headers
 }
 
 fn post_jsonrpc_request_blocking_http(
@@ -85079,18 +85156,20 @@ fn post_jsonrpc_request_blocking_http(
     } else {
         String::new()
     };
-    // Carry the caller's tmux pane to the daemon (GH#177 Defect 3). The value is
-    // validated to `%<digits>`, so it can't inject CRLF/extra headers.
-    let x_tmux_pane = caller_tmux_pane_header()
-        .map(|pane| format!("X-Tmux-Pane: {pane}\r\n"))
-        .unwrap_or_default();
+    // Carry the caller's tmux pane and server socket to the daemon (GH#177
+    // Defect 3, GH#310). The pane is validated to `%<digits>` and the socket to
+    // an absolute CR/LF/NUL-free path, so neither can inject extra headers.
+    let x_tmux: String = caller_tmux_headers()
+        .into_iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     let head = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: mcp-agent-mail-cli\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}{}\r\n",
         target.request_target,
         target.host_header,
         body.len(),
         authorization,
-        x_tmux_pane
+        x_tmux
     );
     // GH#220: writes must retry transient EAGAIN/EINTR just like reads.
     let deadline = std::time::Instant::now() + timeout;
@@ -85380,10 +85459,13 @@ async fn post_jsonrpc_request(
     if let Some(tok) = bearer.filter(|s| !s.is_empty()) {
         headers.push(("Authorization".to_string(), format!("Bearer {tok}")));
     }
-    // Carry the caller's tmux pane to the daemon (GH#177 Defect 3).
-    if let Some(pane) = caller_tmux_pane_header() {
-        headers.push(("X-Tmux-Pane".to_string(), pane));
-    }
+    // Carry the caller's tmux pane and server socket to the daemon (GH#177
+    // Defect 3, GH#310).
+    headers.extend(
+        caller_tmux_headers()
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value)),
+    );
 
     // Production request-scoped Cx, not the test-only `Cx::for_testing()`
     // constructor — matching every other production call site in this crate
