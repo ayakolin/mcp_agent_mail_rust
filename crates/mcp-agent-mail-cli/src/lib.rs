@@ -41241,7 +41241,9 @@ mod mail_server_cli_bridge_tests {
                     .map(|(_, value)| value.as_str());
                 assert_eq!(socket, Some("/tmp/tmux-1000/ntm"));
                 assert!(
-                    headers.iter().all(|(_, value)| !value.contains(['\r', '\n'])),
+                    headers
+                        .iter()
+                        .all(|(_, value)| !value.contains(['\r', '\n'])),
                     "header values must be CRLF-free: {headers:?}"
                 );
             },

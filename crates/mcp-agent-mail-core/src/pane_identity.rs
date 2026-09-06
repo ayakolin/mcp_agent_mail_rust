@@ -177,10 +177,12 @@ pub fn validate_tmux_socket_path(raw: &str) -> Result<String, TmuxSocketPathErro
     Ok(socket_path.to_string())
 }
 
-/// The caller's own tmux server socket from `$TMUX`
-/// (`<socket_path>,<server_pid>,<session_index>`), validated with
-/// [`validate_tmux_socket_path`]. `None` outside tmux or when the value is
-/// malformed — callers then fall back to the ambient server exactly as before.
+/// The caller's own tmux server socket from `$TMUX`, validated.
+///
+/// `$TMUX` is `<socket_path>,<server_pid>,<session_index>`; the first field is
+/// run through [`validate_tmux_socket_path`]. `None` outside tmux or when the
+/// value is malformed — callers then fall back to the ambient server exactly
+/// as before.
 #[must_use]
 pub fn tmux_env_socket_path_validated() -> Option<String> {
     let value = crate::config::process_env_value("TMUX")?;
@@ -632,10 +634,12 @@ pub fn resolve_identity_with_binding(
     resolve_identity_with_binding_on_server(project_key, pane_id, TmuxServer::AMBIENT)
 }
 
-/// [`resolve_identity_with_binding`] with every tmux query for `pane_id`
-/// addressed at an explicit server (GH#310): the bare/composite key
-/// normalization, the target-pane facts behind the GH#252 adoption rule, and
-/// the holder check that decides whether a live record belongs to this caller.
+/// [`resolve_identity_with_binding`] against an explicit tmux server (GH#310).
+///
+/// Every tmux query for `pane_id` is addressed at `server`: the bare/composite
+/// key normalization, the target-pane facts behind the GH#252 adoption rule,
+/// and the holder check that decides whether a live record belongs to this
+/// caller.
 #[must_use]
 pub fn resolve_identity_with_binding_on_server(
     project_key: &str,
@@ -816,10 +820,11 @@ pub fn resolve_identity_with_optional_pane(
     resolve_identity_with_optional_pane_on_server(project_key, pane_id, TmuxServer::AMBIENT)
 }
 
-/// [`resolve_identity_with_optional_pane`] resolving an explicit pane against
-/// an explicit tmux server (GH#310). `server` only applies to the explicit
-/// pane: with no pane supplied the lookup is for *this* process's own pane,
-/// which by definition lives on the ambient server.
+/// [`resolve_identity_with_optional_pane`] against an explicit tmux server (GH#310).
+///
+/// `server` only applies to the explicit pane: with no pane supplied the
+/// lookup is for *this* process's own pane, which by definition lives on the
+/// ambient server.
 #[must_use]
 pub fn resolve_identity_with_optional_pane_on_server(
     project_key: &str,
@@ -864,9 +869,11 @@ pub fn write_identity_with_optional_pane(
     )
 }
 
-/// [`write_identity_with_optional_pane`] gathering the explicit pane's binding
-/// facts from an explicit tmux server (GH#310). As with resolution, `server`
-/// only applies to an explicit pane; this process's own pane is ambient.
+/// [`write_identity_with_optional_pane`] against an explicit tmux server (GH#310).
+///
+/// The explicit pane's binding facts are gathered from `server`. As with
+/// resolution, `server` only applies to an explicit pane; this process's own
+/// pane is ambient.
 #[must_use]
 pub fn write_identity_with_optional_pane_on_server(
     project_key: &str,

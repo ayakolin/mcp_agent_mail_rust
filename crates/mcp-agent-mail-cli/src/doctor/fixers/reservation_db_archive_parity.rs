@@ -1226,22 +1226,37 @@ INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive
         let mut json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&legacy).expect("legacy")).expect("json");
         json["db_generation"] = serde_json::Value::String(FOREIGN_GENERATION.to_string());
-        std::fs::write(&legacy, serde_json::to_vec_pretty(&json).expect("serialize"))
-            .expect("rewrite legacy with a foreign embedded generation");
+        std::fs::write(
+            &legacy,
+            serde_json::to_vec_pretty(&json).expect("serialize"),
+        )
+        .expect("rewrite legacy with a foreign embedded generation");
 
         assert!(
-            build_archive_release_rewrite(&finding, "reservation-regression", 301, 1_700_003_010_000_000)
-                .is_none(),
+            build_archive_release_rewrite(
+                &finding,
+                "reservation-regression",
+                301,
+                1_700_003_010_000_000
+            )
+            .is_none(),
             "foreign embedded generation must not be rewritten"
         );
 
         // Same file stamped with the LIVE generation is a legitimate target.
         json["db_generation"] = serde_json::Value::String(LIVE_GENERATION.to_string());
-        std::fs::write(&legacy, serde_json::to_vec_pretty(&json).expect("serialize"))
-            .expect("rewrite legacy with the live embedded generation");
-        let rewrite =
-            build_archive_release_rewrite(&finding, "reservation-regression", 301, 1_700_003_010_000_000)
-                .expect("live embedded generation is rewritable");
+        std::fs::write(
+            &legacy,
+            serde_json::to_vec_pretty(&json).expect("serialize"),
+        )
+        .expect("rewrite legacy with the live embedded generation");
+        let rewrite = build_archive_release_rewrite(
+            &finding,
+            "reservation-regression",
+            301,
+            1_700_003_010_000_000,
+        )
+        .expect("live embedded generation is rewritable");
         assert_eq!(rewrite.path, legacy);
     }
 
