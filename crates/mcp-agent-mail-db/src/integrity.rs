@@ -1127,7 +1127,9 @@ pub fn index_table_cross_count(
     // Release only our savepoint, including on the error path. An enclosing
     // transaction remains owned by the caller; never COMMIT or ROLLBACK it.
     conn.execute_raw("RELEASE SAVEPOINT am_integrity_cross_count")
-        .map_err(|error| DbError::Sqlite(format!("cross-count snapshot release failed: {error}")))?;
+        .map_err(|error| {
+            DbError::Sqlite(format!("cross-count snapshot release failed: {error}"))
+        })?;
     result
 }
 
@@ -2093,7 +2095,11 @@ mod tests {
     }
 
     impl<C: crate::pool::SyncQuery> crate::pool::SyncQuery for CrossCountConcurrentInsert<'_, C> {
-        fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, sqlmodel_core::Error> {
+        fn query_sync(
+            &self,
+            sql: &str,
+            params: &[Value],
+        ) -> Result<Vec<Row>, sqlmodel_core::Error> {
             let rows = self.reader.query_sync(sql, params)?;
             if sql.contains("NOT INDEXED") && !self.inserted.replace(true) {
                 self.writer
@@ -2154,7 +2160,9 @@ mod tests {
 
     #[test]
     fn cross_count_canonical_concurrent_insert_is_not_corruption() {
-        let directory = tempfile::tempdir().expect("retained canonical fixture").keep();
+        let directory = tempfile::tempdir()
+            .expect("retained canonical fixture")
+            .keep();
         let path = directory.join("canonical-cross-count.sqlite3");
         let writer = crate::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
             .expect("open canonical writer");
@@ -2165,10 +2173,14 @@ mod tests {
 
     #[test]
     fn cross_count_franken_concurrent_insert_is_not_corruption() {
-        let directory = tempfile::tempdir().expect("retained runtime fixture").keep();
+        let directory = tempfile::tempdir()
+            .expect("retained runtime fixture")
+            .keep();
         let path = directory.join("franken-cross-count.sqlite3");
-        let writer = DbConn::open_file(path.to_string_lossy().as_ref()).expect("open runtime writer");
-        let reader = DbConn::open_file(path.to_string_lossy().as_ref()).expect("open runtime reader");
+        let writer =
+            DbConn::open_file(path.to_string_lossy().as_ref()).expect("open runtime writer");
+        let reader =
+            DbConn::open_file(path.to_string_lossy().as_ref()).expect("open runtime reader");
         cross_count_concurrent_insert_is_not_corruption(&reader, &writer);
     }
 
@@ -2180,10 +2192,9 @@ mod tests {
         conn.execute_raw("BEGIN").expect("begin caller transaction");
         conn.execute_raw("INSERT INTO cc_scope (name) VALUES ('caller-owned')")
             .expect("write uncommitted caller row");
-        assert!(
-            index_table_cross_count(conn, &["cc_scope"])
-                .expect("probe inside caller transaction")
-                .is_empty()
+        assert_eq!(
+            index_table_cross_count(conn, &["cc_scope"]).expect("probe inside caller transaction"),
+            Vec::<CrossCountMismatch>::new()
         );
         conn.execute_raw("ROLLBACK")
             .expect("caller still owns its transaction");
@@ -2201,6 +2212,41 @@ mod tests {
     }
 
     #[test]
+    fn cross_count_snapshot_still_reports_a_real_index_mismatch() {
+        let conn = crate::CanonicalDbConn::open_memory().expect("canonical corruption fixture");
+        conn.execute_raw(
+            "CREATE TABLE cc_corrupt (id INTEGER PRIMARY KEY, name TEXT); \
+             CREATE INDEX idx_cc_corrupt_name ON cc_corrupt(name); \
+             INSERT INTO cc_corrupt (name) VALUES ('first'), ('second'); \
+             CREATE TABLE cc_empty (id INTEGER PRIMARY KEY, name TEXT); \
+             CREATE INDEX idx_cc_empty_name ON cc_empty(name);",
+        )
+        .expect("create real table and index btrees");
+        // Redirect only this private in-memory index to an empty index btree.
+        // The forced-index scan now returns real inconsistent data; no query
+        // result is mocked, and no mailbox file is opened or modified.
+        conn.execute_raw(
+            "PRAGMA writable_schema=ON; \
+             UPDATE sqlite_master SET rootpage=( \
+                 SELECT rootpage FROM sqlite_master WHERE name='idx_cc_empty_name' \
+             ) WHERE name='idx_cc_corrupt_name'; \
+             PRAGMA writable_schema=OFF; \
+             PRAGMA schema_version=100;",
+        )
+        .expect("create owned index/table inconsistency and reload the schema");
+        assert_eq!(
+            index_table_cross_count(&conn, &["cc_corrupt"])
+                .expect("scan actual inconsistent index"),
+            vec![CrossCountMismatch {
+                table: "cc_corrupt".to_string(),
+                index: "idx_cc_corrupt_name".to_string(),
+                table_rows: 2,
+                index_rows: 0,
+            }]
+        );
+    }
+
+    #[test]
     fn cross_count_franken_preserves_caller_transaction() {
         cross_count_preserves_caller_transaction(
             &DbConn::open_memory().expect("runtime transaction fixture"),
@@ -2212,7 +2258,11 @@ mod tests {
     struct CrossCountQueryError<'a, C>(&'a C);
 
     impl<C: crate::pool::SyncQuery> crate::pool::SyncQuery for CrossCountQueryError<'_, C> {
-        fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, sqlmodel_core::Error> {
+        fn query_sync(
+            &self,
+            sql: &str,
+            params: &[Value],
+        ) -> Result<Vec<Row>, sqlmodel_core::Error> {
             if sql.contains("NOT INDEXED") {
                 self.0
                     .query_sync("SELECT missing FROM nonexistent_cross_count_fixture", &[])
@@ -2231,7 +2281,11 @@ mod tests {
             .expect("create real query-error fixture");
         let error = index_table_cross_count(&CrossCountQueryError(conn), &["cc_error"])
             .expect_err("actual engine error must propagate");
-        assert!(error.to_string().contains("NOT INDEXED scan of cc_error failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("NOT INDEXED scan of cc_error failed")
+        );
         conn.execute_raw("BEGIN")
             .expect("diagnostic must release its snapshot on error");
         conn.execute_raw("INSERT INTO cc_error (id) VALUES (1)")
@@ -2244,10 +2298,10 @@ mod tests {
             .query_sync("SELECT count(*) AS c FROM cc_error", &[])
             .expect("read rollback witness");
         assert_eq!(rows[0].get_named::<i64>("c").expect("row count"), 0);
-        assert!(
+        assert_eq!(
             index_table_cross_count(conn, &["cc_error"])
-                .expect("connection remains usable after diagnostic errors")
-                .is_empty()
+                .expect("connection remains usable after diagnostic errors"),
+            Vec::<CrossCountMismatch>::new()
         );
     }
 

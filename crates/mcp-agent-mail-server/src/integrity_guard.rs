@@ -1096,6 +1096,17 @@ mod tests {
             "fixture must retain committed frames that a checkpointing close would consume"
         );
 
+        let observer = open_index_table_cross_count_connection(&path)
+            .expect("open strict read-only WAL observer");
+        let mismatches =
+            mcp_agent_mail_db::integrity::index_table_cross_count(&observer, CROSS_COUNT_TABLES)
+                .expect("the real read-only WAL probe must execute successfully");
+        assert!(
+            mismatches.is_empty(),
+            "healthy read-only WAL probe found mismatches: {mismatches:?}"
+        );
+        drop(observer);
+
         assert!(
             run_index_table_cross_count(&path).is_none(),
             "healthy cross-count fixture must not report desync"
