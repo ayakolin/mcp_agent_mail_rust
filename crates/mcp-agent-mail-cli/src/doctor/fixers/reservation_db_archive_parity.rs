@@ -324,6 +324,21 @@ fn build_archive_release_rewrite(
     if object.get("id").and_then(serde_json::Value::as_i64) != Some(reservation_id) {
         return None;
     }
+    // The detector attributes a legacy-named artifact by its embedded
+    // `db_generation` field when the filename carries none; a value foreign to
+    // the live generation makes it prior-generation debris the detector never
+    // compared. Mirror that rule so the fixer cannot rewrite it either (GH#311).
+    let embedded_generation = object
+        .get("db_generation")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|generation| !generation.is_empty());
+    if mcp_agent_mail_tools::reservation_parity::is_foreign_generation(
+        finding.report.live_generation.as_deref(),
+        embedded_generation,
+    ) {
+        return None;
+    }
     object.insert(
         "released_ts".to_string(),
         serde_json::Value::from(released_ts),
@@ -1195,6 +1210,39 @@ INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive
             after.is_empty(),
             "second detector pass must be clean: {after:?}"
         );
+    }
+
+    #[test]
+    fn archive_rewrite_refuses_legacy_named_artifact_with_foreign_embedded_generation() {
+        // The detector attributes a legacy-named file by its embedded
+        // `db_generation`; when that token is foreign the file is debris the
+        // detector never compared. The rewrite builder must apply the same rule
+        // (this shape can only reach the fixer if the file changed between the
+        // fresh detection and the rewrite, so it is exercised directly).
+        let (storage_root, db_path, legacy, _foreign) = materialize_foreign_generation_fixture();
+        let finding = detect(Some(storage_root.path()), std::slice::from_ref(&db_path))
+            .pop()
+            .expect("precondition: release drift present");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&legacy).expect("legacy")).expect("json");
+        json["db_generation"] = serde_json::Value::String(FOREIGN_GENERATION.to_string());
+        std::fs::write(&legacy, serde_json::to_vec_pretty(&json).expect("serialize"))
+            .expect("rewrite legacy with a foreign embedded generation");
+
+        assert!(
+            build_archive_release_rewrite(&finding, "reservation-regression", 301, 1_700_003_010_000_000)
+                .is_none(),
+            "foreign embedded generation must not be rewritten"
+        );
+
+        // Same file stamped with the LIVE generation is a legitimate target.
+        json["db_generation"] = serde_json::Value::String(LIVE_GENERATION.to_string());
+        std::fs::write(&legacy, serde_json::to_vec_pretty(&json).expect("serialize"))
+            .expect("rewrite legacy with the live embedded generation");
+        let rewrite =
+            build_archive_release_rewrite(&finding, "reservation-regression", 301, 1_700_003_010_000_000)
+                .expect("live embedded generation is rewritable");
+        assert_eq!(rewrite.path, legacy);
     }
 
     #[test]
