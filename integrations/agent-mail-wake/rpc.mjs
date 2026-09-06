@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { createInterface } from 'node:readline';
 import { localUrl } from './common.mjs';
 
 export class CodexRPC extends EventEmitter {
@@ -80,5 +81,82 @@ export class KimiAdapter {
       if ([40903, 40927].includes(error.code)) return { alreadyAccepted: true };
       throw error;
     }
+  }
+}
+
+// Grok Build exposes a long-lived agent over ACP (JSON-RPC, newline-delimited)
+// via `grok agent stdio`. This is the same managed-session pattern as the Kimi
+// Server API adapter: the launcher owns the session and prompts it per batch.
+// session/prompt resolves when the turn ends, but BYOK/proxy backends can fail
+// response deserialization after streaming; `_x.ai/session/prompt_complete`
+// (observed on the wire) is the authoritative turn-end notification, so await
+// that and treat the response itself as advisory.
+export class GrokACP extends EventEmitter {
+  constructor(proc) {
+    super(); this.proc = proc; this.pending = new Map(); this.counter = 0;
+    this.promptWaiters = new Set(); this.turnText = ''; this.textSink = null;
+    this.lineReader = createInterface({ input: proc.stdout });
+    this.lineReader.on('line', line => {
+      let message; try { message = JSON.parse(line); } catch { return; }
+      if (message.id !== undefined && this.pending.has(message.id) && !message.method) {
+        const p = this.pending.get(message.id); this.pending.delete(message.id); clearTimeout(p.timeout);
+        p.resolve(message); return;
+      }
+      if (!message.method) return;
+      if (/prompt_complete/.test(message.method)) {
+        for (const w of this.promptWaiters) w(); this.promptWaiters.clear();
+      } else if (message.method === 'session/update') {
+        const u = message.params?.update;
+        if (u?.sessionUpdate === 'agent_message_chunk') {
+          const text = u.content?.text || ''; this.turnText += text; this.textSink?.write(text);
+        }
+      }
+      if (message.id !== undefined) { // server->client request: always-approve sessions should not emit these
+        this.proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {} }) + '\n');
+      }
+    });
+    proc.on('exit', () => {
+      for (const p of this.pending.values()) { clearTimeout(p.timeout); p.resolve({ error: { message: 'Grok agent exited' } }); }
+      this.pending.clear(); this.emit('disconnected');
+    });
+  }
+  get alive() { return this.proc.exitCode === null && !this.proc.killed; }
+  request(method, params, timeoutMs = 30000) {
+    return new Promise((resolve, reject) => {
+      if (!this.alive) return reject(new Error('Grok agent is not running'));
+      const id = ++this.counter;
+      const timeout = setTimeout(() => { this.pending.delete(id); reject(new Error(`Grok ${method} timed out`)); }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timeout });
+      try { this.proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); }
+      catch (error) { clearTimeout(timeout); this.pending.delete(id); reject(error); }
+    });
+  }
+  async call(method, params, timeoutMs) {
+    const message = await this.request(method, params, timeoutMs);
+    if (message.error) throw new Error(`Grok ${method}: ${message.error.message || JSON.stringify(message.error)}`.slice(0, 500));
+    return message.result;
+  }
+  async connect() {
+    await this.call('initialize', { protocolVersion: 1, clientCapabilities: { fs: {}, terminal: false } });
+    return this;
+  }
+  async openSession(project, sessionId, rules) {
+    if (sessionId) {
+      await this.call('session/load', { sessionId, cwd: project, mcpServers: [] }, 120000);
+      return sessionId;
+    }
+    const result = await this.call('session/new',
+      { cwd: project, mcpServers: [], ...(rules ? { _meta: { rules } } : {}) }, 120000);
+    return result.sessionId;
+  }
+  deliver(text) {
+    if (!this.alive) throw new Error('Grok agent exited; delivery remains pending');
+    const turn = new Promise(resolve => this.promptWaiters.add(resolve));
+    turn.catch(() => {});
+    this.turnText = '';
+    this.request('session/prompt', { sessionId: this.session, prompt: [{ type: 'text', text }] }, 30 * 60000)
+      .then(message => { if (message.error) process.stderr.write(`grok prompt response: ${message.error.message}\n`); })
+      .catch(error => { if (this.promptWaiters.size) { for (const w of this.promptWaiters) w(error); this.promptWaiters.clear(); } });
+    return turn;
   }
 }

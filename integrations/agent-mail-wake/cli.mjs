@@ -8,7 +8,7 @@ import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { MailClient, MailWatcher, STATE_ROOT, DATA_ROOT, listStates, readJson, saveJson, projectPath, identityInstructions, sleep, errorText } from './common.mjs';
-import { CodexRPC, CodexAdapter, KimiAdapter } from './rpc.mjs';
+import { CodexRPC, CodexAdapter, KimiAdapter, GrokACP } from './rpc.mjs';
 
 const children = new Set(); let watcher, rpc, stopping = false;
 function child(command, args, options = {}) {
@@ -131,8 +131,38 @@ async function claudeMain(options) {
   const proc = child('claude', args, { env, cwd: project, stdio: 'inherit' });
   const [code] = await once(proc, 'exit'); process.exitCode = code || 0;
 }
+async function grokMain(options) {
+  const project = projectPath(options.project);
+  const sessionKey = options.session || randomUUID();
+  let acp, session, bindingFile;
+  const delivered = new Set();
+  watcher = new MailWatcher({ host: 'grok-build', session: sessionKey, project,
+    model: options.model || 'configured-model',
+    canDeliver: () => acp?.alive,
+    deliver: async (text, batch) => {
+      if (delivered.has(batch.id)) return;
+      delivered.add(batch.id);
+      saveJson(bindingFile, { ...readJson(bindingFile, {}), delivered: [...delivered].slice(-64) });
+      try { await acp.deliver(text); process.stderr.write(`[Agent Mail] grok replied: ${acp.turnText.trim().slice(0, 400)}\n`); }
+      catch (error) { delivered.delete(batch.id); saveJson(bindingFile, { ...readJson(bindingFile, {}), delivered: [...delivered] }); throw error; }
+    }, onStatus: report });
+  bindingFile = path.join(DATA_ROOT, 'bindings', `${watcher.id}.json`);
+  for (const batchId of readJson(bindingFile, {}).delivered || []) delivered.add(batchId);
+  await watcher.init({ start: false });
+  const log = logFile('grok-agent');
+  const proc = child('grok', ['agent', '--always-approve', ...(options.model ? ['-m', options.model] : []), 'stdio'],
+    { cwd: project, stdio: ['pipe', 'pipe', log] }); fs.closeSync(log);
+  acp = new GrokACP(proc);
+  proc.on('exit', () => { if (!stopping) { void shutdown().then(() => process.exit(1)); } });
+  await waitFor(() => acp.connect(), 'Grok ACP agent', proc);
+  session = await acp.openSession(project, options.session, identityInstructions(watcher.state));
+  acp.session = session;
+  saveJson(bindingFile, { ...readJson(bindingFile, {}), host: 'grok-build', session, project, agent: watcher.state.agent });
+  process.stderr.write(`Grok session: ${session}\nKeep this launcher running; the ACP agent is owned by it.\n${identityInstructions(watcher.state)}\n`);
+  watcher.start();
+}
 function usage() {
-  console.log(`Agent Mail Wake\n\nagent-mail-wake list\nagent-mail-wake pause|resume <listener-id>\nagent-mail-wake doctor\ncodex-mail [--project DIR] [--session ID] [--headless] [-- native flags]\nclaude-mail [--project DIR] [--session ID] [-- native flags]\nkimi-mail [--project DIR] [--server URL --session ID]\n\nOMP: automatically enabled in new interactive sessions; /mail-wake status|pause|resume\nGrok Build: no automatic wake adapter is included.`);
+  console.log(`Agent Mail Wake\n\nagent-mail-wake list\nagent-mail-wake pause|resume <listener-id>\nagent-mail-wake doctor\ncodex-mail [--project DIR] [--session ID] [--headless] [-- native flags]\nclaude-mail [--project DIR] [--session ID] [-- native flags]\nkimi-mail [--project DIR] [--server URL --session ID]\ngrok-mail [--project DIR] [--session ID] [--model ID]\n\nOMP: automatically enabled in new interactive sessions; /mail-wake status|pause|resume\nGrok Build: managed ACP session (grok agent stdio); approvals run always-approve.`);
 }
 export async function main(args = process.argv.slice(2)) {
   const command = args.shift();
@@ -148,13 +178,14 @@ export async function main(args = process.argv.slice(2)) {
   }
   if (command === 'doctor') {
     const client = new MailClient(); await client.call('health_check');
-    console.log('Agent Mail: healthy\nAdapters: OMP extension, Codex App Server, Claude channel, Kimi Server API\n');
+    console.log('Agent Mail: healthy\nAdapters: OMP extension, Codex App Server, Claude channel, Kimi Server API, Grok ACP agent\n');
     return console.log(JSON.stringify(listStates(), null, 2));
   }
   const options = parse(args); if (options.help) return usage();
   if (command === 'codex') return codexMain(options);
   if (command === 'claude') return claudeMain(options);
   if (command === 'kimi') return kimiMain(options);
+  if (command === 'grok') return grokMain(options);
   throw new Error(`Unknown command: ${command}`);
 }
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {

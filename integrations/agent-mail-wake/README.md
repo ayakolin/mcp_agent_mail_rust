@@ -13,10 +13,11 @@ external package dependencies.
 | Codex | Managed App Server plus native remote TUI | `codex-mail` |
 | Claude Code | Local MCP Channel plus native TUI | `claude-mail` |
 | Kimi Code | Managed Web/API session | `kimi-mail` |
+| Grok Build | Managed ACP session (`grok agent stdio`) | `grok-mail` |
 
-Grok Build wake support is not included. A configured MCP connection alone does
-not automatically wake a client. These integrations do not take over arbitrary
-already-running sessions.
+A configured MCP connection alone does not automatically wake a client. These
+integrations do not take over arbitrary already-running sessions; the Grok
+adapter owns a managed ACP session rather than attaching to a live Grok TUI.
 
 ## Install
 
@@ -49,8 +50,9 @@ Options: `--home`, `--prefix`, `--bin-dir`, `--clients`, `--url`, `--dry-run`.
 `--home` is useful for isolated installation tests. `--url` accepts loopback HTTP
 only. Existing MCP endpoints are not rewritten: keep them consistent with the
 listener's endpoint. The initial setup targets a local service accessible without
-a bearer token; authenticated deployments must adapt the HTTP headers in both the
-mail client and their native MCP configuration.
+a bearer token; when the service provisions `HTTP_BEARER_TOKEN` (as the upstream
+installer does), `MailClient` discovers it from `AGENT_MAIL_BEARER_TOKEN` or
+`~/.config/mcp-agent-mail/config.env`, and native MCP entries need matching headers.
 
 ## Use
 
@@ -79,6 +81,10 @@ client's local-channel confirmation. Plain `claude` keeps the added Channel MCP
 server passive. Kimi prints its Web UI URL and uses the existing `server.token`;
 its adapter does not attach to an unrelated live Kimi TUI.
 
+Grok runs headless: `grok-mail` owns a `grok agent --always-approve -m MODEL stdio`
+process and prompts its ACP session per batch (`--session ID` reuses a stored
+session via `session/load`). It does not attach to a live Grok TUI.
+
 Default polling is 3 seconds, with at most 5 events per batch and a pause after 8
 automatic deliveries. The polling itself does not invoke a model. Configure with
 `AGENT_MAIL_WAKE_INTERVAL_MS` and `AGENT_MAIL_WAKE_MAX_TURNS`.
@@ -88,7 +94,8 @@ See the Chinese guide for full session-resume commands and lifecycle details.
 
 The watcher stores a delivery cursor and pending batch before submission. It
 advances the cursor only after the receiving adapter accepts the batch. Codex
-checks thread history, Kimi uses a stable `prompt_id`, and OMP checks custom-message
+checks thread history, Kimi uses a stable `prompt_id`, Grok records accepted batch
+IDs in its launcher-local binding ledger, and OMP checks custom-message
 records when reconciling retries. A cursor gap pauses instead of skipping history.
 These mechanisms do not provide exactly-once execution of an agent's tools.
 
@@ -96,6 +103,8 @@ Claude Channel success means the notification was written to MCP, not that the
 model finished processing it. A crash around that boundary can repeat or miss a
 wake notification; the original mail remains in Agent Mail. Tool approvals still
 need the client's normal approval flow, including for a headless Codex session.
+The Grok adapter runs its managed session with always-approve; keep that in mind
+before letting peers prompt it in sensitive workspaces.
 
 Runtime state, bindings, logs and backups stay under the user data directory
 (`AGENT_MAIL_WAKE_HOME` overrides it); `AGENT_MAIL_WAKE_STATE_DIR` overrides only
@@ -109,7 +118,7 @@ source-only import of the original local integration.
 | `common.mjs` | Mail protocol, identities, batching, durable cursor and pause controls |
 | `omp.mjs` | OMP extension lifecycle and incoming-message delivery |
 | `claude-channel.mjs` | Claude's stdio MCP Channel and control tools |
-| `rpc.mjs` | Codex App Server and Kimi Server API adapters |
+| `rpc.mjs` | Codex App Server, Kimi Server API, and Grok ACP adapters |
 | `cli.mjs` | Shared launcher, session binding, status and lifecycle commands |
 | `install.mjs` | Portable installer for sources, launchers and client config |
 | `test/` | Behavioral watcher/adapter tests and real filesystem installation tests |

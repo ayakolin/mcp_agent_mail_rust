@@ -18,6 +18,23 @@ These observations describe that installation, not a guarantee for every future
 client version. Account credentials, conversation transcripts, mail bodies,
 session IDs, runtime bindings, logs and raw local result files are not published.
 
+
+## Grok Build wake adapter (added locally, 2026-09-07)
+
+The Grok adapter (managed `grok agent stdio` ACP session) was verified on this
+machine against Grok Build 1.0.3 / Agent Mail 0.3.32 / Node.js 24.3.0:
+
+- ACP `initialize` → `session/new` (`_meta.rules` carrying mailbox identity) →
+  `session/prompt` round trip: model echoed the requested marker.
+- Live loop: `grok-mail` listener registered a mailbox; incoming mail woke the
+  session; the woken model fetched its inbox, acknowledged the contact request,
+  and replied through the `mcp_agent_mail` tools (reply archived as message #7
+  in the thread).
+- Caveat found during verification: with the local BYOK proxy's `responses`
+  backend the tool loop aborts after the first response
+  (`missing field output_tokens_details` in `response.completed`); the
+  `chat_completions` backend completes the loop.
+
 ## Fork packaging checks
 
 The fork preserves the original adapter sources and makes a small packaging

@@ -41,9 +41,27 @@ export function localUrl(value) {
   if (url.username || url.password) throw new Error('Credentials must not be embedded in the URL');
   return url.toString();
 }
+// Authenticated deployments (upstream install.sh provisions HTTP_BEARER_TOKEN):
+// resolve the loopback bearer token from the environment or the Agent Mail
+// service config so the mail client speaks the same credentials as the
+// native MCP entries written into each client config.
+export function bearerToken() {
+  const inline = process.env.AGENT_MAIL_BEARER_TOKEN?.trim();
+  if (inline) return inline;
+  try {
+    const file = process.env.AGENT_MAIL_CONFIG_ENV || path.join(
+      process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'mcp-agent-mail', 'config.env');
+    const text = fs.readFileSync(file, 'utf8');
+    const match = text.match(/^\s*(?:export\s+)?HTTP_BEARER_TOKEN\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))\s*$/m);
+    return (match?.[1] ?? match?.[2] ?? match?.[3] ?? '').trim();
+  } catch { return ''; }
+}
 export class MailClient {
   constructor(endpoint = process.env.AGENT_MAIL_URL || DEFAULT_ENDPOINT, headers = {}) {
-    this.endpoint = localUrl(endpoint); this.headers = headers; this.counter = 0;
+    this.endpoint = localUrl(endpoint);
+    const token = bearerToken();
+    this.headers = { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers };
+    this.counter = 0;
   }
   async rpc(method, params = {}) {
     const response = await fetch(this.endpoint, {

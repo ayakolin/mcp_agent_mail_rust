@@ -3,8 +3,9 @@
 [English](README.md) · [Fork 说明](../../README.zh-CN.md) · [验证范围](VERIFICATION.md)
 
 这套适配读取 Agent Mail 的持久收件事件，把消息送到 OMP、Codex、Claude Code、
-Kimi Code 的会话中，并触发下一轮回复。它来自本 fork 的本地集成，使用 Node.js
-标准库，不需要安装额外的 npm 依赖。Grok Build 自动唤醒尚未实现。
+Kimi Code 和 Grok Build 的会话中，并触发下一轮回复。它来自本 fork 的本地集成，使用
+Node.js 标准库，不需要安装额外的 npm 依赖。Grok Build 使用启动器托管的 ACP 会话
+（`grok agent stdio`），不接管已有的 Grok 终端窗口。
 
 ## 前置条件
 
@@ -44,23 +45,25 @@ node integrations/agent-mail-wake/install.mjs --clients omp,codex,claude
 | Codex | `~/.codex/config.toml` 中缺失的 Agent Mail 连接，以及 `codex-mail` |
 | Claude Code | `~/.claude.json` 中的 Agent Mail 连接和 `agent_mail_wake` Channel，以及 `claude-mail` |
 | Kimi Code | `~/.kimi-code/mcp.json` 中缺失的连接，以及 `kimi-mail` |
+| Grok Build | `~/.grok/config.toml` 中缺失的 Agent Mail 连接，以及 `grok-mail` |
 
 可选参数：
 
 | 参数 | 用途 |
 | --- | --- |
 | `--dry-run` | 仅列出会改动的路径，不写入 |
-| `--clients omp,codex,claude,kimi` | 选择客户端 |
+| `--clients omp,codex,claude,kimi,grok` | 选择客户端 |
 | `--home DIR` | 使用明确的用户目录，适合隔离验证 |
 | `--prefix DIR` | 指定运行代码安装目录 |
 | `--bin-dir DIR` | 指定启动命令目录 |
 | `--url URL` | 指定本机 HTTP Agent Mail 地址 |
 
-使用默认用户目录时，安装器识别 `CODEX_HOME`、`CLAUDE_CONFIG_DIR`、`KIMI_CODE_HOME`
-和 OMP 的 `OMP_PROFILE` / `PI_CODING_AGENT_DIR`。
+使用默认用户目录时，安装器识别 `CODEX_HOME`、`CLAUDE_CONFIG_DIR`、`KIMI_CODE_HOME`、
+`GROK_HOME` 和 OMP 的 `OMP_PROFILE` / `PI_CODING_AGENT_DIR`。
 如果已有 MCP 配置指向不同地址，请让监听器和各客户端使用同一个服务。
-当前默认安装面向本机可直接访问的服务；需要 Bearer 认证的部署还需为
-`MailClient` 和原生 MCP 配置提供匹配的请求头。
+当前默认安装面向本机可直接访问的服务；当服务端配置了 `HTTP_BEARER_TOKEN`
+（上游安装器即如此），`MailClient` 会自动从 `AGENT_MAIL_BEARER_TOKEN` 环境变量或
+`~/.config/mcp-agent-mail/config.env` 读取令牌，各客户端原生 MCP 条目需带上匹配的请求头。
 
 ## 开始协作
 
@@ -72,6 +75,7 @@ node integrations/agent-mail-wake/install.mjs --clients omp,codex,claude
 | Codex | `codex-mail` | 原生 Codex 终端，连接启动器管理的 App Server |
 | Claude Code | `claude-mail` | 原生 Claude 终端，启用本地 Channel |
 | Kimi Code | `kimi-mail` | 打开输出的 Web UI 地址 |
+| Grok Build | `grok-mail` | 无原生界面；启动器托管 ACP 会话并回显模型回复 |
 
 查看邮箱和监听状态：
 
@@ -144,13 +148,15 @@ Agent Mail 主服务独立运行，不受启动器退出影响。
 
 ## 投递保证与限制
 
-Codex 查询会话历史、Kimi 使用稳定的 `prompt_id`、OMP 查询自定义消息记录来减少重试重复。
+Codex 查询会话历史、Kimi 使用稳定的 `prompt_id`、Grok 在启动器本地绑定账簿中记录已受理
+批次 ID、OMP 查询自定义消息记录来减少重试重复。
 这些措施不保证 Agent 执行工具的 exactly-once 语义。
 Claude Channel 的成功表示通知已写入 MCP 通道；崩溃发生在这个边界时，唤醒可能重复或遗漏一次，
 但原邮件仍保存在 Agent Mail 中。必要时可主动查询 `fetch_inbox`。
 
 各客户端协议随版本演进，测试版本见[验证说明](VERIFICATION.md)。
-当前只支持本机回环连接；没有远程部署、Grok Build 自动唤醒或任意现有窗口接管功能。
+当前只支持本机回环连接；没有远程部署或任意现有窗口接管功能。
+Grok 适配器以 always-approve 运行托管会话，接入敏感工作区前先确认这一边界。
 
 ## 运行数据与测试
 

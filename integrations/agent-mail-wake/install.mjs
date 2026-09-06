@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
 const SOURCE = path.dirname(fileURLToPath(import.meta.url));
-const CLIENTS = ['omp', 'codex', 'claude', 'kimi'];
+const CLIENTS = ['omp', 'codex', 'claude', 'kimi', 'grok'];
 const FILES = ['common.mjs', 'rpc.mjs', 'omp.mjs', 'claude-channel.mjs', 'cli.mjs',
   'package.json', 'install.mjs', 'README.md', 'README.zh-CN.md'];
 const ENDPOINT = 'http://127.0.0.1:8765/mcp/';
@@ -65,6 +65,7 @@ export function installationPlan(options = {}) {
   if (clients.includes('codex')) launcher('codex-mail', 'codex');
   if (clients.includes('claude')) launcher('claude-mail', 'claude');
   if (clients.includes('kimi')) launcher('kimi-mail', 'kimi');
+  if (clients.includes('grok')) launcher('grok-mail', 'grok');
 
   if (clients.includes('omp')) {
     const profile = !customHome ? process.env.OMP_PROFILE : undefined;
@@ -104,6 +105,14 @@ export function installationPlan(options = {}) {
   if (clients.includes('kimi')) {
     const dir = !customHome && process.env.KIMI_CODE_HOME ? process.env.KIMI_CODE_HOME : path.join(home, '.kimi-code');
     changes.push(changedJson(path.join(dir, 'mcp.json'), data => mailEntry(data, { url })));
+  }
+  if (clients.includes('grok')) {
+    const dir = !customHome && process.env.GROK_HOME ? process.env.GROK_HOME : path.join(home, '.grok');
+    const file = path.join(dir, 'config.toml'), before = contents(file);
+    const table = /^\s*\[\s*mcp_servers\s*\.\s*(?:mcp_agent_mail|"mcp_agent_mail"|'mcp_agent_mail')\s*(?:\.|\])/m;
+    const after = before && table.test(before) ? before
+      : `${before || ''}${before?.endsWith('\n') ? '' : '\n'}\n[mcp_servers.mcp_agent_mail]\nurl = ${JSON.stringify(url)}\n`;
+    changes.push({ file, before, after, mode: 0o600 });
   }
   return { prefix, binDir, clients, changes: changes.filter(c => c.before !== c.after) };
 }
