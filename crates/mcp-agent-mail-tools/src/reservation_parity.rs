@@ -117,6 +117,13 @@ pub struct ReservationParityExample {
 pub struct ReservationParityReport {
     pub schema_version: &'static str,
     pub ok: bool,
+    /// The live database's generation token (`db_identity.generation_id`) the
+    /// checker attributed archive artifacts against, or `None` when the DB is
+    /// unseeded/legacy and generations could not be attributed. A fixer acting
+    /// on this report must resolve artifacts with the same token
+    /// (`find_reservation_artifact_for_generation`) so it mutates exactly the
+    /// file the checker compared, never prior-generation debris (GH#311).
+    pub live_generation: Option<String>,
     pub db_reservations: usize,
     pub archive_reservations: usize,
     pub drift: ReservationParityDriftSummary,
@@ -692,6 +699,7 @@ where
     Ok(ReservationParityReport {
         schema_version: RESERVATION_PARITY_SCHEMA_VERSION,
         ok,
+        live_generation: current_generation,
         db_reservations: db_reservations.len(),
         archive_reservations: archive_reservations.len(),
         drift,
@@ -1605,6 +1613,7 @@ mod tests {
         let report = ReservationParityReport {
             schema_version: RESERVATION_PARITY_SCHEMA_VERSION,
             ok: false,
+            live_generation: None,
             db_reservations: 1,
             archive_reservations: 1,
             drift: ReservationParityDriftSummary {

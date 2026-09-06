@@ -2695,6 +2695,11 @@ pub enum DoctorCommand {
         /// Skips the legacy multi-detector `fix` flow and routes through
         /// `mutate()` for the single FM. Use `am doctor fixers` to list
         /// valid ids. Unknown ids exit 64 with a hint.
+        ///
+        /// The process exit code equals the JSON envelope's `exit_code`:
+        /// 0 when no findings remain (or with `--dry-run`), 1 when findings
+        /// remain and nothing was mutated, 2 when actions were taken but
+        /// findings remain (partial fix), 3/4 on mutate failure/refusal.
         #[arg(long)]
         only: Option<String>,
         /// Detect-only, no `fix()` call. Two operating modes:
