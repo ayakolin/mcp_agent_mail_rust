@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
 const SOURCE = path.dirname(fileURLToPath(import.meta.url));
-const CLIENTS = ['omp', 'codex', 'claude', 'kimi', 'grok'];
+const CLIENTS = ['omp', 'codex', 'claude', 'kimi', 'grok', 'opencode'];
 const FILES = ['common.mjs', 'rpc.mjs', 'omp.mjs', 'claude-channel.mjs', 'cli.mjs',
   'package.json', 'install.mjs', 'README.md', 'README.zh-CN.md'];
 const ENDPOINT = 'http://127.0.0.1:8765/mcp/';
@@ -28,6 +28,19 @@ function changedJson(file, modify) {
   const snapshot = JSON.stringify(data); modify(data);
   return { file, before, after: JSON.stringify(data) === snapshot ? before : JSON.stringify(data, null, 2) + '\n', mode: 0o600 };
 }
+function discoverToken(home, customHome) {
+  const inline = process.env.AGENT_MAIL_BEARER_TOKEN?.trim();
+  if (inline) return inline;
+  if (!customHome && process.env.AGENT_MAIL_CONFIG_ENV) {
+    try { return readTokenLine(process.env.AGENT_MAIL_CONFIG_ENV); } catch { return ''; }
+  }
+  const configHome = !customHome && process.env.XDG_CONFIG_HOME ? process.env.XDG_CONFIG_HOME : path.join(home, '.config');
+  try { return readTokenLine(path.join(configHome, 'mcp-agent-mail', 'config.env')); } catch { return ''; }
+}
+function readTokenLine(file) {
+  const match = fs.readFileSync(file, 'utf8').match(/^\s*(?:export\s+)?HTTP_BEARER_TOKEN\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))\s*$/m);
+  return (match?.[1] ?? match?.[2] ?? match?.[3] ?? '').trim();
+}
 function mailEntry(data, entry) {
   if (data.mcpServers === undefined) data.mcpServers = {};
   if (!data.mcpServers || Array.isArray(data.mcpServers) || typeof data.mcpServers !== 'object') throw new Error('mcpServers must be an object');
@@ -48,6 +61,8 @@ export function installationPlan(options = {}) {
     throw new Error('Agent Mail URL must be a loopback HTTP URL without embedded credentials');
   }
   const url = endpoint.toString(), changes = [];
+  const token = discoverToken(home, customHome);
+  const authHeaders = token ? { Authorization: `Bearer ${token}` } : {};
   const add = (file, after, mode = 0o600) => changes.push({ file, before: contents(file), after, mode });
   for (const file of FILES) add(path.join(prefix, file), fs.readFileSync(path.join(SOURCE, file), 'utf8'), 0o644);
 
@@ -66,6 +81,7 @@ export function installationPlan(options = {}) {
   if (clients.includes('claude')) launcher('claude-mail', 'claude');
   if (clients.includes('kimi')) launcher('kimi-mail', 'kimi');
   if (clients.includes('grok')) launcher('grok-mail', 'grok');
+  if (clients.includes('opencode')) launcher('opencode-mail', 'opencode');
 
   if (clients.includes('omp')) {
     const profile = !customHome ? process.env.OMP_PROFILE : undefined;
@@ -80,20 +96,20 @@ export function installationPlan(options = {}) {
     add(entry, '// agent-mail-wake managed extension\n' +
       `import agentMailWake from ${JSON.stringify(path.join(prefix, 'omp.mjs'))};\n` +
       `export default function (pi) { process.env.AGENT_MAIL_WAKE_HOME ??= ${JSON.stringify(prefix)}; process.env.AGENT_MAIL_URL ??= ${JSON.stringify(url)}; agentMailWake(pi); }\n`, 0o644);
-    changes.push(changedJson(path.join(ompDir, 'mcp.json'), data => mailEntry(data, { type: 'http', url })));
+    changes.push(changedJson(path.join(ompDir, 'mcp.json'), data => mailEntry(data, { type: 'http', url, ...(Object.keys(authHeaders).length ? { headers: authHeaders } : {}) })));
   }
   if (clients.includes('codex')) {
     const dir = !customHome && process.env.CODEX_HOME ? process.env.CODEX_HOME : path.join(home, '.codex');
     const file = path.join(dir, 'config.toml'), before = contents(file);
     const table = /^\s*\[\s*mcp_servers\s*\.\s*(?:mcp_agent_mail|"mcp_agent_mail"|'mcp_agent_mail')\s*(?:\.|\])/m;
     const after = before && table.test(before) ? before
-      : `${before || ''}${before?.endsWith('\n') ? '' : '\n'}\n[mcp_servers.mcp_agent_mail]\nurl = ${JSON.stringify(url)}\n`;
+      : `${before || ''}${before?.endsWith('\n') ? '' : '\n'}\n[mcp_servers.mcp_agent_mail]\nurl = ${JSON.stringify(url)}\n${token ? `http_headers = { Authorization = ${JSON.stringify(`Bearer ${token}`)} }\n` : ''}`;
     changes.push({ file, before, after, mode: 0o600 });
   }
   if (clients.includes('claude')) {
     const file = !customHome && process.env.CLAUDE_CONFIG_DIR ? path.join(process.env.CLAUDE_CONFIG_DIR, '.claude.json') : path.join(home, '.claude.json');
     changes.push(changedJson(file, data => {
-      mailEntry(data, { type: 'http', url });
+      mailEntry(data, { type: 'http', url, ...(Object.keys(authHeaders).length ? { headers: authHeaders } : {}) });
       const current = data.mcpServers.agent_mail_wake;
       if (current && !current.args?.some(arg => arg === path.join(prefix, 'claude-channel.mjs'))) {
         throw new Error('agent_mail_wake is already assigned to another MCP server');
@@ -104,15 +120,23 @@ export function installationPlan(options = {}) {
   }
   if (clients.includes('kimi')) {
     const dir = !customHome && process.env.KIMI_CODE_HOME ? process.env.KIMI_CODE_HOME : path.join(home, '.kimi-code');
-    changes.push(changedJson(path.join(dir, 'mcp.json'), data => mailEntry(data, { url })));
+    changes.push(changedJson(path.join(dir, 'mcp.json'), data => mailEntry(data, { url, ...(Object.keys(authHeaders).length ? { headers: authHeaders } : {}) })));
   }
   if (clients.includes('grok')) {
     const dir = !customHome && process.env.GROK_HOME ? process.env.GROK_HOME : path.join(home, '.grok');
     const file = path.join(dir, 'config.toml'), before = contents(file);
     const table = /^\s*\[\s*mcp_servers\s*\.\s*(?:mcp_agent_mail|"mcp_agent_mail"|'mcp_agent_mail')\s*(?:\.|\])/m;
     const after = before && table.test(before) ? before
-      : `${before || ''}${before?.endsWith('\n') ? '' : '\n'}\n[mcp_servers.mcp_agent_mail]\nurl = ${JSON.stringify(url)}\n`;
+      : `${before || ''}${before?.endsWith('\n') ? '' : '\n'}\n[mcp_servers.mcp_agent_mail]\nurl = ${JSON.stringify(url)}\n${token ? `\n[mcp_servers.mcp_agent_mail.headers]\nAuthorization = ${JSON.stringify(`Bearer ${token}`)}\n` : ''}`;
     changes.push({ file, before, after, mode: 0o600 });
+  }
+  if (clients.includes('opencode')) {
+    const dir = !customHome && process.env.OPENCODE_CONFIG_DIR ? process.env.OPENCODE_CONFIG_DIR : path.join(home, '.opencode');
+    changes.push(changedJson(path.join(dir, 'opencode.json'), data => {
+      if (data.mcp === undefined) data.mcp = {};
+      if (!data.mcp || Array.isArray(data.mcp) || typeof data.mcp !== 'object') throw new Error('mcp must be an object');
+      data.mcp.mcp_agent_mail ??= { type: 'remote', url, enabled: true, ...(Object.keys(authHeaders).length ? { headers: authHeaders } : {}) };
+    }));
   }
   return { prefix, binDir, clients, changes: changes.filter(c => c.before !== c.after) };
 }

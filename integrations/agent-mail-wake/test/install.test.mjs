@@ -83,6 +83,27 @@ test('existing Agent Mail credentials and quoted TOML tables remain intact', t =
   assert.deepEqual(read(kimiFile), kimi);
 });
 
+test('grok, opencode and codex entries embed the discovered bearer token once', async t => {
+  const { home } = sandbox(t);
+  process.env.AGENT_MAIL_BEARER_TOKEN = 'TEST-TOK';
+  t.after(() => { delete process.env.AGENT_MAIL_BEARER_TOKEN; });
+  const plan = installationPlan({ home, clients: ['grok', 'opencode', 'codex'] });
+  applyInstallation(plan);
+  const grok = fs.readFileSync(path.join(home, '.grok', 'config.toml'), 'utf8');
+  assert.match(grok, /\[mcp_servers\.mcp_agent_mail\]\nurl = /);
+  assert.match(grok, /\[mcp_servers\.mcp_agent_mail\.headers\]\nAuthorization = "Bearer TEST-TOK"/);
+  const codex = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8');
+  assert.match(codex, /http_headers = \{ Authorization = "Bearer TEST-TOK" \}/);
+  assert.deepEqual(read(path.join(home, '.opencode', 'opencode.json')).mcp.mcp_agent_mail,
+    { type: 'remote', url: 'http://127.0.0.1:8765/mcp/', enabled: true, headers: { Authorization: 'Bearer TEST-TOK' } });
+  for (const name of ['grok-mail', 'opencode-mail']) {
+    const launcher = spawnSync(path.join(plan.binDir, name), ['--help'], { encoding: 'utf8' });
+    assert.equal(launcher.status, 0, launcher.stderr);
+    assert.match(launcher.stdout, /Agent Mail Wake/);
+  }
+  assert.deepEqual(applyInstallation(installationPlan({ home, clients: ['grok', 'opencode', 'codex'] })).changed, []);
+});
+
 test('unrelated launchers and concurrent config edits are not overwritten', t => {
   const first = sandbox(t);
   write(path.join(first.home, '.local', 'bin', 'codex-mail'), '# unrelated script\n');

@@ -160,3 +160,42 @@ export class GrokACP extends EventEmitter {
     return turn;
   }
 }
+
+// OpenCode exposes a headless HTTP server (`opencode serve`) whose
+// POST /session/:id/message call blocks until the assistant turn completes,
+// so the response doubles as the delivery acknowledgment.
+export class OpenCodeAdapter {
+  constructor(url, fetchImpl = fetch) { this.url = localUrl(url).replace(/\/$/, ''); this.fetch = fetchImpl; }
+  async request(path, body) {
+    const response = await fetch(this.url + path, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const text = await response.text();
+    let data; try { data = JSON.parse(text); } catch { data = text.slice(0, 200); }
+    if (!response.ok) throw new Error(`OpenCode ${response.status} ${path}: ${JSON.stringify(data).slice(0, 250)}`);
+    return data;
+  }
+  async openSession(title) { return (await this.request('/session', { title })).id; }
+  async history(sessionId) { const rows = await this.request(`/session/${encodeURIComponent(sessionId)}/message`); return Array.isArray(rows) ? rows : rows.data || []; }
+  async canDeliver(sessionId) { await this.history(sessionId); return true; }
+  async deliver(sessionId, text, batch, model) {
+    const history = await this.history(sessionId);
+    const marker = `[Agent Mail delivery ${batch.id}]`;
+    if (JSON.stringify(history).includes(marker)) return { alreadyAccepted: true };
+    const body = { parts: [{ type: 'text', text }], ...(model ? { model } : {}) };
+    const message = await new Promise((resolve, reject) => {
+      fetch(this.url + `/session/${encodeURIComponent(sessionId)}/message`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(30 * 60000),
+      }).then(async response => {
+        const payload = await response.text();
+        let data; try { data = JSON.parse(payload); } catch { data = payload.slice(0, 200); }
+        response.ok ? resolve(data) : reject(new Error(`OpenCode prompt failed: ${JSON.stringify(data).slice(0, 300)}`));
+      }).catch(reject);
+    });
+    return { reply: (message.parts || []).filter(p => p.type === 'text').map(p => p.text).join(' ').slice(0, 400) };
+  }
+}

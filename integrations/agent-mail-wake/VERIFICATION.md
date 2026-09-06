@@ -35,6 +35,15 @@ machine against Grok Build 1.0.3 / Agent Mail 0.3.32 / Node.js 24.3.0:
   (`missing field output_tokens_details` in `response.completed`); the
   `chat_completions` backend completes the loop.
 
+## OpenCode wake adapter (added locally, 2026-09-07)
+
+Verified on this machine against OpenCode 1.18.21 / Agent Mail 0.3.32:
+`opencode-mail` started `opencode serve`, created a session, woke on incoming
+mail, and the woken agent fetched its inbox and replied through the
+`mcp_agent_mail` tools (reply archived as `Re: oc wake` containing the agreed
+marker). `POST /session/:id/message` blocks until the turn completes, so no SSE
+event stream is required by the adapter.
+
 ## Fork packaging checks
 
 The fork preserves the original adapter sources and makes a small packaging

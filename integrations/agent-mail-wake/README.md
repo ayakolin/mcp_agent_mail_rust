@@ -14,10 +14,12 @@ external package dependencies.
 | Claude Code | Local MCP Channel plus native TUI | `claude-mail` |
 | Kimi Code | Managed Web/API session | `kimi-mail` |
 | Grok Build | Managed ACP session (`grok agent stdio`) | `grok-mail` |
+| OpenCode | Managed headless server session (`opencode serve`) | `opencode-mail` |
 
 A configured MCP connection alone does not automatically wake a client. These
-integrations do not take over arbitrary already-running sessions; the Grok
-adapter owns a managed ACP session rather than attaching to a live Grok TUI.
+integrations do not take over arbitrary already-running sessions; the Grok and
+OpenCode adapters own a managed session (ACP or headless server) rather than
+attaching to a live native TUI.
 
 ## Install
 
@@ -85,6 +87,10 @@ Grok runs headless: `grok-mail` owns a `grok agent --always-approve -m MODEL std
 process and prompts its ACP session per batch (`--session ID` reuses a stored
 session via `session/load`). It does not attach to a live Grok TUI.
 
+OpenCode runs its own headless server: `opencode-mail` starts `opencode serve`,
+creates a session, and POSTs each batch to `/session/ID/message`, which returns
+when the turn completes (`--session ID` reuses a stored session).
+
 Default polling is 3 seconds, with at most 5 events per batch and a pause after 8
 automatic deliveries. The polling itself does not invoke a model. Configure with
 `AGENT_MAIL_WAKE_INTERVAL_MS` and `AGENT_MAIL_WAKE_MAX_TURNS`.
@@ -95,8 +101,9 @@ See the Chinese guide for full session-resume commands and lifecycle details.
 The watcher stores a delivery cursor and pending batch before submission. It
 advances the cursor only after the receiving adapter accepts the batch. Codex
 checks thread history, Kimi uses a stable `prompt_id`, Grok records accepted batch
-IDs in its launcher-local binding ledger, and OMP checks custom-message
-records when reconciling retries. A cursor gap pauses instead of skipping history.
+IDs in its launcher-local binding ledger, OpenCode scans its session history for
+the delivery marker, and OMP checks custom-message records when reconciling
+retries. A cursor gap pauses instead of skipping history.
 These mechanisms do not provide exactly-once execution of an agent's tools.
 
 Claude Channel success means the notification was written to MCP, not that the
@@ -118,7 +125,7 @@ source-only import of the original local integration.
 | `common.mjs` | Mail protocol, identities, batching, durable cursor and pause controls |
 | `omp.mjs` | OMP extension lifecycle and incoming-message delivery |
 | `claude-channel.mjs` | Claude's stdio MCP Channel and control tools |
-| `rpc.mjs` | Codex App Server, Kimi Server API, and Grok ACP adapters |
+| `rpc.mjs` | Codex App Server, Kimi Server API, Grok ACP, and OpenCode adapters |
 | `cli.mjs` | Shared launcher, session binding, status and lifecycle commands |
 | `install.mjs` | Portable installer for sources, launchers and client config |
 | `test/` | Behavioral watcher/adapter tests and real filesystem installation tests |
