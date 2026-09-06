@@ -1076,6 +1076,63 @@ def tool(label, name, arguments, request_id):
     assert len(result["content"]) == 1, result
     return json.loads(result["content"][0]["text"])
 
+def lost_send_response():
+    arguments = {"project_key": project, "sender_name": "RedFox", "to": ["BluePeak"],
+        "subject": "Recover an indeterminate HTTP send", "body_md": "Retain exactly one lost-response message.",
+        "thread_id": "kp1in-lost-response", "ack_required": True,
+        "idempotency_key": "kp1in-lost-response", "format": "json"}
+    request = {"jsonrpc": "2.0", "id": 500, "method": "tools/call",
+               "params": {"name": "send_message", "arguments": arguments}}
+    (run / "lost_response.request.json").write_text(json.dumps(request))
+    # Fault injection at the client boundary: deliberately discard the real
+    # response body without parsing a tool result or learning its message ID.
+    # This is a lost-body case, not a claim that the network timed out.
+    with urllib.request.urlopen(urllib.request.Request(endpoint, data=json.dumps(request).encode(),
+                                 headers=headers), timeout=35) as response:
+        assert response.status == 200, response.status
+    observation = {"outcome": "indeterminate", "fault": "response_body_discarded",
+                   "response_body_bytes_read": 0, "request_id": 500}
+    (run / "lost_response.observation.json").write_text(json.dumps(observation))
+    with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
+        rows = conn.execute(
+            "SELECT m.id, m.body_md FROM messages m JOIN projects p ON p.id = m.project_id "
+            "WHERE p.human_key = ? AND m.thread_id = ?", (project, arguments["thread_id"])).fetchall()
+        assert len(rows) == 1 and rows[0][1] == arguments["body_md"], rows
+        committed_id = rows[0][0]
+        recipient_rows = conn.execute(
+            "SELECT a.name, r.kind, r.read_ts, r.ack_ts FROM message_recipients r "
+            "JOIN agents a ON a.id = r.agent_id WHERE r.message_id = ?", (committed_id,)).fetchall()
+        assert recipient_rows == [("BluePeak", "to", None, None)], recipient_rows
+    replay = tool("lost_response_retry", "send_message", arguments, 501)
+    assert replay["idempotent_replay"] is True, replay
+    assert replay["deliveries"][0]["payload"]["id"] == committed_id, replay
+    rpc("lost_response_changed_payload", "tools/call", {"name": "send_message",
+        "arguments": dict(arguments, body_md="This changed payload must not be committed.")}, 502,
+        expected_tool_error="IDEMPOTENCY_KEY_CONFLICT")
+    receipt_args = {"project_key": project, "message_id": committed_id}
+    receipt = tool("lost_response_receipt", "get_message_delivery_receipt", receipt_args, 503)
+    assert receipt["message_id"] == committed_id and len(receipt["recipients"]) == 1, receipt
+    recipient = receipt["recipients"][0]
+    assert recipient["recipient"] == "BluePeak" and recipient["persisted"] is True, receipt
+    assert recipient["acknowledged"] is False, receipt
+    peek = tool("lost_response_peek", "fetch_inbox", {"project_key": project,
+        "agent_name": "BluePeak", "include_bodies": True, "mark_read": False, "limit": 100}, 504)
+    matching = [row for row in peek if row.get("thread_id") == arguments["thread_id"]]
+    assert len(matching) == 1 and matching[0]["id"] == committed_id, matching
+    assert matching[0]["body_md"] == arguments["body_md"], matching
+    assert matching[0].get("read_ts") is None and matching[0].get("ack_ts") is None, matching
+    with closing(sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)) as conn:
+        assert conn.execute("SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
+                            (committed_id,)).fetchall() == [(None, None)], "peek consumed the lost-response message"
+    ack = tool("lost_response_ack", "acknowledge_message", {
+        "project_key": project, "agent_name": "BluePeak", "message_id": committed_id}, 505)
+    assert ack["acknowledged"] is True and ack["acknowledged_at"], ack
+    receipt = tool("lost_response_ack_receipt", "get_message_delivery_receipt", receipt_args, 506)
+    assert receipt["recipients"][0]["acknowledged"] is True, receipt
+    summary["lost_response"] = dict(observation, message_id=committed_id,
+                                    reconciled=True, idempotent_replay=True, acknowledged=True)
+    return committed_id, arguments
+
 def stop(signum):
     global server
     assert server.poll() is None, "server exited before its requested stop"
@@ -1432,6 +1489,7 @@ try:
                "message_id": message_id}, 4)
     assert ack["acknowledged"] is True and ack["acknowledged_at"], ack
     ring = concurrent_ring()
+    lost_id, lost_arguments = lost_send_response()
     product_and_slots()
     cursor_message_id, cursor_positions, cursor_roles, cursor_body = recipient_cursors()
     stop(signal.SIGTERM)
@@ -1460,11 +1518,15 @@ try:
             "JOIN agents a ON a.id = r.agent_id WHERE r.message_id = ?", (cursor_message_id,)).fetchall()
         assert sorted((row[0], row[1]) for row in cursor_rows) == sorted(cursor_roles.items()), cursor_rows
         assert all(row[2] and row[3] for row in cursor_rows), cursor_rows
+        lost_rows = conn.execute(
+            "SELECT id, body_md FROM messages WHERE thread_id = ?", (lost_arguments["thread_id"],)).fetchall()
+        assert lost_rows == [(lost_id, lost_arguments["body_md"])], lost_rows
         assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     archived = []
     ring_archived = []
     cursor_archived = []
+    lost_archived = []
     for path in Path(storage).glob("projects/*/messages/**/*.md"):
         content = path.read_text()
         if content.startswith("---json\n") and "\n---\n" in content:
@@ -1477,13 +1539,24 @@ try:
             if json.loads(metadata).get("id") == cursor_message_id:
                 assert archived_body.strip() == cursor_body
                 cursor_archived.append(path)
+            if json.loads(metadata).get("thread_id") == lost_arguments["thread_id"]:
+                lost_archived.append((json.loads(metadata)["id"], archived_body.strip()))
     assert len(archived) == 1, archived
     assert sorted(ring_archived) == sorted((row[0], row[2]) for row in expected_ring), ring_archived
     assert len(cursor_archived) == 1, cursor_archived
+    assert lost_archived == [(lost_id, lost_arguments["body_md"])], lost_archived
     summary["archive_message"] = str(archived[0])
 
     start("reopen")
     initialize("reopen")
+    lost_replay = tool("reopen_lost_response_retry", "send_message", lost_arguments, 507)
+    assert lost_replay["idempotent_replay"] is True, lost_replay
+    assert lost_replay["deliveries"][0]["payload"]["id"] == lost_id, lost_replay
+    lost_receipt = tool("reopen_lost_response_receipt", "get_message_delivery_receipt", {
+        "project_key": project, "message_id": lost_id}, 508)
+    assert len(lost_receipt["recipients"]) == 1, lost_receipt
+    assert lost_receipt["recipients"][0]["persisted"] is True, lost_receipt
+    assert lost_receipt["recipients"][0]["acknowledged"] is True, lost_receipt
     inbox = tool("reopen_inbox", "fetch_inbox", arguments, 2)
     assert any(row["id"] == message_id and row["body_md"] == body for row in inbox), inbox
     for index, (actor, value) in enumerate(ring.items()):
