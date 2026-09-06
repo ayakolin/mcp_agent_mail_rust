@@ -135,8 +135,15 @@ pub async fn macro_start_session(
     inbox_limit: Option<i32>,
     reaper_exempt: Option<bool>,
     pane_id: Option<String>,
+    /// Absolute socket path of the tmux server `pane_id` belongs to (the first
+    /// field of the caller's `$TMUX`). Pane ids are only unique per server
+    /// (GH#310). Over HTTP the daemon fills this from the `X-Tmux-Socket`
+    /// header and ignores any body value. Ignored when `pane_id` is absent.
+    tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
 ) -> McpResult<String> {
+    let tmux_socket_path =
+        crate::identity::validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let agent_name =
         agent_name.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
     let inbox_limit = parse_macro_inbox_limit(inbox_limit)?;
@@ -170,9 +177,10 @@ pub async fn macro_start_session(
     // fresh name is minted below), while a dead binding is adopted and its
     // record rewritten with this caller's pane facts.
     let resolved_name = agent_name.or_else(|| {
-        mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane(
+        mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane_on_server(
             &project.human_key,
             pane_id.as_deref(),
+            mcp_agent_mail_core::TmuxServer::from_validated(tmux_socket_path.as_deref()),
         )
         .and_then(|name| normalize_resolved_pane_agent_name(&name))
     });
@@ -187,6 +195,7 @@ pub async fn macro_start_session(
         None,
         reaper_exempt,
         pane_id,
+        tmux_socket_path,
         registration_proof,
     )
     .await?;
@@ -353,6 +362,7 @@ pub async fn macro_prepare_thread(
             model,
             agent_name,
             task_description,
+            None,
             None,
             None,
             None,

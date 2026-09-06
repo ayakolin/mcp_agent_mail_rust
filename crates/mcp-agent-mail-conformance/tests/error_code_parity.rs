@@ -355,6 +355,7 @@ fn validation_and_lookup_errors_have_expected_envelope_shape() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("empty program must fail");
@@ -368,6 +369,7 @@ fn validation_and_lookup_errors_have_expected_envelope_shape() {
             String::new(),
             Some("BlueLake".to_string()),
             Some("error code parity".to_string()),
+            None,
             None,
             None,
             None,
@@ -507,6 +509,7 @@ fn not_found_without_suggestions_and_missing_agent_have_expected_payload_fields(
             "gpt-5".to_string(),
             Some("BlueLake".to_string()),
             Some("error code parity".to_string()),
+            None,
             None,
             None,
             None,

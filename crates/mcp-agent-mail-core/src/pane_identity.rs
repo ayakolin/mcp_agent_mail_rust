@@ -48,6 +48,146 @@ const LIVENESS_PROBE_FORMAT: &str = "#{session_name}\t#{pane_pid}\t#{pane_curren
 const TARGET_FACTS_FORMAT: &str =
     "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{socket_path}";
 
+/// Upper bound on a caller-supplied tmux socket path, in bytes.
+///
+/// A generous *shape* bound, not a validity claim: tmux itself refuses socket
+/// paths that do not fit `sockaddr_un.sun_path` (104-108 bytes depending on
+/// the platform). The cap exists so a transport-derived value can never grow
+/// an HTTP header or `tmux` argv without limit.
+const MAX_TMUX_SOCKET_PATH_LEN: usize = 1024;
+
+// ---------------------------------------------------------------------------
+// Caller tmux server (GH#310)
+// ---------------------------------------------------------------------------
+
+/// The tmux server a caller-supplied pane id must be resolved against.
+///
+/// tmux pane ids (`%N`) are only unique *within one server*. The `am`
+/// `serve-http` daemon receives pane ids from CLI callers that may run under a
+/// different tmux server than the daemon's own ambient one (a non-default
+/// `-L`/`-S` socket, an orchestrator's private server, ...). Asking the
+/// ambient server about a foreign `%N` either fails (degrading to a
+/// legacy-unverified identity) or — worse — answers for an unrelated pane that
+/// happens to share the number, producing a *verified* binding for the wrong
+/// pane. Every pane-facts query therefore carries the server to ask.
+///
+/// [`TmuxServer::AMBIENT`] preserves the historical behavior (whatever
+/// `tmux` picks from `$TMUX` / the default socket); [`TmuxServer::at_socket`]
+/// pins the query to an explicit `tmux -S <socket>` server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TmuxServer<'a> {
+    socket_path: Option<&'a str>,
+}
+
+impl<'a> TmuxServer<'a> {
+    /// The server `tmux` selects on its own from the process environment.
+    pub const AMBIENT: Self = Self { socket_path: None };
+
+    /// A server pinned to an explicit socket path.
+    ///
+    /// The path must already have passed [`validate_tmux_socket_path`]: it is
+    /// handed to `tmux -S` as a single argv element (never a shell), so the
+    /// validator's job is to keep control characters and unbounded lengths
+    /// out of argv, not to prove the socket exists. A missing or dead socket
+    /// simply makes `tmux` fail and the caller falls back to the same
+    /// legacy-unverified path an unreachable ambient server produces.
+    #[must_use]
+    pub const fn at_socket(socket_path: &'a str) -> Self {
+        Self {
+            socket_path: Some(socket_path),
+        }
+    }
+
+    /// [`Self::at_socket`] when a validated path is present, otherwise
+    /// [`Self::AMBIENT`].
+    #[must_use]
+    pub const fn from_validated(socket_path: Option<&'a str>) -> Self {
+        Self { socket_path }
+    }
+
+    /// The pinned socket path, if any.
+    #[must_use]
+    pub const fn socket_path(self) -> Option<&'a str> {
+        self.socket_path
+    }
+
+    /// A `tmux` command addressed at this server.
+    fn command(self) -> std::process::Command {
+        let mut command = tmux_command();
+        if let Some(socket_path) = self.socket_path {
+            command.args(["-S", socket_path]);
+        }
+        command
+    }
+}
+
+/// Why a caller-supplied tmux socket path was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TmuxSocketPathError {
+    /// Empty after trimming.
+    Empty,
+    /// Longer than [`MAX_TMUX_SOCKET_PATH_LEN`] bytes.
+    TooLong,
+    /// Contains CR, LF, or NUL — never legitimate in a path, and the bytes
+    /// that would let a value smuggle an extra HTTP header or truncate argv.
+    ControlCharacter,
+    /// Not an absolute path. tmux resolves a relative `-S` against *its* cwd,
+    /// which is meaningless once the value has crossed a process boundary.
+    Relative,
+}
+
+impl std::fmt::Display for TmuxSocketPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "tmux socket path must not be empty",
+            Self::TooLong => "tmux socket path exceeds the maximum length",
+            Self::ControlCharacter => "tmux socket path must not contain CR, LF, or NUL",
+            Self::Relative => "tmux socket path must be absolute",
+        })
+    }
+}
+
+impl std::error::Error for TmuxSocketPathError {}
+
+/// Validate a tmux socket path that arrived from another process (the `$TMUX`
+/// first field on the CLI side; the `X-Tmux-Socket` header on the daemon side).
+///
+/// Accepts an absolute, control-character-free path of at most
+/// [`MAX_TMUX_SOCKET_PATH_LEN`] bytes and returns it trimmed. Existence is
+/// deliberately *not* checked: the value is only ever used as the `-S` argument
+/// of a `tmux display-message` query, which never creates files and fails
+/// cleanly when nothing listens there.
+pub fn validate_tmux_socket_path(raw: &str) -> Result<String, TmuxSocketPathError> {
+    if raw
+        .bytes()
+        .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+    {
+        return Err(TmuxSocketPathError::ControlCharacter);
+    }
+    let socket_path = raw.trim();
+    if socket_path.is_empty() {
+        return Err(TmuxSocketPathError::Empty);
+    }
+    if socket_path.len() > MAX_TMUX_SOCKET_PATH_LEN {
+        return Err(TmuxSocketPathError::TooLong);
+    }
+    if !Path::new(socket_path).is_absolute() {
+        return Err(TmuxSocketPathError::Relative);
+    }
+    Ok(socket_path.to_string())
+}
+
+/// The caller's own tmux server socket from `$TMUX`
+/// (`<socket_path>,<server_pid>,<session_index>`), validated with
+/// [`validate_tmux_socket_path`]. `None` outside tmux or when the value is
+/// malformed — callers then fall back to the ambient server exactly as before.
+#[must_use]
+pub fn tmux_env_socket_path_validated() -> Option<String> {
+    let value = crate::config::process_env_value("TMUX")?;
+    let first = value.split(',').next()?;
+    validate_tmux_socket_path(first).ok()
+}
+
 /// tmux format that reports only the bare pane id (`%97`) of a target pane.
 // A tmux format placeholder, not a Rust one.
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -365,6 +505,25 @@ pub fn write_identity(
     pane_id: &str,
     agent_name: &str,
 ) -> std::io::Result<PathBuf> {
+    write_identity_on_server(project_key, pane_id, TmuxServer::AMBIENT, agent_name)
+}
+
+/// [`write_identity`] with the pane's binding facts gathered from an explicit
+/// tmux server (GH#310).
+///
+/// `server` is the tmux server the caller's `pane_id` belongs to. A daemon
+/// writing an identity on behalf of a remote caller must pass the caller's
+/// server, otherwise the facts (and the GH#252 live-holder check) describe
+/// whichever unrelated pane shares that `%N` on the daemon's ambient server.
+///
+/// # Errors
+/// As [`write_identity`].
+pub fn write_identity_on_server(
+    project_key: &str,
+    pane_id: &str,
+    server: TmuxServer<'_>,
+    agent_name: &str,
+) -> std::io::Result<PathBuf> {
     let path = canonical_identity_path(project_key, pane_id);
     if let Some(parent) = path.parent() {
         ensure_real_directory(parent)?;
@@ -379,7 +538,7 @@ pub fn write_identity(
         ));
     }
 
-    let facts = query_target_pane_facts(pane_id);
+    let facts = query_target_pane_facts(pane_id, server);
 
     // GH#252: never overwrite a verifiably live binding held by another pane.
     if let Some(existing) = read_identity_record(&path)
@@ -470,7 +629,20 @@ pub fn resolve_identity_with_binding(
     project_key: &str,
     pane_id: &str,
 ) -> Option<(String, PathBuf, PaneBindingStatus)> {
-    let mut resolver = PaneBindingResolver::new(pane_id);
+    resolve_identity_with_binding_on_server(project_key, pane_id, TmuxServer::AMBIENT)
+}
+
+/// [`resolve_identity_with_binding`] with every tmux query for `pane_id`
+/// addressed at an explicit server (GH#310): the bare/composite key
+/// normalization, the target-pane facts behind the GH#252 adoption rule, and
+/// the holder check that decides whether a live record belongs to this caller.
+#[must_use]
+pub fn resolve_identity_with_binding_on_server(
+    project_key: &str,
+    pane_id: &str,
+    server: TmuxServer<'_>,
+) -> Option<(String, PathBuf, PaneBindingStatus)> {
+    let mut resolver = PaneBindingResolver::new(pane_id, server);
 
     // 1. Canonical path (composite or bare)
     let canonical = canonical_identity_path(project_key, pane_id);
@@ -491,7 +663,7 @@ pub fn resolve_identity_with_binding(
     // ask about their own pane on a host where tmux is not reachable.
     let bare_candidates: Vec<String> = if pane_id.contains(':') {
         let mut candidates = Vec::new();
-        if let Some(bare) = bare_for_composite_pane(pane_id)
+        if let Some(bare) = bare_for_composite_pane(pane_id, server)
             && bare != pane_id
         {
             candidates.push(bare);
@@ -524,7 +696,7 @@ pub fn resolve_identity_with_binding(
     //     call, or a trusted `X-Tmux-Pane` header — would otherwise miss its own
     //     composite-keyed identity (GH#177 Defect 2).
     if !pane_id.contains(':')
-        && let Some(composite) = composite_for_bare_pane(pane_id)
+        && let Some(composite) = composite_for_bare_pane(pane_id, server)
         && composite != pane_id
     {
         let composite_canonical = canonical_identity_path(project_key, &composite);
@@ -641,9 +813,23 @@ pub fn resolve_identity_with_optional_pane(
     project_key: &str,
     pane_id: Option<&str>,
 ) -> Option<String> {
+    resolve_identity_with_optional_pane_on_server(project_key, pane_id, TmuxServer::AMBIENT)
+}
+
+/// [`resolve_identity_with_optional_pane`] resolving an explicit pane against
+/// an explicit tmux server (GH#310). `server` only applies to the explicit
+/// pane: with no pane supplied the lookup is for *this* process's own pane,
+/// which by definition lives on the ambient server.
+#[must_use]
+pub fn resolve_identity_with_optional_pane_on_server(
+    project_key: &str,
+    pane_id: Option<&str>,
+    server: TmuxServer<'_>,
+) -> Option<String> {
     let trimmed = pane_id.map(str::trim).filter(|pane| !pane.is_empty());
     if let Some(pane) = trimmed {
-        return resolve_identity_for_pane(project_key, Some(pane));
+        return resolve_identity_with_binding_on_server(project_key, pane, server)
+            .map(|(name, _, _)| name);
     }
     resolve_identity_current_pane(project_key)
 }
@@ -670,9 +856,22 @@ pub fn write_identity_with_optional_pane(
     pane_id: Option<&str>,
     agent_name: &str,
 ) -> Option<std::io::Result<PathBuf>> {
+    write_identity_with_optional_pane_on_server(project_key, pane_id, TmuxServer::AMBIENT, agent_name)
+}
+
+/// [`write_identity_with_optional_pane`] gathering the explicit pane's binding
+/// facts from an explicit tmux server (GH#310). As with resolution, `server`
+/// only applies to an explicit pane; this process's own pane is ambient.
+#[must_use]
+pub fn write_identity_with_optional_pane_on_server(
+    project_key: &str,
+    pane_id: Option<&str>,
+    server: TmuxServer<'_>,
+    agent_name: &str,
+) -> Option<std::io::Result<PathBuf>> {
     let trimmed = pane_id.map(str::trim).filter(|pane| !pane.is_empty());
     if let Some(pane) = trimmed {
-        return write_identity_for_pane(project_key, Some(pane), agent_name);
+        return Some(write_identity_on_server(project_key, pane, server, agent_name));
     }
     write_identity_current_pane(project_key, agent_name)
 }
@@ -1037,9 +1236,10 @@ fn pane_target_for(pane_id: &str) -> Option<String> {
 /// Query tmux (in the caller's environment) for the binding facts of the pane
 /// named by `pane_id`. Returns `None` when tmux is unavailable or the pane
 /// does not exist — the caller then behaves as it did before GH#252.
-fn query_target_pane_facts(pane_id: &str) -> Option<TargetPaneFacts> {
+fn query_target_pane_facts(pane_id: &str, server: TmuxServer<'_>) -> Option<TargetPaneFacts> {
     let target = pane_target_for(pane_id)?;
-    let output = tmux_command()
+    let output = server
+        .command()
         .args(["display-message", "-t", &target, "-p", TARGET_FACTS_FORMAT])
         .output()
         .ok()?;
@@ -1047,11 +1247,15 @@ fn query_target_pane_facts(pane_id: &str) -> Option<TargetPaneFacts> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_target_facts_line(stdout.lines().next()?)
+    parse_target_facts_line(stdout.lines().next()?, server)
 }
 
 /// Parse one `TARGET_FACTS_FORMAT` line into [`TargetPaneFacts`].
-fn parse_target_facts_line(line: &str) -> Option<TargetPaneFacts> {
+///
+/// When tmux reports an empty `#{socket_path}` (older servers), the socket is
+/// taken from the server the query was addressed at — the explicit `-S` path,
+/// or `$TMUX` for the ambient server.
+fn parse_target_facts_line(line: &str, server: TmuxServer<'_>) -> Option<TargetPaneFacts> {
     let mut fields = line.split('\t');
     let session_name = fields.next()?.trim().to_string();
     let pane = fields.next()?.trim().to_string();
@@ -1062,7 +1266,11 @@ fn parse_target_facts_line(line: &str) -> Option<TargetPaneFacts> {
         return None;
     }
     let socket_path = if socket_path.is_empty() {
-        tmux_env_socket_path().unwrap_or_default()
+        server
+            .socket_path()
+            .map(str::to_string)
+            .or_else(tmux_env_socket_path)
+            .unwrap_or_default()
     } else {
         socket_path
     };
@@ -1122,16 +1330,19 @@ fn adopt_record_at(path: &Path, name: &str, facts: &TargetPaneFacts) {
 /// Lazily gathers the target pane's facts once (the pane named by the
 /// caller's `pane_id` argument — the reuse-seed slot every candidate key in
 /// the lookup order describes) and classifies each candidate record found.
-struct PaneBindingResolver {
+struct PaneBindingResolver<'a> {
     pane_arg: String,
+    /// The tmux server `pane_arg` belongs to (GH#310).
+    server: TmuxServer<'a>,
     facts_queried: bool,
     facts: Option<TargetPaneFacts>,
 }
 
-impl PaneBindingResolver {
-    fn new(pane_id: &str) -> Self {
+impl<'a> PaneBindingResolver<'a> {
+    fn new(pane_id: &str, server: TmuxServer<'a>) -> Self {
         Self {
             pane_arg: pane_id.to_string(),
+            server,
             facts_queried: false,
             facts: None,
         }
@@ -1139,7 +1350,7 @@ impl PaneBindingResolver {
 
     fn target_facts(&mut self) -> Option<&TargetPaneFacts> {
         if !self.facts_queried {
-            self.facts = query_target_pane_facts(&self.pane_arg);
+            self.facts = query_target_pane_facts(&self.pane_arg, self.server);
             self.facts_queried = true;
         }
         self.facts.as_ref()
@@ -1610,12 +1821,13 @@ pub fn get_composite_tmux_pane_id() -> Option<String> {
 /// the daemon for a caller-provided pane (GH#177 Defect 2). Returns `None` when
 /// tmux is unavailable, the pane is unknown, or the answer isn't a composite key.
 #[must_use]
-fn composite_for_bare_pane(pane_id: &str) -> Option<String> {
+fn composite_for_bare_pane(pane_id: &str, server: TmuxServer<'_>) -> Option<String> {
     let pane = pane_id.trim();
     if pane.is_empty() {
         return None;
     }
-    let output = tmux_command()
+    let output = server
+        .command()
         .args([
             "display-message",
             "-t",
@@ -1639,9 +1851,10 @@ fn composite_for_bare_pane(pane_id: &str) -> Option<String> {
 /// `session:window:pane` form and tmux's own `session:window.pane` form
 /// resolve. Returns `None` when tmux is unavailable, the pane does not exist,
 /// or the answer is not a bare `%N` pane id.
-fn bare_for_composite_pane(pane_id: &str) -> Option<String> {
+fn bare_for_composite_pane(pane_id: &str, server: TmuxServer<'_>) -> Option<String> {
     let target = pane_target_for(pane_id)?;
-    let output = tmux_command()
+    let output = server
+        .command()
         .args(["display-message", "-t", &target, "-p", PANE_ID_FORMAT])
         .output()
         .ok()?;
@@ -2492,6 +2705,267 @@ mod tests {
                 "explicit pane must not fall back to TMUX_PANE when a different pane is supplied"
             );
         });
+        drop(config);
+    }
+
+    // ── GH#310: caller tmux server ─────────────────────────────────────────
+
+    #[test]
+    fn validate_tmux_socket_path_accepts_absolute_paths_and_trims() {
+        assert_eq!(
+            validate_tmux_socket_path("/tmp/tmux-1000/default"),
+            Ok("/tmp/tmux-1000/default".to_string())
+        );
+        assert_eq!(
+            validate_tmux_socket_path("  /tmp/tmux-1000/ntm \t"),
+            Ok("/tmp/tmux-1000/ntm".to_string())
+        );
+        // Existence is deliberately not part of the contract.
+        assert!(validate_tmux_socket_path("/definitely/not/there").is_ok());
+    }
+
+    #[test]
+    fn validate_tmux_socket_path_rejects_hostile_shapes() {
+        assert_eq!(validate_tmux_socket_path(""), Err(TmuxSocketPathError::Empty));
+        assert_eq!(
+            validate_tmux_socket_path("   "),
+            Err(TmuxSocketPathError::Empty)
+        );
+        assert_eq!(
+            validate_tmux_socket_path("relative/socket"),
+            Err(TmuxSocketPathError::Relative)
+        );
+        assert_eq!(
+            validate_tmux_socket_path("./socket"),
+            Err(TmuxSocketPathError::Relative)
+        );
+        for hostile in ["/tmp/ok\r\nX-Evil: 1", "/tmp/ok\n", "/tmp/nul\0byte"] {
+            assert_eq!(
+                validate_tmux_socket_path(hostile),
+                Err(TmuxSocketPathError::ControlCharacter),
+                "{hostile:?}"
+            );
+        }
+        // Control characters are rejected even when trimming would hide them.
+        assert_eq!(
+            validate_tmux_socket_path("/tmp/ok\n  "),
+            Err(TmuxSocketPathError::ControlCharacter)
+        );
+        let at_limit = format!("/{}", "x".repeat(MAX_TMUX_SOCKET_PATH_LEN - 1));
+        assert!(validate_tmux_socket_path(&at_limit).is_ok());
+        let too_long = format!("/{}", "x".repeat(MAX_TMUX_SOCKET_PATH_LEN));
+        assert_eq!(
+            validate_tmux_socket_path(&too_long),
+            Err(TmuxSocketPathError::TooLong)
+        );
+    }
+
+    #[test]
+    fn tmux_env_socket_path_validated_takes_the_first_tmux_field() {
+        crate::config::with_process_env_overrides_for_test(
+            &[("TMUX", "/tmp/tmux-1000/ntm,4242,3")],
+            || {
+                assert_eq!(
+                    tmux_env_socket_path_validated().as_deref(),
+                    Some("/tmp/tmux-1000/ntm")
+                );
+            },
+        );
+        for malformed in ["", ",1,0", "relative,1,0", "/tmp/ok\r\nX: y,1,0"] {
+            crate::config::with_process_env_overrides_for_test(&[("TMUX", malformed)], || {
+                assert_eq!(
+                    tmux_env_socket_path_validated(),
+                    None,
+                    "malformed TMUX must degrade to the ambient server: {malformed:?}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn tmux_server_command_pins_explicit_socket_only() {
+        let ambient = TmuxServer::AMBIENT.command();
+        assert!(ambient.get_args().next().is_none());
+        let pinned = TmuxServer::at_socket("/tmp/tmux-1000/ntm").command();
+        let args: Vec<_> = pinned.get_args().collect();
+        assert_eq!(args, ["-S", "/tmp/tmux-1000/ntm"]);
+        assert_eq!(TmuxServer::from_validated(None), TmuxServer::AMBIENT);
+        assert_eq!(
+            TmuxServer::from_validated(Some("/s")).socket_path(),
+            Some("/s")
+        );
+    }
+
+    /// A tmux stub simulating TWO servers that both own a pane `%7`: the
+    /// daemon's ambient server (no `-S`; session `daemon-session`, pid 1111)
+    /// and the caller's server at `caller_sock` (session `caller-session`,
+    /// pid 4242). Liveness probes (always `-S <recorded socket>`) answer for
+    /// whichever server they name.
+    #[cfg(unix)]
+    fn two_server_stub_script(caller_sock: &str, ambient_sock: &str) -> String {
+        r#"#!/bin/sh
+sock=""; fmt=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = "-S" ]; then sock="$a"; fi
+  if [ "$prev" = "-p" ]; then fmt="$a"; fi
+  prev="$a"
+done
+case "$fmt" in
+  *'#{pane_id}'*'#{socket_path}'*)
+    if [ "$sock" = "@CALLER@" ]; then printf 'caller-session\t%%7\t4242\tclaude\t@CALLER@\n'; exit 0; fi
+    if [ -z "$sock" ]; then printf 'daemon-session\t%%7\t1111\tclaude\t@AMBIENT@\n'; exit 0; fi
+    exit 1;;
+  *'#{pane_pid}'*)
+    if [ "$sock" = "@CALLER@" ]; then printf 'caller-session\t4242\tclaude\n'; exit 0; fi
+    if [ "$sock" = "@AMBIENT@" ]; then printf 'daemon-session\t1111\tclaude\n'; exit 0; fi
+    exit 1;;
+  *) exit 1;;
+esac
+"#
+        .replace("@CALLER@", caller_sock)
+        .replace("@AMBIENT@", ambient_sock)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_identity_on_server_records_the_callers_pane_not_the_ambient_collision() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("gh310-write");
+        let caller_sock = config.tempdir.path().join("caller-sock");
+        let ambient_sock = config.tempdir.path().join("ambient-sock");
+        for sock in [&caller_sock, &ambient_sock] {
+            std::fs::write(sock, b"").expect("socket placeholder");
+        }
+        let caller_text = caller_sock.to_string_lossy().into_owned();
+        let ambient_text = ambient_sock.to_string_lossy().into_owned();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let tmux_bin = write_tmux_stub(
+            stub_dir.path(),
+            &two_server_stub_script(&caller_text, &ambient_text),
+        );
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str())],
+            || {
+                // The bug: the ambient lookup "verifies" the daemon's own %7.
+                let ambient_path =
+                    write_identity(&project, "%7", "BlueLake").expect("ambient write");
+                let ambient = read_identity_record(&ambient_path).expect("ambient record");
+                assert_eq!(ambient.session_name.as_deref(), Some("daemon-session"));
+                assert_eq!(ambient.pane_pid, Some(1111));
+                assert_eq!(ambient.socket_path.as_deref(), Some(ambient_text.as_str()));
+
+                // The fix: pinned to the caller's server, the record describes
+                // the caller's pane. (Same holder check passes: the existing
+                // ambient record is live on ITS server, but this write names a
+                // different socket, so it must be refused as a live holder
+                // elsewhere — exercise that on a fresh key instead.)
+                let path = write_identity_on_server(
+                    &project,
+                    "alpha:0:7",
+                    TmuxServer::at_socket(&caller_text),
+                    "GreenLake",
+                )
+                .expect("caller-server write");
+                let record = read_identity_record(&path).expect("caller record");
+                assert_eq!(record.name, "GreenLake");
+                assert_eq!(record.session_name.as_deref(), Some("caller-session"));
+                assert_eq!(record.pane_id.as_deref(), Some("%7"));
+                assert_eq!(record.pane_pid, Some(4242));
+                assert_eq!(record.socket_path.as_deref(), Some(caller_text.as_str()));
+
+                // GH#252 still holds across servers: the ambient %7 record is a
+                // live binding on the ambient server, so a caller-server write
+                // to that same key is a different holder and is refused.
+                let refused =
+                    write_identity_on_server(&project, "%7", TmuxServer::at_socket(&caller_text), "RedStone");
+                assert!(
+                    refused.is_err(),
+                    "live binding held on another server must not be overwritten"
+                );
+                let untouched = read_identity_record(&ambient_path).expect("ambient record");
+                assert_eq!(untouched.name, "BlueLake");
+            },
+        );
+        drop(config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_identity_with_binding_on_server_verifies_holder_on_the_callers_server() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("gh310-resolve");
+        let caller_sock = config.tempdir.path().join("caller-sock");
+        let ambient_sock = config.tempdir.path().join("ambient-sock");
+        for sock in [&caller_sock, &ambient_sock] {
+            std::fs::write(sock, b"").expect("socket placeholder");
+        }
+        let caller_text = caller_sock.to_string_lossy().into_owned();
+        let ambient_text = ambient_sock.to_string_lossy().into_owned();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let tmux_bin = write_tmux_stub(
+            stub_dir.path(),
+            &two_server_stub_script(&caller_text, &ambient_text),
+        );
+
+        // A record correctly bound to the CALLER's %7.
+        let path = canonical_identity_path(&project, "%7");
+        write_record_fixture(
+            &path,
+            &serde_json::to_string(&PaneIdentityRecord {
+                name: "GreenLake".to_string(),
+                session_name: Some("caller-session".to_string()),
+                pane_id: Some("%7".to_string()),
+                pane_pid: Some(4242),
+                socket_path: Some(caller_text.clone()),
+                written_at: Some("2026-09-05T00:00:00Z".to_string()),
+            })
+            .expect("serialize"),
+        );
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str())],
+            || {
+                // Ambient resolution sees a live binding whose holder facts
+                // (socket) differ from the daemon's %7 → "live holder
+                // elsewhere" → None: the caller would be handed a fresh name
+                // for a pane it already owns.
+                assert_eq!(resolve_identity_with_binding(&project, "%7"), None);
+
+                // Resolved against the caller's server, the holder matches and
+                // the binding is verified live.
+                let (name, hit_path, status) = resolve_identity_with_binding_on_server(
+                    &project,
+                    "%7",
+                    TmuxServer::at_socket(&caller_text),
+                )
+                .expect("caller-server resolution");
+                assert_eq!(name, "GreenLake");
+                assert_eq!(hit_path, path);
+                assert_eq!(status, PaneBindingStatus::VerifiedLive);
+
+                // The optional-pane wrappers agree.
+                assert_eq!(
+                    resolve_identity_with_optional_pane_on_server(
+                        &project,
+                        Some("%7"),
+                        TmuxServer::at_socket(&caller_text),
+                    )
+                    .as_deref(),
+                    Some("GreenLake")
+                );
+                assert_eq!(
+                    resolve_identity_with_optional_pane_on_server(
+                        &project,
+                        Some(" %7 "),
+                        TmuxServer::at_socket(&caller_text),
+                    )
+                    .as_deref(),
+                    Some("GreenLake"),
+                    "pane id is trimmed"
+                );
+            },
+        );
         drop(config);
     }
 
