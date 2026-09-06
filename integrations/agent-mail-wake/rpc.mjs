@@ -107,16 +107,31 @@ export class KimiAdapter {
     return result.data;
   }
   async canDeliver() {
-    const session = await this.request(`/api/v1/sessions/${encodeURIComponent(this.session)}`);
-    return !session.main_turn_active && session.pending_interaction === 'none';
+    // The prompt queue accepts submissions in every turn state; a queued batch
+    // is steered into the active turn on delivery. The GET doubles as a
+    // session-liveness probe — a dead session still throws here.
+    await this.request(`/api/v1/sessions/${encodeURIComponent(this.session)}`);
+    return true;
   }
   async deliver(text, batch) {
+    const promptId = `mail_${batch.id}`;
+    const route = `/api/v1/sessions/${encodeURIComponent(this.session)}/prompts`;
     try {
-      return await this.request(`/api/v1/sessions/${encodeURIComponent(this.session)}/prompts`, {
-        prompt_id: `mail_${batch.id}`, content: [{ type: 'text', text }],
-      });
+      await this.request(route, { prompt_id: promptId, content: [{ type: 'text', text }] });
     } catch (error) {
-      if ([40903, 40927].includes(error.code)) return { alreadyAccepted: true };
+      // 40903: prompt_id belongs to an already-completed prompt (replay after success).
+      if (error.code === 40903) return { alreadyAccepted: true };
+      // 40927: prompt_id already reserved by an in-flight prompt — fall through and steer it.
+      if (error.code !== 40927) throw error;
+    }
+    // A submission while the main turn is active lands in the session queue and
+    // would otherwise wait for the whole turn; steer it so the running turn
+    // consumes it at the next model iteration. 40402 = no longer queued (already
+    // running or completed — an idle submission starts its turn immediately).
+    try {
+      return await this.request(`${route}:steer`, { prompt_ids: [promptId] });
+    } catch (error) {
+      if (error.code === 40402) return { steered: false, alreadyRunning: true };
       throw error;
     }
   }
@@ -199,9 +214,13 @@ export class GrokACP extends EventEmitter {
   }
 }
 
-// OpenCode exposes a headless HTTP server (`opencode serve`) whose
-// POST /session/:id/message call blocks until the assistant turn completes,
-// so the response doubles as the delivery acknowledgment.
+// OpenCode exposes a headless HTTP server (`opencode serve`). Delivery uses the
+// v2 prompt endpoint with `delivery: "steer"`: the call returns as soon as the
+// prompt is admitted, a busy session consumes it at the next step boundary
+// (verified: a steered prompt ended a multi-step tool turn at the first
+// boundary instead of after the turn), and an idle session starts a new turn.
+// The v1 `POST /session/:id/message` blocks until the turn completes and queues
+// behind a busy turn, so it is only kept for session creation.
 export class OpenCodeAdapter {
   constructor(url, fetchImpl = fetch) { this.url = localUrl(url).replace(/\/$/, ''); this.fetch = fetchImpl; }
   async request(path, body) {
@@ -217,23 +236,27 @@ export class OpenCodeAdapter {
     return data;
   }
   async openSession(title) { return (await this.request('/session', { title })).id; }
-  async history(sessionId) { const rows = await this.request(`/session/${encodeURIComponent(sessionId)}/message`); return Array.isArray(rows) ? rows : rows.data || []; }
+  async setModel(sessionId, model) {
+    // v2 ModelRef: { providerID, id }. The v2 prompt endpoint has no per-request
+    // model field, so the session model is switched once at setup.
+    const [providerID, ...rest] = model.split('/');
+    await this.request(`/api/session/${encodeURIComponent(sessionId)}/model`, {
+      model: { providerID, id: rest.join('/') },
+    });
+  }
+  async history(sessionId) {
+    // v2 messages are not visible through the v1 message list; read v2.
+    const rows = await this.request(`/api/session/${encodeURIComponent(sessionId)}/message`);
+    return Array.isArray(rows) ? rows : rows.data || [];
+  }
   async canDeliver(sessionId) { await this.history(sessionId); return true; }
-  async deliver(sessionId, text, batch, model) {
+  async deliver(sessionId, text, batch) {
     const history = await this.history(sessionId);
     const marker = `[Agent Mail delivery ${batch.id}]`;
     if (JSON.stringify(history).includes(marker)) return { alreadyAccepted: true };
-    const body = { parts: [{ type: 'text', text }], ...(model ? { model } : {}) };
-    const message = await new Promise((resolve, reject) => {
-      fetch(this.url + `/session/${encodeURIComponent(sessionId)}/message`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body), signal: AbortSignal.timeout(30 * 60000),
-      }).then(async response => {
-        const payload = await response.text();
-        let data; try { data = JSON.parse(payload); } catch { data = payload.slice(0, 200); }
-        response.ok ? resolve(data) : reject(new Error(`OpenCode prompt failed: ${JSON.stringify(data).slice(0, 300)}`));
-      }).catch(reject);
+    const result = await this.request(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
+      prompt: { text }, delivery: 'steer',
     });
-    return { reply: (message.parts || []).filter(p => p.type === 'text').map(p => p.text).join(' ').slice(0, 400) };
+    return { admitted: true, messageId: result?.data?.id ?? result?.id ?? null };
   }
 }

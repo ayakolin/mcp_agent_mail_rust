@@ -74,16 +74,68 @@ test('Codex refuses delivery while the thread is in an error state', async () =>
   await assert.rejects(adapter.deliver('text', { id: 'batch' }), /systemError/);
 });
 
-test('Kimi retries use a stable prompt ID and respect outstanding approvals', async () => {
+test('Kimi submits with a stable prompt ID and steers the queue into the active turn', async () => {
   const adapter = new KimiAdapter('http://127.0.0.1:12345', () => 'unused', 'session');
-  let status = { main_turn_active: false, pending_interaction: 'approval' }, submitted;
+  let status = { main_turn_active: true, pending_interaction: 'approval' }, calls = [];
   adapter.request = async (route, body) => {
-    if (body) { submitted = body; const error = new Error('already received'); error.code = 40927; throw error; }
+    calls.push({ route, body });
+    if (route.endsWith(':steer')) return { steered: true, prompt_ids: body.prompt_ids };
+    if (body) return {};
     return status;
   };
-  assert.equal(await adapter.canDeliver(), false);
-  status.pending_interaction = 'none'; assert.equal(await adapter.canDeliver(), true);
-  assert.deepEqual(await adapter.deliver('text', { id: 'fixed' }), { alreadyAccepted: true });
-  assert.equal(submitted.prompt_id, 'mail_fixed');
-  assert.equal(submitted.permission_mode, undefined);
+  // Turn state no longer gates delivery: a queued prompt is steered into the turn.
+  assert.equal(await adapter.canDeliver(), true);
+  const result = await adapter.deliver('text', { id: 'fixed' });
+  assert.deepEqual(result, { steered: true, prompt_ids: ['mail_fixed'] });
+  const submit = calls.find(call => call.route.endsWith('/prompts'));
+  const steer = calls.find(call => call.route.endsWith('/prompts:steer'));
+  assert.equal(submit.body.prompt_id, 'mail_fixed');
+  assert.equal(submit.body.permission_mode, undefined);
+  assert.deepEqual(steer.body.prompt_ids, ['mail_fixed']);
+});
+
+test('Kimi replay of a completed prompt skips the steer; in-flight prompt is steered', async () => {
+  const adapter = new KimiAdapter('http://127.0.0.1:12345', () => 'unused', 'session');
+  let calls = [];
+  adapter.request = async (route, body) => {
+    calls.push(route);
+    if (body && body.prompt_id === 'mail_done') { const error = new Error('completed'); error.code = 40903; throw error; }
+    if (body && body.prompt_id === 'mail_flying') { const error = new Error('in flight'); error.code = 40927; throw error; }
+    if (body) return { steered: true, prompt_ids: body.prompt_ids };
+    return {};
+  };
+  assert.deepEqual(await adapter.deliver('text', { id: 'done' }), { alreadyAccepted: true });
+  assert.equal(calls.filter(route => route.endsWith(':steer')).length, 0);
+  assert.deepEqual(await adapter.deliver('text', { id: 'flying' }), { steered: true, prompt_ids: ['mail_flying'] });
+});
+
+test('Kimi treats a vanished queue entry as already running', async () => {
+  const adapter = new KimiAdapter('http://127.0.0.1:12345', () => 'unused', 'session');
+  adapter.request = async (route, body) => {
+    if (body?.prompt_ids) { const error = new Error('not queued'); error.code = 40402; throw error; }
+    if (body) return {};
+    return {};
+  };
+  assert.deepEqual(await adapter.deliver('text', { id: 'gone' }), { steered: false, alreadyRunning: true });
+});
+
+test('OpenCode delivers via the v2 steer endpoint and reconciles by marker', async () => {
+  const { OpenCodeAdapter } = await import('../rpc.mjs');
+  const adapter = new OpenCodeAdapter('http://127.0.0.1:12345');
+  let history = [], calls = [];
+  adapter.request = async (route, body) => {
+    calls.push({ route, body });
+    if (body) return { data: { id: 'msg_steer1', admittedSeq: 3 } };
+    return { data: history };
+  };
+  const result = await adapter.deliver('ses_1', 'text', { id: 'b1' });
+  assert.deepEqual(result, { admitted: true, messageId: 'msg_steer1' });
+  const prompt = calls.find(call => call.route === '/api/session/ses_1/prompt');
+  assert.equal(prompt.body.delivery, 'steer');
+  assert.equal(prompt.body.prompt.text, 'text');
+  assert.ok(calls.every(call => !call.route.includes('/session/ses_1/message') || call.route.startsWith('/api/')));
+  // Marker already in history -> no second submission.
+  history = [{ content: [{ type: 'text', text: '[Agent Mail delivery b1]' }] }];
+  assert.deepEqual(await adapter.deliver('ses_1', 'text', { id: 'b1' }), { alreadyAccepted: true });
+  assert.equal(calls.filter(call => call.body).length, 1);
 });

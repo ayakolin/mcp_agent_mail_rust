@@ -168,9 +168,7 @@ async function opencodeMain(options) {
   watcher = new MailWatcher({ host: 'opencode', session: sessionKey, project,
     model: options.model || 'configured-model',
     canDeliver: () => adapter && proc?.exitCode === null,
-    deliver: (text, batch) => adapter.deliver(session, text, batch,
-      options.model ? { providerID: options.model.split('/')[0], modelID: options.model.split('/').slice(1).join('/') } : undefined)
-      .then(result => { if (result.reply) process.stderr.write(`[Agent Mail] opencode replied: ${result.reply}\n`); return result; }),
+    deliver: (text, batch) => adapter.deliver(session, text, batch),
     onStatus: report });
   await watcher.init({ start: false });
   const server = `http://127.0.0.1:${await freePort()}`;
@@ -179,6 +177,7 @@ async function opencodeMain(options) {
   adapter = new OpenCodeAdapter(server);
   await waitFor(() => adapter.request('/session'), 'OpenCode server', proc);
   session = options.session || await adapter.openSession(`Agent Mail ${watcher.state.agent}`);
+  if (options.model) await adapter.setModel(session, options.model);
   saveJson(path.join(DATA_ROOT, 'bindings', `${watcher.id}.json`), { host: 'opencode', server, session, project, agent: watcher.state.agent });
   process.stderr.write(`OpenCode session: ${session}\nKeep this launcher running; it owns the headless server.\n${identityInstructions(watcher.state)}\n`);
   proc.on('exit', () => { if (!stopping) void shutdown().then(() => process.exit(1)); });

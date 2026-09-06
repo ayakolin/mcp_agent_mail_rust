@@ -41,8 +41,8 @@ Verified on this machine against OpenCode 1.18.21 / Agent Mail 0.3.32:
 `opencode-mail` started `opencode serve`, created a session, woke on incoming
 mail, and the woken agent fetched its inbox and replied through the
 `mcp_agent_mail` tools (reply archived as `Re: oc wake` containing the agreed
-marker). `POST /session/:id/message` blocks until the turn completes, so no SSE
-event stream is required by the adapter.
+marker). Delivery later moved to the v2 steer endpoint — see the mid-turn
+delivery section below.
 
 ## Codex mid-turn steer delivery (2026-09-07)
 
@@ -72,6 +72,44 @@ Server's `turn/steer`. Verified live against Codex 0.153.4
 until the model consumes it, so a steer accepted immediately before a watcher
 crash can be re-steered once on restart; the batch prompt instructs the model
 to process each message once.
+
+## Mid-turn delivery for Kimi, OpenCode and OMP (2026-09-07)
+
+The remaining idle-gated adapters were moved to mid-turn injection and verified
+live on this machine (Agent Mail 0.3.32, Node.js 24.14.0):
+
+- **Kimi Code 0.41.0** (`kimi web` Server API): a prompt submitted while
+  `main_turn_active` lands in the session queue (`GET /prompts` shows it under
+  `queued`) and would wait for the whole turn. The adapter now immediately calls
+  `POST /api/v1/sessions/:id/prompts:steer` with the stable `mail_<batch>`
+  prompt id; the server answered `{"steered": true}` and the queue emptied into
+  the running turn. End to end: mail sent mid-turn was delivered ~1 s later
+  (1 s poll interval in the probe) with the queue confirmed empty afterwards.
+  Submit replays still map 40903 (completed) to a no-op and 40927 (in-flight)
+  to a steer retry; a 40402 from the steer call means the prompt already left
+  the queue (running or done) and is treated as accepted.
+- **OpenCode 1.18.25** (`opencode serve`): the v1 `POST /session/:id/message`
+  accepts a message while busy but only processes it after the running turn
+  (observed: marker reply created 3 ms after the essay turn completed). The v2
+  `POST /api/session/:id/prompt` accepts `delivery: "steer"`: admission returns
+  immediately with a `msg_` id, an idle session starts a new turn, and in a
+  multi-step tool turn the steered prompt was consumed at the first tool-step
+  boundary (the model skipped the remaining `sleep 25` steps and answered the
+  steered instruction at ~28 s instead of ~85 s). End to end: mail sent mid-turn
+  was admitted ~0.5 s later and materialized in the v2 message history within
+  about a second. Note the v1 message list does not show v2 messages — history
+  reconciliation reads `/api/session/:id/message`.
+- **OMP 18.1.12**: the extension now delivers with `deliverAs: "aside"`
+  (injected at the next agent step boundary without interrupting the current
+  tool batch; starts a turn when idle) and the idle gate was removed from
+  `canDeliver`. Verified by the extension-level test in
+  `test/omp-extension.test.mjs`, which drives the real extension and watcher
+  against a stub MCP endpoint and asserts aside delivery; `aside` semantics are
+  from the tagged 18.1.12 extension docs and match the installed binary.
+- **Claude** (unchanged): channel notifications are pushed to the client as
+  soon as they are emitted; there is no idle gate to remove.
+- **Grok Build** (unchanged): the ACP adapter already attempts delivery whenever
+  the managed agent process is alive.
 
 ## Fork packaging checks
 

@@ -15,12 +15,15 @@ export default function agentMailWake(pi) {
       const candidate = new MailWatcher({ host: 'omp', session: ctx.sessionManager.getSessionId(),
         project: projectPath(process.env.AGENT_MAIL_PROJECT || ctx.cwd), model: ctx.model?.id,
         interval: Number(process.env.AGENT_MAIL_WAKE_INTERVAL_MS || 3000),
-        canDeliver: async () => current === generation && ctx.isIdle() && !ctx.hasPendingMessages(),
+        // deliverAs:"aside" injects at the next agent step boundary without
+        // interrupting the current tool batch, and starts a turn when idle — so
+        // mail is deliverable mid-run, not only between turns.
+        canDeliver: async () => current === generation,
         deliver: async (text, batch) => {
           if (ctx.sessionManager.getEntries().some(entry => entry.type === 'custom_message' &&
             entry.customType === 'agent-mail-incoming' && entry.details?.batchId === batch.id)) return;
           pi.sendMessage({ customType: 'agent-mail-incoming', content: text, display: true,
-            details: { batchId: batch.id } }, { triggerTurn: true, deliverAs: 'followUp' });
+            details: { batchId: batch.id } }, { deliverAs: 'aside' });
         },
         onStatus: state => {
           if (ctx.hasUI) ctx.ui.setStatus('agent-mail', `Mail: ${state.agent || 'connecting'}${state.paused ? ' [paused]' : ''}${state.error ? ' !' : ''}`);

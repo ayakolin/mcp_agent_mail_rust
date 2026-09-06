@@ -94,10 +94,12 @@ when the turn completes (`--session ID` reuses a stored session).
 Default polling is 3 seconds, with at most 5 events per batch and a pause after 8
 automatic deliveries. The polling itself does not invoke a model. Configure with
 `AGENT_MAIL_WAKE_INTERVAL_MS` and `AGENT_MAIL_WAKE_MAX_TURNS`.
-Codex deliveries steer into an active turn (`turn/steer`): incoming mail is
-injected into the running conversation within one poll interval instead of
-waiting for the current turn to finish. Only threads in an error state (or a
-brief non-steerable review/compact turn) still defer delivery.
+Deliveries are injected into a running turn, not deferred until the session goes
+idle: OMP uses `deliverAs: "aside"` (next step boundary), Codex uses the App
+Server's `turn/steer`, Kimi submits to the prompt queue and immediately steers it
+into the active turn (`prompts:steer`), OpenCode posts with `delivery: "steer"`,
+and Claude receives channel notifications natively. Only error-state sessions (or
+a brief non-steerable review/compact turn on Codex) still defer delivery.
 See the Chinese guide for full session-resume commands and lifecycle details.
 
 ## Persistence and delivery limits
