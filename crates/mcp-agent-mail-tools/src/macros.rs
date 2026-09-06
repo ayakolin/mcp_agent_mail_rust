@@ -135,10 +135,10 @@ pub async fn macro_start_session(
     inbox_limit: Option<i32>,
     reaper_exempt: Option<bool>,
     pane_id: Option<String>,
-    /// Absolute socket path of the tmux server `pane_id` belongs to (the first
-    /// field of the caller's `$TMUX`). Pane ids are only unique per server
-    /// (GH#310). Over HTTP the daemon fills this from the `X-Tmux-Socket`
-    /// header and ignores any body value. Ignored when `pane_id` is absent.
+    // Absolute socket path of the tmux server `pane_id` belongs to (the first
+    // field of the caller's `$TMUX`). Pane ids are only unique per server
+    // (GH#310). Over HTTP the daemon fills this from the `X-Tmux-Socket`
+    // header and ignores any body value. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
 ) -> McpResult<String> {

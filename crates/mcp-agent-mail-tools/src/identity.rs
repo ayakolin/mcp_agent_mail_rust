@@ -2175,12 +2175,12 @@ pub async fn register_agent(
     attachments_policy: Option<String>,
     reaper_exempt: Option<bool>,
     pane_id: Option<String>,
-    /// Absolute socket path of the tmux server `pane_id` belongs to (the first
-    /// field of the caller's `$TMUX`). Pane ids are only unique per server, so
-    /// without it a pane id from another server would be looked up on this
-    /// process's ambient tmux (GH#310). Over HTTP the daemon fills this from the
-    /// `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
-    /// it explicitly. Ignored when `pane_id` is absent.
+    // Absolute socket path of the tmux server `pane_id` belongs to (the first
+    // field of the caller's `$TMUX`). Pane ids are only unique per server, so
+    // without it a pane id from another server would be looked up on this
+    // process's ambient tmux (GH#310). Over HTTP the daemon fills this from the
+    // `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
+    // it explicitly. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
 ) -> McpResult<String> {
@@ -2518,12 +2518,12 @@ pub async fn create_agent_identity(
     task_description: Option<String>,
     attachments_policy: Option<String>,
     pane_id: Option<String>,
-    /// Absolute socket path of the tmux server `pane_id` belongs to (the first
-    /// field of the caller's `$TMUX`). Pane ids are only unique per server, so
-    /// without it a pane id from another server would be looked up on this
-    /// process's ambient tmux (GH#310). Over HTTP the daemon fills this from the
-    /// `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
-    /// it explicitly. Ignored when `pane_id` is absent.
+    // Absolute socket path of the tmux server `pane_id` belongs to (the first
+    // field of the caller's `$TMUX`). Pane ids are only unique per server, so
+    // without it a pane id from another server would be looked up on this
+    // process's ambient tmux (GH#310). Over HTTP the daemon fills this from the
+    // `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
+    // it explicitly. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
     return_registration_token: Option<bool>,
@@ -2803,12 +2803,12 @@ pub async fn retire_agent(
     agent_name: String,
     registration_token: Option<String>,
     pane_id: Option<String>,
-    /// Absolute socket path of the tmux server `pane_id` belongs to (the first
-    /// field of the caller's `$TMUX`). Pane ids are only unique per server, so
-    /// without it a pane id from another server would be looked up on this
-    /// process's ambient tmux (GH#310). Over HTTP the daemon fills this from the
-    /// `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
-    /// it explicitly. Ignored when `pane_id` is absent.
+    // Absolute socket path of the tmux server `pane_id` belongs to (the first
+    // field of the caller's `$TMUX`). Pane ids are only unique per server, so
+    // without it a pane id from another server would be looked up on this
+    // process's ambient tmux (GH#310). Over HTTP the daemon fills this from the
+    // `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
+    // it explicitly. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
@@ -2871,12 +2871,12 @@ pub async fn unretire_agent(
     agent_name: String,
     registration_token: Option<String>,
     pane_id: Option<String>,
-    /// Absolute socket path of the tmux server `pane_id` belongs to (the first
-    /// field of the caller's `$TMUX`). Pane ids are only unique per server, so
-    /// without it a pane id from another server would be looked up on this
-    /// process's ambient tmux (GH#310). Over HTTP the daemon fills this from the
-    /// `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
-    /// it explicitly. Ignored when `pane_id` is absent.
+    // Absolute socket path of the tmux server `pane_id` belongs to (the first
+    // field of the caller's `$TMUX`). Pane ids are only unique per server, so
+    // without it a pane id from another server would be looked up on this
+    // process's ambient tmux (GH#310). Over HTTP the daemon fills this from the
+    // `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
+    // it explicitly. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
@@ -2928,12 +2928,12 @@ pub async fn deregister_agent(
     agent_name: String,
     registration_token: Option<String>,
     pane_id: Option<String>,
-    /// Absolute socket path of the tmux server `pane_id` belongs to (the first
-    /// field of the caller's `$TMUX`). Pane ids are only unique per server, so
-    /// without it a pane id from another server would be looked up on this
-    /// process's ambient tmux (GH#310). Over HTTP the daemon fills this from the
-    /// `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
-    /// it explicitly. Ignored when `pane_id` is absent.
+    // Absolute socket path of the tmux server `pane_id` belongs to (the first
+    // field of the caller's `$TMUX`). Pane ids are only unique per server, so
+    // without it a pane id from another server would be looked up on this
+    // process's ambient tmux (GH#310). Over HTTP the daemon fills this from the
+    // `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
+    // it explicitly. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
@@ -3158,12 +3158,12 @@ pub async fn resolve_pane_identity(
     ctx: &McpContext,
     project_key: String,
     pane_id: Option<String>,
-    /// Absolute socket path of the tmux server `pane_id` belongs to (the first
-    /// field of the caller's `$TMUX`). Pane ids are only unique per server, so
-    /// without it a pane id from another server would be looked up on this
-    /// process's ambient tmux (GH#310). Over HTTP the daemon fills this from the
-    /// `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
-    /// it explicitly. Ignored when `pane_id` is absent.
+    // Absolute socket path of the tmux server `pane_id` belongs to (the first
+    // field of the caller's `$TMUX`). Pane ids are only unique per server, so
+    // without it a pane id from another server would be looked up on this
+    // process's ambient tmux (GH#310). Over HTTP the daemon fills this from the
+    // `X-Tmux-Socket` header and ignores any body value; stdio callers may pass
+    // it explicitly. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
@@ -4990,13 +4990,12 @@ body
                     "identity test wrote outside temp config home: {written_path:?}"
                 );
 
-                let resolved =
-                    resolve_identity_from_project_keys(
-                        &[raw_project_key, human_key],
-                        pane,
-                        mcp_agent_mail_core::TmuxServer::AMBIENT,
-                    )
-                    .expect("resolve identity across project keys");
+                let resolved = resolve_identity_from_project_keys(
+                    &[raw_project_key, human_key],
+                    pane,
+                    mcp_agent_mail_core::TmuxServer::AMBIENT,
+                )
+                .expect("resolve identity across project keys");
                 assert_eq!(resolved.0, "BlueLake");
                 assert_eq!(resolved.1, written_path);
             },

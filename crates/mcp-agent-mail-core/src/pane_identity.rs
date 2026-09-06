@@ -856,7 +856,12 @@ pub fn write_identity_with_optional_pane(
     pane_id: Option<&str>,
     agent_name: &str,
 ) -> Option<std::io::Result<PathBuf>> {
-    write_identity_with_optional_pane_on_server(project_key, pane_id, TmuxServer::AMBIENT, agent_name)
+    write_identity_with_optional_pane_on_server(
+        project_key,
+        pane_id,
+        TmuxServer::AMBIENT,
+        agent_name,
+    )
 }
 
 /// [`write_identity_with_optional_pane`] gathering the explicit pane's binding
@@ -871,7 +876,12 @@ pub fn write_identity_with_optional_pane_on_server(
 ) -> Option<std::io::Result<PathBuf>> {
     let trimmed = pane_id.map(str::trim).filter(|pane| !pane.is_empty());
     if let Some(pane) = trimmed {
-        return Some(write_identity_on_server(project_key, pane, server, agent_name));
+        return Some(write_identity_on_server(
+            project_key,
+            pane,
+            server,
+            agent_name,
+        ));
     }
     write_identity_current_pane(project_key, agent_name)
 }
@@ -2726,7 +2736,10 @@ mod tests {
 
     #[test]
     fn validate_tmux_socket_path_rejects_hostile_shapes() {
-        assert_eq!(validate_tmux_socket_path(""), Err(TmuxSocketPathError::Empty));
+        assert_eq!(
+            validate_tmux_socket_path(""),
+            Err(TmuxSocketPathError::Empty)
+        );
         assert_eq!(
             validate_tmux_socket_path("   "),
             Err(TmuxSocketPathError::Empty)
@@ -2877,8 +2890,12 @@ esac
                 // GH#252 still holds across servers: the ambient %7 record is a
                 // live binding on the ambient server, so a caller-server write
                 // to that same key is a different holder and is refused.
-                let refused =
-                    write_identity_on_server(&project, "%7", TmuxServer::at_socket(&caller_text), "RedStone");
+                let refused = write_identity_on_server(
+                    &project,
+                    "%7",
+                    TmuxServer::at_socket(&caller_text),
+                    "RedStone",
+                );
                 assert!(
                     refused.is_err(),
                     "live binding held on another server must not be overwritten"
