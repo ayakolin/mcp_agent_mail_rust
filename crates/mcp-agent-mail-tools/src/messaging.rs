@@ -1178,6 +1178,16 @@ pub fn normalize_send_message_arguments(arguments: &mut Value) -> McpResult<()> 
     Ok(())
 }
 
+/// Replies have an optional `to`: JSON null means reply to the original sender.
+pub fn normalize_reply_message_arguments(arguments: &mut Value) -> McpResult<()> {
+    if let Some(args) = arguments.as_object_mut()
+        && args.get("to").is_some_and(Value::is_null)
+    {
+        args.remove("to");
+    }
+    normalize_send_message_arguments(arguments)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn push_recipient(
     ctx: &McpContext,
@@ -1254,14 +1264,27 @@ async fn push_recipient(
     Ok(())
 }
 
-/// Cross-project approval is identity-bound. Local name/thread/reservation
-/// heuristics cannot establish shared scope across two directories.
+/// Default cross-project messaging needs no handshake. Explicit restrictive
+/// policies are still checked against project-qualified identities.
 async fn enforce_cross_project_contacts(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
     sender: &mcp_agent_mail_db::AgentRow,
     recipients: &HashMap<String, mcp_agent_mail_db::AgentRow>,
 ) -> McpResult<()> {
+    if recipients
+        .values()
+        .any(|recipient| recipient.contact_policy.eq_ignore_ascii_case("block_all"))
+    {
+        return Err(contact_blocked_error());
+    }
+    if !recipients.values().any(|recipient| {
+        recipient
+            .contact_policy
+            .eq_ignore_ascii_case("contacts_only")
+    }) {
+        return Ok(());
+    }
     let (outgoing, incoming) = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_contacts(
             ctx.cx(),
@@ -1274,10 +1297,7 @@ async fn enforce_cross_project_contacts(
     let now = mcp_agent_mail_db::now_micros();
     for recipient in recipients.values() {
         let policy = recipient.contact_policy.to_ascii_lowercase();
-        if policy == "block_all" {
-            return Err(contact_blocked_error());
-        }
-        if policy == "open" {
+        if policy != "contacts_only" {
             continue;
         }
         let recipient_id = recipient.id.unwrap_or(0);
@@ -1881,7 +1901,7 @@ pub struct ReplyMessageResponse {
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior.\n\nCross-directory delivery\n------------------------\nto_project : Optional[str]\n    Destination project directory or slug on the same shared Agent Mail service.\n    Omit for delivery within project_key. This does not route to another server.\n    The sender identity and sender_token remain scoped to project_key; all to/cc/bcc\n    recipients resolve in to_project. The destination and recipients must already\n    be registered. Discover them using resource://agents/{to_project}.\n    With contact enforcement enabled, each recipient needs an open policy or an\n    approved cross-project contact link from this sender. Local name/thread\n    heuristics do not grant access, and no contact handshake is requested automatically.\n    Recipients fetch and acknowledge using the destination project. reply_message\n    without to routes back to the original sender's directory; explicit to stays\n    within the replying sender's project. CLI equivalent: am mail send --project\n    /abs/path/backend --to-project /abs/path/frontend --from GreenCastle --to BlueLake\n    --subject Plan --body 'Please review.'"
+    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior.\n\nCross-directory delivery\n------------------------\nto_project : Optional[str]\n    Destination project directory or slug on the same shared Agent Mail service.\n    Omit for delivery within project_key. This does not route to another server.\n    The sender identity and sender_token remain scoped to project_key; all to/cc/bcc\n    recipients resolve in to_project. The destination and recipients must already\n    be registered. Discover them using resource://agents/{to_project}.\n    Cross-project sends and replies need no approval for recipients using the\n    default auto policy or open, including first contact. Explicit contacts_only\n    still requires an approved cross-project contact link from this sender, and\n    block_all still rejects delivery. Sending does not create approved contact\n    links or automatically request a contact handshake.\n    Recipients fetch and acknowledge using the destination project. reply_message\n    with to omitted/null or containing only the original sender (case-insensitive;\n    duplicates are harmless) routes back to that sender's directory, even if a\n    local agent has the same name. Other explicit recipients stay in the replying\n    sender's project unless reply_message.to_project overrides the destination.\n    CLI equivalent: am mail send --project\n    /abs/path/backend --to-project /abs/path/frontend --from GreenCastle --to BlueLake\n    --subject Plan --body 'Please review.'"
 )]
 pub async fn send_message(
     ctx: &McpContext,
@@ -2835,15 +2855,21 @@ effective_free_bytes={free}"
 /// Reply to an existing message, preserving or establishing a thread.
 ///
 /// # Parameters
-/// - `project_key`: Project identifier
+/// - `project_key`: Replying sender's project identifier, also for cross-project replies
 /// - `message_id`: ID of message to reply to
 /// - `sender_name`: Sender agent name
 /// - `body_md`: Reply body in Markdown
-/// - `to`: Override recipients (defaults to original sender)
+/// - `to`: Override recipients (omitted/null or only original sender routes to their project)
+/// - `to_project`: Optional existing destination override for all to/cc/bcc recipients
 /// - `cc`: CC recipients
 /// - `bcc`: BCC recipients
 /// - `subject_prefix`: Prefix for subject (default: "Re:")
 /// - `sender_token`: Registration token for sender identity verification (optional)
+///
+/// Original-sender matching is case-insensitive, tolerates duplicate entries, and
+/// takes precedence over a local agent with the same name. Cross-project replies
+/// need no approval for default `auto` or `open` recipients. Explicit `block_all`
+/// still rejects delivery, and `contacts_only` still requires an approved link.
 ///
 /// # Conformance
 /// Python-parity.
@@ -2853,7 +2879,7 @@ effective_free_bytes={free}"
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Reply to an existing message, preserving or establishing a thread.\n\nBehavior\n--------\n- Inherits original `importance` and `ack_required` flags unless overridden\n- `thread_id` is taken from the original message if present; otherwise, the original id is used\n- Subject is prefixed with `subject_prefix` if not already present\n- Defaults `to` to the original sender if not explicitly provided\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nmessage_id : int\n    The id of the message you are replying to.\nsender_name : str\n    Your agent name (must be registered in the project).\nbody_md : str\n    Reply body in Markdown.\nto, cc, bcc : Optional[list[str]]\n    Recipients by agent name. If omitted, `to` defaults to original sender.\nsubject_prefix : str\n    Prefix to apply (default \"Re:\"). Case-insensitive idempotent.\nimportance : Optional[str]\n    Override importance level {\"low\",\"normal\",\"high\",\"urgent\"}. Inherits from original if omitted.\nack_required : Optional[bool]\n    Override acknowledgement requirement. Inherits from original if omitted.\nsender_token : Optional[str]\n    Registration token for identity verification.\n\nDo / Don't\n----------\nDo:\n- Keep the subject focused; avoid topic drift within a thread.\n- Reply to the original sender unless new stakeholders are strictly required.\n- Preserve importance/ack flags from the original unless there is a clear reason to change.\n- Use CC for FYI only; BCC sparingly and with intention.\n\nDon't:\n- Change `thread_id` when continuing the same discussion.\n- Escalate to many recipients; prefer targeted replies and start a new thread for new topics.\n- Attach large binaries in replies unless essential; reference prior attachments where possible.\n\nReturns\n-------\ndict\n    Message payload including `thread_id` and `reply_to`.\n\nExamples\n--------\nMinimal reply to original sender:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6\",\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"message_id\":1234,\"sender_name\":\"BlueLake\",\n  \"body_md\":\"Questions about the migration plan...\"\n}}}\n```\n\nReply with explicit recipients and CC:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6c\",\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"message_id\":1234,\"sender_name\":\"BlueLake\",\n  \"body_md\":\"Looping ops.\",\"to\":[\"GreenCastle\"],\"cc\":[\"RedCat\"],\"subject_prefix\":\"RE:\"\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this reply safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original reply (same\n    message id) with \"idempotent_replay\": true and does NOT create a second reply\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
+    description = "Reply to an existing message, preserving or establishing a thread.\n\nBehavior\n--------\n- Inherits original `importance` and `ack_required` flags unless overridden\n- `thread_id` is taken from the original message if present; otherwise, the original id is used\n- Subject is prefixed with `subject_prefix` if not already present\n- Defaults `to` to the original sender if omitted or null\n- With `to` omitted/null or containing only the original sender (case-insensitive; duplicates are harmless), routes back to the original sender's project, even if a local agent has the same name\n- Other explicit recipients resolve in the replying sender's project unless `to_project` overrides the destination\n\nParameters\n----------\nproject_key : str\n    Always the replying sender's project identifier, including when replying across directories.\nmessage_id : int\n    The id of the message you are replying to.\nsender_name : str\n    Your agent name (must be registered in the project).\nbody_md : str\n    Reply body in Markdown.\nto, cc, bcc : Optional[list[str]]\n    Recipients by agent name. If omitted or null, `to` defaults to original sender.\nto_project : Optional[str]\n    Override destination project directory or slug on the same shared Agent Mail service.\n    The destination project must already exist. All `to`, `cc`, and `bcc` names\n    resolve in this destination; sender identity and sender_token remain in project_key.\n    Omit to use the automatic reply routing described above.\nsubject_prefix : str\n    Prefix to apply (default \"Re:\"). Case-insensitive idempotent.\nimportance : Optional[str]\n    Override importance level {\"low\",\"normal\",\"high\",\"urgent\"}. Inherits from original if omitted.\nack_required : Optional[bool]\n    Override acknowledgement requirement. Inherits from original if omitted.\nsender_token : Optional[str]\n    Registration token for identity verification.\n\nCross-project contact policy\n----------------------------\nCross-project sends and replies need no approval for recipients using the\ndefault `auto` policy or `open`, including first contact. No recent-message\nevidence or contact application is required for these policies. An explicitly\nconfigured `contacts_only` recipient still requires an approved cross-project\ncontact link from the sender, and `block_all` still rejects delivery. Sending\ndoes not create approved contact links or automatically request a handshake.\n\nDo / Don't\n----------\nDo:\n- Keep the subject focused; avoid topic drift within a thread.\n- Reply to the original sender unless new stakeholders are strictly required.\n- Preserve importance/ack flags from the original unless there is a clear reason to change.\n- Use CC for FYI only; BCC sparingly and with intention.\n\nDon't:\n- Change `thread_id` when continuing the same discussion.\n- Escalate to many recipients; prefer targeted replies and start a new thread for new topics.\n- Attach large binaries in replies unless essential; reference prior attachments where possible.\n\nReturns\n-------\ndict\n    Message payload including `thread_id` and `reply_to`.\n\nExamples\n--------\nMinimal reply to original sender:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6\",\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"message_id\":1234,\"sender_name\":\"BlueLake\",\n  \"body_md\":\"Questions about the migration plan...\"\n}}}\n```\n\nReply with explicit recipients and CC:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6c\",\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"message_id\":1234,\"sender_name\":\"BlueLake\",\n  \"body_md\":\"Looping ops.\",\"to\":[\"GreenCastle\"],\"cc\":[\"RedCat\"],\"subject_prefix\":\"RE:\"\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this reply safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original reply (same\n    message id) with \"idempotent_replay\": true and does NOT create a second reply\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
 )]
 pub async fn reply_message(
     ctx: &McpContext,
@@ -2871,6 +2897,7 @@ pub async fn reply_message(
     convert_images: Option<bool>,
     sender_token: Option<String>,
     idempotency_key: Option<String>,
+    to_project: Option<String>,
 ) -> McpResult<String> {
     // Normalize names
     let sender_name = normalize_agent_name_or_original(sender_name);
@@ -2892,6 +2919,7 @@ pub async fn reply_message(
             "reply_message",
             &[
                 ("parent", message_id.to_string()),
+                ("to_project", to_project.clone().unwrap_or_default()),
                 ("sender", sender_name.clone()),
                 ("body_md", body_md.clone()),
                 ("to", sorted(to.as_ref())),
@@ -3141,9 +3169,25 @@ effective_free_bytes={free}"
     // matching send_message's enforcement (fail fast before processing).
     let source_project = project;
     let source_project_id = source_project.id.unwrap_or(0);
-    // An ordinary reply to incoming cross-directory mail returns to the
-    // original sender's home project. Explicit recipients remain local.
-    let project = if to.is_none() && original_sender.project_id != source_project_id {
+    // Explicitly naming the original sender has the same meaning as omitting
+    // `to`; never create a local placeholder for the remote sender's name.
+    let targets_original_sender = to.as_ref().is_none_or(|names| {
+        !names.is_empty()
+            && names
+                .iter()
+                .all(|name| name.eq_ignore_ascii_case(&original_sender.name))
+    });
+    let project = if let Some(key) = to_project.as_deref() {
+        if key.trim().is_empty() {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                "to_project must be an existing project directory or slug",
+                true,
+                json!({"field": "to_project"}),
+            ));
+        }
+        resolve_existing_project(ctx, &pool, key.trim()).await?
+    } else if targets_original_sender && original_sender.project_id != source_project_id {
         db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::get_project_by_id(
                 ctx.cx(),
@@ -5095,6 +5139,15 @@ mod tests {
                             )
                             .await
                         };
+                    queries::set_agent_contact_policy(
+                        &cx,
+                        &pool,
+                        receiver.id.unwrap(),
+                        "contacts_only",
+                    )
+                    .await
+                    .into_result()
+                    .expect("restrict initial target");
                     let blocked = send(
                         Some(target.human_key.clone()),
                         vec![receiver.name.clone()],
@@ -5293,6 +5346,7 @@ mod tests {
                             None,
                             receiver.registration_token.clone(),
                             Some("reply".into()),
+                            None,
                         )
                         .await
                         .expect("cross-project reply"),
@@ -5367,6 +5421,7 @@ mod tests {
                             None,
                             None,
                             observer.registration_token.clone(),
+                            None,
                             None,
                         )
                         .await
@@ -6076,6 +6131,7 @@ mod tests {
                 None,
                 None,
                 None, // idempotency_key
+                None, // to_project
             )
             .await
             .expect_err("reply should fail when original sender metadata is missing");
@@ -6413,6 +6469,22 @@ mod tests {
             &sender_patterns,
             &recipient_patterns
         ));
+    }
+
+    #[test]
+    fn normalize_reply_message_arguments_accepts_null_to_without_weakening_send() {
+        let mut reply = json!({"to": null, "cc": null, "bcc": null});
+        normalize_reply_message_arguments(&mut reply).unwrap();
+        assert!(reply.get("to").is_none());
+        assert!(reply.get("cc").is_none());
+        assert!(reply.get("bcc").is_none());
+        let mut send = json!({"to": null});
+        assert!(normalize_send_message_arguments(&mut send).is_err());
+        let mut invalid = json!({"to": 123});
+        assert!(normalize_reply_message_arguments(&mut invalid).is_err());
+        let mut empty = json!({"to": []});
+        normalize_reply_message_arguments(&mut empty).unwrap();
+        assert_eq!(empty["to"], json!([]), "explicitly empty is not omitted");
     }
 
     #[test]

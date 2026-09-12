@@ -2154,6 +2154,9 @@ pub enum MailCommand {
         /// Override recipients (comma-separated; defaults to original sender).
         #[arg(long)]
         to: Option<String>,
+        /// Recipient project override (defaults to the original sender's project for replies to them).
+        #[arg(long)]
+        to_project: Option<String>,
         /// Output format: table, json, or toon (default: auto-detect).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -37598,6 +37601,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             message_id,
             body,
             to,
+            to_project,
             format,
             json,
         } => {
@@ -37620,6 +37624,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     &sender,
                     &body,
                     explicit_to.as_deref(),
+                    to_project.as_deref(),
                 ),
             )
             .await
@@ -37669,6 +37674,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 &sender,
                 &body,
                 explicit_to.as_deref(),
+                to_project.as_deref(),
             )
             .await?;
             let data = server_message_payload_to_cli_json(payload).ok_or_else(|| {
@@ -38459,6 +38465,7 @@ fn build_server_reply_message_arguments(
     sender: &str,
     body: &str,
     explicit_to: Option<&[String]>,
+    to_project: Option<&str>,
 ) -> serde_json::Value {
     let mut arguments = serde_json::Map::from_iter([
         ("project_key".to_string(), serde_json::json!(project_key)),
@@ -38468,6 +38475,9 @@ fn build_server_reply_message_arguments(
     ]);
     if let Some(explicit_to) = explicit_to {
         arguments.insert("to".to_string(), serde_json::json!(explicit_to));
+    }
+    if let Some(to_project) = to_project {
+        arguments.insert("to_project".to_string(), serde_json::json!(to_project));
     }
     serde_json::Value::Object(arguments)
 }
@@ -41548,10 +41558,30 @@ mod mail_server_cli_bridge_tests {
             "PinkStone",
             "Reply body",
             None,
+            None,
         );
 
         let object = args.as_object().expect("object arguments");
         assert!(!object.contains_key("to"));
+        assert!(!object.contains_key("to_project"));
+    }
+
+    #[test]
+    fn reply_message_server_arguments_preserve_recipient_project_override() {
+        let recipients = vec!["BlueLake".to_string()];
+        let args = build_server_reply_message_arguments(
+            "/tmp/source",
+            42,
+            "PinkStone",
+            "Reply body",
+            Some(&recipients),
+            Some("/tmp/destination"),
+        );
+
+        assert_eq!(args["project_key"], "/tmp/source");
+        assert_eq!(args["message_id"], 42);
+        assert_eq!(args["to"], serde_json::json!(["BlueLake"]));
+        assert_eq!(args["to_project"], "/tmp/destination");
     }
 
     #[test]
@@ -64654,6 +64684,47 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn clap_parses_mail_reply_recipient_project() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "mail",
+            "reply",
+            "--project",
+            "/tmp/source",
+            "--to-project",
+            "/tmp/destination",
+            "--from",
+            "BlueLake",
+            "--to",
+            "RedFox",
+            "--message-id",
+            "42",
+            "--body",
+            "Ready",
+        ])
+        .expect("mail reply should accept --to-project");
+
+        match cli.command.expect("expected command") {
+            Commands::Mail {
+                action:
+                    MailCommand::Reply {
+                        project_key,
+                        to_project,
+                        message_id,
+                        to,
+                        ..
+                    },
+            } => {
+                assert_eq!(project_key, "/tmp/source");
+                assert_eq!(to_project.as_deref(), Some("/tmp/destination"));
+                assert_eq!(message_id, 42);
+                assert_eq!(to.as_deref(), Some("RedFox"));
+            }
+            other => panic!("expected Mail Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn clap_parses_mail_summarize_thread() {
         let cli = Cli::try_parse_from([
             "am",
@@ -86615,6 +86686,7 @@ async fn call_reply_message_tool_locally(
     sender: &str,
     body: &str,
     to_names: Option<&[String]>,
+    to_project: Option<&str>,
 ) -> CliResult<serde_json::Value> {
     let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
     let payload = mcp_agent_mail_tools::messaging::reply_message(
@@ -86633,6 +86705,7 @@ async fn call_reply_message_tool_locally(
         None,
         None, // sender_token
         None, // idempotency_key
+        to_project.map(str::to_string),
     )
     .await
     .map_err(mcp_error_to_cli_error)?;

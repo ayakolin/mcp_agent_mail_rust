@@ -12872,7 +12872,11 @@ to skip auth for local requests.</p>
                 {
                     // Keep alias normalization tool-specific so one cluster cannot
                     // silently rewrite another tool's documented parameters.
-                    mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
+                    if tool_name == "reply_message" {
+                        mcp_agent_mail_tools::normalize_reply_message_arguments(arguments)?;
+                    } else {
+                        mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
+                    }
                 }
 
                 // Extract format param before dispatch (TOON support)
@@ -23289,6 +23293,152 @@ first body
             finished.load(Ordering::Acquire),
             "blocking work must stop within the cancellation grace period"
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dispatch_cross_project_replies_preserve_parent_identity_and_contact_scope() {
+        with_serialized_tool_dispatch_env(|_| {
+            let local_project = "/srv/cross-reply-local".to_string();
+            let remote_project = format!("{local_project}-remote");
+            let config = mcp_agent_mail_core::Config::from_env();
+            let state = build_state(config);
+            let call =
+                |name: &str, arguments: serde_json::Value| -> Result<serde_json::Value, String> {
+                    let result = state
+                        .dispatch_inner(JsonRpcRequest::new(
+                            "tools/call",
+                            Some(serde_json::json!({"name": name, "arguments": arguments})),
+                            1_i64,
+                        ))
+                        .map_err(|error| error.to_string())?;
+                    if result["isError"].as_bool().unwrap_or(false) {
+                        return Err(result.to_string());
+                    }
+                    serde_json::from_str(
+                        result["content"][0]["text"]
+                            .as_str()
+                            .ok_or_else(|| result.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())
+                };
+            for project in [&local_project, &remote_project] {
+                call("ensure_project", serde_json::json!({"human_key": project})).unwrap();
+            }
+            // The local namesake must never capture an explicitly addressed reply.
+            for (project, name) in [
+                (&remote_project, "BlueLake"),
+                (&local_project, "GreenStone"),
+                (&local_project, "BlueLake"),
+            ] {
+                call(
+                    "register_agent",
+                    serde_json::json!({
+                        "project_key": project, "name": name, "program": "test", "model": "test",
+                    }),
+                )
+                .unwrap();
+            }
+            call("send_message", serde_json::json!({
+                "project_key": remote_project, "sender_name": "BlueLake", "to": ["GreenStone"],
+                "to_project": local_project, "subject": "direct cross-project mail", "body_md": "no approval needed",
+            })).unwrap();
+            let incoming = call(
+                "fetch_inbox",
+                serde_json::json!({
+                    "project_key": local_project, "agent_name": "GreenStone", "mark_read": false,
+                }),
+            )
+            .unwrap();
+            let parent = incoming[0]["id"].as_i64().unwrap();
+            let reply_args = serde_json::json!({
+                "project_key": local_project, "message_id": parent, "sender_name": "GreenStone",
+                "body_md": "direct cross-project reply", "cc": null, "bcc": null,
+            });
+            // Default auto policy requires neither contact requests nor approval.
+            for recipients in [
+                serde_json::Value::Null,
+                serde_json::json!(["bluelake", "BlueLake"]),
+                serde_json::json!("BlueLake"),
+            ] {
+                let mut arguments = reply_args.clone();
+                arguments["to"] = recipients;
+                let response = call("reply_message", arguments)
+                    .expect("direct reply must reach remote sender");
+                assert_eq!(response["deliveries"][0]["project"], remote_project);
+                assert_eq!(response["to"], serde_json::json!(["BlueLake"]));
+                assert_eq!(response["thread_id"], parent.to_string());
+            }
+            let remote_inbox = call(
+                "fetch_inbox",
+                serde_json::json!({
+                    "project_key": remote_project, "agent_name": "BlueLake", "mark_read": false,
+                }),
+            )
+            .unwrap();
+            assert_eq!(remote_inbox.as_array().unwrap().len(), 3);
+            let namesake_inbox = call(
+                "fetch_inbox",
+                serde_json::json!({
+                    "project_key": local_project, "agent_name": "BlueLake", "mark_read": false,
+                }),
+            )
+            .unwrap();
+            assert_eq!(namesake_inbox, serde_json::json!([]));
+            let return_reply = call("reply_message", serde_json::json!({
+                "project_key": remote_project, "message_id": remote_inbox[0]["id"], "sender_name": "BlueLake",
+                "body_md": "third turn", "to": ["GreenStone"], "to_project": local_project,
+            })).expect("original sender can reply back without approval");
+            assert_eq!(return_reply["deliveries"][0]["project"], local_project);
+
+            for policy in ["block_all", "contacts_only"] {
+                call(
+                    "set_contact_policy",
+                    serde_json::json!({
+                        "project_key": remote_project, "agent_name": "BlueLake", "policy": policy,
+                    }),
+                )
+                .unwrap();
+                assert!(
+                    call("reply_message", reply_args.clone()).is_err(),
+                    "delivery cannot override {policy}"
+                );
+            }
+            call(
+                "set_contact_policy",
+                serde_json::json!({
+                    "project_key": remote_project, "agent_name": "BlueLake", "policy": "auto",
+                }),
+            )
+            .unwrap();
+            for destination in ["", "/unregistered-reply-project"] {
+                let mut arguments = reply_args.clone();
+                arguments["to_project"] = serde_json::json!(destination);
+                assert!(call("reply_message", arguments).is_err());
+            }
+            let mut empty = reply_args.clone();
+            empty["to"] = serde_json::json!([]);
+            assert!(call("reply_message", empty).is_err());
+            let mut broadcast = reply_args;
+            broadcast["broadcast"] = serde_json::json!(true);
+            assert!(
+                call("reply_message", broadcast)
+                    .unwrap_err()
+                    .contains("broadcast=true is intentionally unsupported")
+            );
+
+            let contacts = call(
+                "list_contacts",
+                serde_json::json!({
+                    "project_key": local_project, "agent_name": "GreenStone",
+                }),
+            )
+            .unwrap();
+            assert!(
+                contacts.as_array().unwrap().is_empty(),
+                "sending and replying must not create contact handshakes"
+            );
+        });
     }
 
     #[test]

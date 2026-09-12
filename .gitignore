@@ -269,3 +269,4 @@ agy.mcp.json
 /.windsurf.mcp.json.*.bak
 /.windsurf.mcp.json.*.replaced
 /windsurf.mcp.json.bak*
+.vscode/mcp.json

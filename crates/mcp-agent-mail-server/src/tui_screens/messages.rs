@@ -1765,6 +1765,7 @@ impl MessageBrowserScreen {
             None,
             None, // sender_token
             None, // idempotency_key
+            None, // to_project
         ));
 
         match result {

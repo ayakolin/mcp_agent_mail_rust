@@ -306,6 +306,7 @@ fn test_reply_message_not_found() {
             None, // convert_images
             None, // sender_token
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect_err("reply to nonexistent message should fail");
@@ -402,6 +403,7 @@ fn test_reply_message_cross_project_reports_owning_project() {
             None, // convert_images
             None, // sender_token
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect_err("cross-project reply must be refused");
@@ -510,6 +512,7 @@ fn test_reply_message_subject_prefix() {
             None, // convert_images
             None, // sender_token
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect("reply should succeed");
@@ -543,6 +546,7 @@ fn test_reply_message_subject_prefix() {
             None, // convert_images
             None, // sender_token
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect("second reply should succeed");
@@ -792,6 +796,7 @@ fn fail_closed_profile_gates_reply_message_sender_verification() {
                 None,
                 None,
                 None, // idempotency_key
+                None, // to_project
             )
             .await
             .expect_err("token-free reply must be refused under the fail-closed profile");
@@ -820,6 +825,7 @@ fn fail_closed_profile_gates_reply_message_sender_verification() {
                 None,
                 Some(red_token),
                 None, // idempotency_key
+                None, // to_project
             )
             .await
             .expect("verified reply under the fail-closed profile");
@@ -913,6 +919,7 @@ fn reply_message_without_profile_returns_full_payload() {
             None,
             None,
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect("reply without profile");
