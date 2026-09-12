@@ -17,11 +17,11 @@ members = [
 exclude = ["experimental/*", "crates/mcp-agent-mail-dashboard-wasm"]
 
 [workspace.package]
-version = "0.3.32"
+version = "0.3.35"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
-rust-version = "1.95"
+rust-version = "1.100"
 repository = "https://github.com/Dicklesworthstone/mcp_agent_mail_rust"
 authors = ["Jeff Emanuel"]
 
@@ -35,12 +35,12 @@ fastmcp-protocol = "0.7.1"
 
 # br-ba1ui: exact pins keep the shared Asupersync type universe coherent.
 # 2026-08-24: =0.4.9, lockstep with fastmcp 0.7.1 (which pins =0.4.9),
-# sqlmodel 0.4.0 (^0.4.9), and the fsqlite 0.3.17 registry baseline (bumped
-# from 0.3.16 on 2026-09-06; family moves in ^0.3.17 lockstep).
+# sqlmodel 0.4.0 (^0.4.9), and the fsqlite 0.3.18 registry baseline (bumped
+# on 2026-09-07; the full fsqlite family moves in lockstep).
 # 0.4.9 is additive on the v0.4.3 public compatibility floor (RuntimeHandle
 # request-Cx / blocking-pool APIs, SQLite cancel correctness, owned-OTLP).
 asupersync = { version = "=0.4.9", features = ["tls-webpki-roots"] }
-fsqlite = "=0.3.17"
+fsqlite = "=0.3.18"
 
 sqlmodel = "=0.4.0"
 sqlmodel-core = "=0.4.0"
@@ -90,7 +90,7 @@ json5 = "1.3.1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 web-time = "1.1.0"
-comrak = { version = "0.54.0", default-features = false }
+comrak = { version = "0.55.0", default-features = false }
 include_dir = "0.7.4"
 minijinja = "2.15.1"
 ammonia = "4.1.2"
@@ -127,6 +127,8 @@ rustix = { version = "1.1.4", features = ["fs"] }
 url = "2.5.8"
 signal-hook = "0.4.4"
 winsafe = { version = "=0.0.28", features = ["kernel"] }
+# Windows stdout readiness without reader threads or optional async adapters.
+socketpair = { version = "=0.19.8", default-features = false }
 
 # frankensearch: two-tier hybrid search engine + optional cross-encoder rerank.
 #
@@ -201,7 +203,7 @@ inherits = "release"     # Benchmarks use same optimizations as release
 [patch.crates-io]
 # 2026-08-22 registry adoption (asupersync =0.4.9 universe):
 # - asupersync resolves from crates.io (=0.4.9; fastmcp 0.7.1 pins =0.4.9).
-# - fsqlite family resolves from crates.io (0.3.17, all 20 locked members in
+# - fsqlite family resolves from crates.io (0.3.18, all 20 locked members in
 #   lockstep) — the machine-specific
 #   /data/projects/frankensqlite path patches are GONE (they broke source
 #   builds on any host without that mount).

@@ -7618,7 +7618,7 @@ pub async fn create_message(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    if let Err(error) = index_created_message_best_effort(&conn, &row) {
+    if let Err(error) = index_created_message_best_effort(pool, &row) {
         tracing::warn!(
             message_id = row.id.unwrap_or_default(),
             error = %error,
@@ -7629,41 +7629,13 @@ pub async fn create_message(
 }
 
 fn index_created_message_best_effort(
-    conn: &crate::DbConn,
+    pool: &DbPool,
     row: &MessageRow,
 ) -> std::result::Result<bool, String> {
     let Some(message_id) = row.id else {
         return Ok(false);
     };
-    let project_slug = conn
-        .query_sync(
-            "SELECT slug FROM projects WHERE id = ? LIMIT 1",
-            &[Value::BigInt(row.project_id)],
-        )
-        .ok()
-        .and_then(|rows| rows.first().and_then(|row| row.get_as::<String>(0).ok()))
-        .unwrap_or_default();
-    let sender_name = conn
-        .query_sync(
-            "SELECT name FROM agents WHERE id = ? LIMIT 1",
-            &[Value::BigInt(row.sender_id)],
-        )
-        .ok()
-        .and_then(|rows| rows.first().and_then(|row| row.get_as::<String>(0).ok()))
-        .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string());
-
-    let message = crate::search_v3::IndexableMessage {
-        id: message_id,
-        project_id: row.project_id,
-        project_slug,
-        sender_name,
-        subject: row.subject.clone(),
-        body_md: row.body_md.clone(),
-        thread_id: row.thread_id.clone(),
-        importance: row.importance.clone(),
-        created_ts: row.created_ts,
-    };
-    crate::search_v3::index_message(&message)
+    crate::search_v3::index_message(pool.sqlite_path(), message_id)
 }
 
 /// Elect the next canonical message id durably inside the caller's write
@@ -11376,9 +11348,14 @@ pub async fn mark_message_read(
                         format!("{agent_id}:{message_id}"),
                     ));
                 }
-                let Some(ts) = rows.first()
+                let Some(ts) = rows
+                    .first()
                     .and_then(|r| r.get(0))
-                    .and_then(value_as_i64)
+                    .and_then(|value| match value {
+                        Value::BigInt(n) => Some(*n),
+                        Value::Int(n) => Some(i64::from(*n)),
+                        _ => None,
+                    })
                 else {
                     rollback_tx(cx, &tracked).await;
                     return Outcome::Err(DbError::Internal(format!(
@@ -12105,12 +12082,16 @@ async fn acknowledge_message_impl(
                         ));
                     }
                     let row = rows.first();
-                    let read_ts = row
-                        .and_then(|r| r.get(0))
-                        .and_then(value_as_i64);
-                    let ack_ts = row
-                        .and_then(|r| r.get(1))
-                        .and_then(value_as_i64);
+                    let read_ts = row.and_then(|r| r.get(0)).and_then(|value| match value {
+                        Value::BigInt(n) => Some(*n),
+                        Value::Int(n) => Some(i64::from(*n)),
+                        _ => None,
+                    });
+                    let ack_ts = row.and_then(|r| r.get(1)).and_then(|value| match value {
+                        Value::BigInt(n) => Some(*n),
+                        Value::Int(n) => Some(i64::from(*n)),
+                        _ => None,
+                    });
                     let (Some(read_ts), Some(ack_ts)) = (read_ts, ack_ts) else {
                         rollback_tx(cx, &tracked).await;
                         return Outcome::Err(DbError::Internal(format!(
@@ -32733,60 +32714,161 @@ mod tests {
             ("partial_ack", true, true),
         ] {
             let rt = RuntimeBuilder::current_thread().build().expect("runtime");
-            let (_cx, pool, _dir) = setup_test_pool(&format!("suppressed_{label}.db"));
+            let dir = tempfile::tempdir().expect("receipt fixture");
+            let db_path = dir.path().join(format!("suppressed_{label}.db"));
+            let seed = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open receipt fixture");
+            seed.execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+                .expect("initialize receipt pragmas");
+            seed.execute_raw(&crate::schema::init_schema_sql_base())
+                .expect("initialize receipt schema");
+            rt.block_on(async {
+                let cx = Cx::current().expect("migration context");
+                crate::schema::migrate_to_latest_base(&cx, &seed)
+                    .await
+                    .into_result()
+                    .expect("migrate receipt schema");
+            });
+            // Install DDL before pooled transactions begin. The partial-ack
+            // fixture permits its initial read and suppresses only the ack.
+            let trigger = if already_read {
+                "CREATE TRIGGER suppress_receipt_update BEFORE UPDATE ON message_recipients \
+                 WHEN NEW.ack_ts IS NOT NULL BEGIN SELECT RAISE(IGNORE); END;"
+            } else {
+                "CREATE TRIGGER suppress_receipt_update BEFORE UPDATE ON message_recipients \
+                 BEGIN SELECT RAISE(IGNORE); END;"
+            };
+            seed.execute_raw(trigger)
+                .expect("install update suppressor");
+            drop(seed);
+            let pool = crate::create_pool(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("receipt pool");
             rt.block_on(async {
                 let cx = Cx::current().expect("runtime context");
                 let project = ensure_project(&cx, &pool, "/tmp/am-suppressed-receipt")
-                    .await.into_result().expect("project");
+                    .await
+                    .into_result()
+                    .expect("project");
                 let project_id = project.id.expect("project id");
                 let agent = register_agent(
-                    &cx, &pool, project_id, "BlueLake", "codex-cli", "gpt-5",
-                    None, None, None,
-                ).await.into_result().expect("agent");
+                    &cx,
+                    &pool,
+                    project_id,
+                    "BlueLake",
+                    "codex-cli",
+                    "gpt-5",
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .into_result()
+                .expect("agent");
                 let agent_id = agent.id.expect("agent id");
                 let message = create_message_with_recipients(
-                    &cx, &pool, project_id, agent_id, "Receipt truth", "Body",
-                    None, "normal", true, "[]", &[(agent_id, "to")],
-                ).await.into_result().expect("message");
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    "Receipt truth",
+                    "Body",
+                    None,
+                    "normal",
+                    true,
+                    "[]",
+                    &[(agent_id, "to")],
+                )
+                .await
+                .into_result()
+                .expect("message");
                 let message_id = message.id.expect("message id");
                 let original_read = if already_read {
-                    Some(mark_message_read(&cx, &pool, agent_id, message_id)
-                        .await.into_result().expect("initial read receipt"))
+                    Some(
+                        mark_message_read(&cx, &pool, agent_id, message_id)
+                            .await
+                            .into_result()
+                            .expect("initial read receipt"),
+                    )
                 } else {
                     None
                 };
                 {
-                    let conn = acquire_conn(&cx, &pool).await.into_result().expect("seed connection");
-                    // A real engine trigger suppresses the write while allowing
-                    // UPDATE to return successfully. Verify its effect below.
-                    conn.execute_raw(
-                        "CREATE TRIGGER suppress_receipt_update BEFORE UPDATE ON message_recipients \
-                         BEGIN SELECT RAISE(IGNORE); END;",
-                    ).expect("install update suppressor");
+                    let conn = acquire_conn(&cx, &pool)
+                        .await
+                        .into_result()
+                        .expect("seed connection");
                     conn.execute_raw("UPDATE inbox_stats SET total_count = 99")
                         .expect("seed rollback witness");
                 }
-                let outcome = if acknowledge {
-                    acknowledge_message(&cx, &pool, agent_id, message_id).await.map(|_| ())
+                let outcome = if already_read {
+                    acknowledge_message_idempotent(
+                        &cx,
+                        &pool,
+                        agent_id,
+                        message_id,
+                        IdempotencyClaim {
+                            project_id,
+                            tool: "acknowledge_message",
+                            key: "suppressed-ack",
+                            fingerprint: "suppressed-ack-fixture",
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                } else if acknowledge {
+                    acknowledge_message(&cx, &pool, agent_id, message_id)
+                        .await
+                        .map(|_| ())
                 } else {
-                    mark_message_read(&cx, &pool, agent_id, message_id).await.map(|_| ())
+                    mark_message_read(&cx, &pool, agent_id, message_id)
+                        .await
+                        .map(|_| ())
                 };
-                let conn = acquire_conn(&cx, &pool).await.into_result().expect("verification connection");
+                let conn = acquire_conn(&cx, &pool)
+                    .await
+                    .into_result()
+                    .expect("verification connection");
                 let rows = conn.query_sync(
                     "SELECT read_ts, ack_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?",
                     &[Value::BigInt(agent_id), Value::BigInt(message_id)],
-                ).expect("read actual stored receipts");
+                )
+                .expect("read actual stored receipts");
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), original_read,
-                    "{label}: the real trigger must suppress the update");
+                assert_eq!(
+                    rows[0].get_named::<Option<i64>>("read_ts").unwrap(),
+                    original_read,
+                    "{label}: the real trigger must suppress the update"
+                );
                 assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
-                assert!(matches!(outcome, Outcome::Err(DbError::Internal(ref message))
-                    if message.contains("did not store")), "{label}: {outcome:?}");
-                let rows = conn.query_sync("SELECT total_count FROM inbox_stats", &[])
+                assert!(
+                    matches!(outcome, Outcome::Err(DbError::Internal(ref message))
+                        if message.contains("did not store")),
+                    "{label}: {outcome:?}"
+                );
+                let rows = conn
+                    .query_sync("SELECT total_count FROM inbox_stats", &[])
                     .expect("read rollback witness");
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].get_named::<i64>("total_count").unwrap(), 99,
-                    "{label}: receipt failure must roll back the stats rebuild");
+                assert_eq!(
+                    rows[0].get_named::<i64>("total_count").unwrap(),
+                    99,
+                    "{label}: receipt failure must roll back the stats rebuild"
+                );
+                let rows = conn
+                    .query_sync("SELECT COUNT(*) AS count FROM idempotency_keys", &[])
+                    .expect("read idempotency records");
+                assert_eq!(
+                    rows[0].get_named::<i64>("count").unwrap(),
+                    0,
+                    "{label}: a failed receipt must not leave a replayable success"
+                );
             });
         }
     }

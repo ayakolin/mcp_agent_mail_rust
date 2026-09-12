@@ -29,6 +29,7 @@
 use sha1::{Digest, Sha1};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -55,6 +56,107 @@ const TARGET_FACTS_FORMAT: &str =
 /// the platform). The cap exists so a transport-derived value can never grow
 /// an HTTP header or `tmux` argv without limit.
 const MAX_TMUX_SOCKET_PATH_LEN: usize = 1024;
+
+/// Default deadline for any single `tmux` child spawned by this module.
+///
+/// `X-Tmux-Socket` (GH#310) lets a caller steer every pane-facts query at a
+/// socket of its choosing. A path held by a listener that accepts the
+/// connection and never answers (`nc -lU /tmp/x`) makes
+/// `tmux -S /tmp/x display-message` block forever, and an unbounded
+/// `Command::output()` with it — pinning the tool call and its dispatch slot
+/// for as long as the listener lives. Every tmux invocation on the identity
+/// path is therefore bounded by [`tmux_probe_timeout`]: at the deadline the
+/// child is killed and the query reports "pane facts unavailable", the same
+/// outcome as a missing `tmux` binary.
+pub const DEFAULT_TMUX_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Environment override for [`tmux_probe_timeout`], in milliseconds.
+pub const TMUX_PROBE_TIMEOUT_ENV: &str = "AM_TMUX_PROBE_TIMEOUT_MS";
+
+/// Clamp bounds for [`TMUX_PROBE_TIMEOUT_ENV`].
+const MIN_TMUX_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+const MAX_TMUX_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+// Introspection responses are small. Bound a fast producer independently of
+// the deadline, while retaining ample room for large pane inventories.
+const MAX_TMUX_PROBE_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// Stable code carried by the warning logged when a tmux probe is killed at
+/// its deadline (see [`TmuxProbeError::code`]).
+pub const TMUX_PROBE_TIMEOUT_CODE: &str = "TMUX_PROBE_TIMEOUT";
+
+/// The deadline applied to every `tmux` child spawned by this module.
+///
+/// [`DEFAULT_TMUX_PROBE_TIMEOUT`] unless [`TMUX_PROBE_TIMEOUT_ENV`] holds a
+/// millisecond count, which is clamped to 50 ms..=60 s. An unparseable value
+/// falls back to the default.
+#[must_use]
+pub fn tmux_probe_timeout() -> Duration {
+    crate::config::process_env_value(TMUX_PROBE_TIMEOUT_ENV)
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_TMUX_PROBE_TIMEOUT, |millis| {
+            Duration::from_millis(millis).clamp(MIN_TMUX_PROBE_TIMEOUT, MAX_TMUX_PROBE_TIMEOUT)
+        })
+}
+
+/// Why a bounded tmux invocation produced no answer.
+#[derive(Debug)]
+pub enum TmuxProbeError {
+    /// The pipe could not be prepared/read, or `tmux` could not be started
+    /// or waited on (binary missing, not executable, ...).
+    Spawn(std::io::Error),
+    /// `tmux` was still running when the probe deadline expired; it was
+    /// killed and reaped.
+    TimedOut {
+        /// The deadline that expired.
+        timeout: Duration,
+    },
+    /// Output exceeded the introspection budget; the child was reaped and
+    /// partial output discarded, so it cannot be mistaken for pane facts.
+    OutputLimit {
+        /// Maximum number of stdout bytes accepted.
+        limit: usize,
+    },
+}
+
+impl TmuxProbeError {
+    /// Stable machine-readable code for logs and diagnostics.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Spawn(_) => "TMUX_UNAVAILABLE",
+            Self::TimedOut { .. } => TMUX_PROBE_TIMEOUT_CODE,
+            Self::OutputLimit { .. } => "TMUX_PROBE_OUTPUT_LIMIT",
+        }
+    }
+}
+
+impl std::fmt::Display for TmuxProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(error) => write!(f, "{}: tmux could not be started: {error}", self.code()),
+            Self::TimedOut { timeout } => write!(
+                f,
+                "{}: tmux did not answer within {} ms and was killed",
+                self.code(),
+                timeout.as_millis()
+            ),
+            Self::OutputLimit { limit } => write!(
+                f,
+                "{}: tmux output exceeded {limit} bytes; pane facts unavailable",
+                self.code()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TmuxProbeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(error) => Some(error),
+            Self::TimedOut { .. } | Self::OutputLimit { .. } => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Caller tmux server (GH#310)
@@ -90,7 +192,9 @@ impl<'a> TmuxServer<'a> {
     /// validator's job is to keep control characters and unbounded lengths
     /// out of argv, not to prove the socket exists. A missing or dead socket
     /// simply makes `tmux` fail and the caller falls back to the same
-    /// legacy-unverified path an unreachable ambient server produces.
+    /// legacy-unverified path an unreachable ambient server produces; a
+    /// socket whose listener never answers is cut off at
+    /// [`tmux_probe_timeout`] and treated the same way.
     #[must_use]
     pub const fn at_socket(socket_path: &'a str) -> Self {
         Self {
@@ -118,6 +222,131 @@ impl<'a> TmuxServer<'a> {
             command.args(["-S", socket_path]);
         }
         command
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Call transport and lifecycle authorization policy (PR #310 follow-up)
+// ---------------------------------------------------------------------------
+
+/// The transport a tool call arrived on, as far as identity authorization is
+/// concerned.
+///
+/// Pane context (`pane_id`, `tmux_socket_path`) means different things on the
+/// two transports. Over stdio the MCP client is a same-user process on this
+/// host, so "the caller's pane is bound to agent X" is a fact about the
+/// caller. Over the `serve-http` daemon the pane and socket arrive in
+/// `X-Tmux-Pane` / `X-Tmux-Socket` headers (or in the JSON body) and are an
+/// *assertion by the client*; the daemon can only check that some pane with
+/// that id, on that socket, carries a binding for X — not that the client is
+/// that pane.
+///
+/// The daemon stamps the wire value ([`Self::ARG_NAME`]) into the arguments
+/// of every lifecycle tool call it forwards, overwriting whatever the body
+/// said. Absent (stdio) means [`Self::Stdio`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CallTransport {
+    /// MCP over stdio: the client is a same-user process on this host.
+    #[default]
+    Stdio,
+    /// The `serve-http` daemon: pane context is a client assertion.
+    Http,
+}
+
+impl CallTransport {
+    /// The transport-owned tool argument the HTTP daemon fills in.
+    pub const ARG_NAME: &'static str = "call_transport";
+
+    /// Wire spelling of this transport.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Http => "http",
+        }
+    }
+
+    /// Parse the wire spelling (case-insensitive, surrounding whitespace
+    /// ignored). Anything else is a caller error rather than a silent
+    /// downgrade to the more permissive stdio policy.
+    pub fn parse(raw: &str) -> Result<Self, CallTransportError> {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("stdio") {
+            Ok(Self::Stdio)
+        } else if trimmed.eq_ignore_ascii_case("http") {
+            Ok(Self::Http)
+        } else {
+            Err(CallTransportError)
+        }
+    }
+}
+
+impl std::fmt::Display for CallTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A `call_transport` value that is neither `stdio` nor `http`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallTransportError;
+
+impl std::fmt::Display for CallTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("call_transport must be \"stdio\" or \"http\"")
+    }
+}
+
+impl std::error::Error for CallTransportError {}
+
+/// How the lifecycle tools (`retire_agent`, `unretire_agent`,
+/// `deregister_agent`) authorize a caller, decided per transport.
+///
+/// A matching `registration_token` authorizes on every transport. The
+/// difference is whether a tmux pane bound to the agent may stand in for it:
+///
+/// | transport | policy |
+/// |-----------|--------|
+/// | stdio     | [`Self::TokenOrBoundPane`] — the pane is the caller's own |
+/// | HTTP      | [`Self::TokenRequired`] — the pane is a client assertion |
+///
+/// Over HTTP a client that names another agent's pane (and, since GH#310,
+/// the socket to look it up on) could otherwise retire or deregister that
+/// agent without ever holding its token. The pane context still flows to the
+/// tools on HTTP for registration and identity resolution; it simply no longer
+/// *authorizes* a lifecycle transition there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleAuthPolicy {
+    /// The registration token, or a tmux pane verifiably bound to the agent.
+    TokenOrBoundPane,
+    /// The registration token only; pane context is advisory.
+    TokenRequired,
+}
+
+impl LifecycleAuthPolicy {
+    /// The policy that applies to calls arriving on `transport`.
+    #[must_use]
+    pub const fn for_transport(transport: CallTransport) -> Self {
+        match transport {
+            CallTransport::Stdio => Self::TokenOrBoundPane,
+            CallTransport::Http => Self::TokenRequired,
+        }
+    }
+
+    /// Whether a pane bound to the agent authorizes a lifecycle transition
+    /// under this policy.
+    #[must_use]
+    pub const fn accepts_bound_pane(self) -> bool {
+        matches!(self, Self::TokenOrBoundPane)
+    }
+
+    /// Machine-readable name, surfaced in `AUTHENTICATION_REQUIRED` details.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenOrBoundPane => "token_or_bound_pane",
+            Self::TokenRequired => "token_required",
+        }
     }
 }
 
@@ -361,7 +590,8 @@ pub fn is_agent_pane_command(command: &str) -> bool {
 /// Any failing check — including a missing socket or an unreachable server —
 /// yields [`PaneBindingLiveness::Dead`]. Records without binding facts, and
 /// records that cannot be checked because `tmux` itself cannot be executed
-/// by this process, yield [`PaneBindingLiveness::Unverifiable`].
+/// by this process or did not answer within [`tmux_probe_timeout`], yield
+/// [`PaneBindingLiveness::Unverifiable`].
 #[must_use]
 pub fn binding_liveness(record: &PaneIdentityRecord) -> PaneBindingLiveness {
     if !record.is_verifiable() {
@@ -1255,11 +1485,9 @@ fn pane_target_for(pane_id: &str) -> Option<String> {
 /// does not exist — the caller then behaves as it did before GH#252.
 fn query_target_pane_facts(pane_id: &str, server: TmuxServer<'_>) -> Option<TargetPaneFacts> {
     let target = pane_target_for(pane_id)?;
-    let output = server
-        .command()
-        .args(["display-message", "-t", &target, "-p", TARGET_FACTS_FORMAT])
-        .output()
-        .ok()?;
+    let mut command = server.command();
+    command.args(["display-message", "-t", &target, "-p", TARGET_FACTS_FORMAT]);
+    let output = run_tmux_bounded(command).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1463,15 +1691,176 @@ fn identity_entry_is_stale(entry: &std::fs::DirEntry, live_panes: &[String]) -> 
 
 /// Run tmux with `args`.
 ///
-/// `Err` means tmux could not be executed at all (binary missing, not
-/// executable, ...); `Ok(None)` means tmux ran but exited non-zero;
+/// `Err` means tmux produced no answer — it could not be executed at all
+/// (binary missing, not executable, ...) or it was killed at
+/// [`tmux_probe_timeout`]; `Ok(None)` means tmux ran but exited non-zero;
 /// `Ok(Some(stdout))` is a successful invocation.
-fn run_tmux_capture(args: &[&str]) -> std::io::Result<Option<String>> {
-    let output = tmux_command().args(args).output()?;
+fn run_tmux_capture(args: &[&str]) -> Result<Option<String>, TmuxProbeError> {
+    let mut command = tmux_command();
+    command.args(args);
+    let output = run_tmux_bounded(command)?;
     if !output.status.success() {
         return Ok(None);
     }
     Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+}
+
+/// Run a `tmux` command with a bounded wait, capturing its stdout.
+///
+/// `Command::output()` has no deadline: it waits for the child to exit, and a
+/// `tmux -S <socket>` whose socket is held by a listener that accepts the
+/// connection and never answers exits never. The child is therefore polled
+/// against [`tmux_probe_timeout`], killed and reaped at the deadline, and
+/// reported as [`TmuxProbeError::TimedOut`] — which every caller treats
+/// exactly like a tmux that could not be spawned.
+///
+/// Nonblocking stdout reads share the child-polling deadline. A chatty child
+/// cannot fill the pipe while we wait for it, and a descendant retaining the
+/// pipe cannot leave a blocked reader thread behind after we return.
+fn run_tmux_bounded(
+    mut command: std::process::Command,
+) -> Result<std::process::Output, TmuxProbeError> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    /// Grace granted to the stdout drain after the child has exited, so a
+    /// child that exits right at the deadline still gets its output read.
+    const DRAIN_GRACE: Duration = Duration::from_millis(50);
+    const MAX_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+    fn kill_and_reap(child: &mut std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let timeout = tmux_probe_timeout();
+    let (mut reader, writer) = tmux_stdout_pipe().map_err(TmuxProbeError::Spawn)?;
+    command
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(TmuxProbeError::Spawn)?;
+    // Command retains explicitly supplied handles after spawning. Close our
+    // writer copy so only the child and its descendants can postpone EOF.
+    command.stdout(Stdio::null());
+
+    let mut deadline = Instant::now() + timeout;
+    let mut poll_interval = Duration::from_millis(1);
+    let mut status = None;
+    let mut stdout = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut eof = false;
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exited)) => {
+                    status = Some(exited);
+                    deadline = deadline.max(Instant::now() + DRAIN_GRACE);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    kill_and_reap(&mut child);
+                    return Err(TmuxProbeError::Spawn(error));
+                }
+            }
+        }
+        if let Some(status) = status.filter(|_| eof) {
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr: Vec::new(),
+            });
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            kill_and_reap(&mut child);
+            tracing::warn!(
+                code = TMUX_PROBE_TIMEOUT_CODE,
+                timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                command = ?command,
+                "tmux child or stdout pipe exceeded its deadline; pane facts unavailable"
+            );
+            return Err(TmuxProbeError::TimedOut { timeout });
+        }
+        if !eof {
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    eof = true;
+                    continue;
+                }
+                Ok(length) => {
+                    if length > MAX_TMUX_PROBE_OUTPUT_BYTES - stdout.len() {
+                        kill_and_reap(&mut child);
+                        let error = TmuxProbeError::OutputLimit {
+                            limit: MAX_TMUX_PROBE_OUTPUT_BYTES,
+                        };
+                        tracing::warn!(code = error.code(), command = ?command, "{error}");
+                        return Err(error);
+                    }
+                    stdout.extend_from_slice(&buffer[..length]);
+                    poll_interval = Duration::from_millis(1);
+                    // Poll both child and deadline even under continuous output.
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    kill_and_reap(&mut child);
+                    return Err(TmuxProbeError::Spawn(error));
+                }
+            }
+        }
+        std::thread::sleep(poll_interval.min(remaining));
+        poll_interval = (poll_interval * 2).min(MAX_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn tmux_stdout_pipe() -> std::io::Result<(impl std::io::Read, std::process::Stdio)> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+    let (reader, writer) = std::io::pipe()?;
+    let flags = fcntl_getfl(&reader)?;
+    fcntl_setfl(&reader, flags | OFlags::NONBLOCK)?;
+    Ok((reader, writer.into()))
+}
+
+#[cfg(windows)]
+fn tmux_stdout_pipe() -> std::io::Result<(impl std::io::Read, std::process::Stdio)> {
+    use std::os::windows::io::OwnedHandle;
+
+    struct Reader(socketpair::SocketpairStream);
+    impl std::io::Read for Reader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            match self.0.num_ready_bytes() {
+                Ok(0) => Err(std::io::ErrorKind::WouldBlock.into()),
+                Ok(available) => {
+                    let length = usize::try_from(available)
+                        .unwrap_or(usize::MAX)
+                        .min(buffer.len());
+                    // We own the only reader. Read at most the bytes that
+                    // PeekNamedPipe proved available, so this cannot block.
+                    std::io::Read::read(&mut self.0, &mut buffer[..length])
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    let (reader, writer) = socketpair::socketpair_stream()?;
+    Ok((Reader(reader), OwnedHandle::from(writer).into()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn tmux_stdout_pipe() -> std::io::Result<(std::io::Empty, std::process::Stdio)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "nonblocking tmux pipes are unavailable on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -1745,16 +2134,15 @@ fn list_live_tmux_panes() -> Vec<String> {
         return panes;
     }
 
-    let output = tmux_command()
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}:#{window_index}:#{pane_index}:#{pane_id}",
-        ])
-        .output();
+    let mut command = tmux_command();
+    command.args([
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}:#{window_index}:#{pane_index}:#{pane_id}",
+    ]);
 
-    match output {
+    match run_tmux_bounded(command) {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
             let mut ids = Vec::new();
@@ -1805,17 +2193,16 @@ pub fn get_composite_tmux_pane_id() -> Option<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())?;
 
-    let output = tmux_command()
-        .args([
-            "display-message",
-            "-t",
-            &pane_target,
-            "-p",
-            "#{session_name}:#{window_index}:#{pane_index}",
-        ])
-        .output();
+    let mut command = tmux_command();
+    command.args([
+        "display-message",
+        "-t",
+        &pane_target,
+        "-p",
+        "#{session_name}:#{window_index}:#{pane_index}",
+    ]);
 
-    if let Ok(out) = output
+    if let Ok(out) = run_tmux_bounded(command)
         && out.status.success()
     {
         let composite = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1843,17 +2230,15 @@ fn composite_for_bare_pane(pane_id: &str, server: TmuxServer<'_>) -> Option<Stri
     if pane.is_empty() {
         return None;
     }
-    let output = server
-        .command()
-        .args([
-            "display-message",
-            "-t",
-            pane,
-            "-p",
-            "#{session_name}:#{window_index}:#{pane_index}",
-        ])
-        .output()
-        .ok()?;
+    let mut command = server.command();
+    command.args([
+        "display-message",
+        "-t",
+        pane,
+        "-p",
+        "#{session_name}:#{window_index}:#{pane_index}",
+    ]);
+    let output = run_tmux_bounded(command).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1870,11 +2255,9 @@ fn composite_for_bare_pane(pane_id: &str, server: TmuxServer<'_>) -> Option<Stri
 /// or the answer is not a bare `%N` pane id.
 fn bare_for_composite_pane(pane_id: &str, server: TmuxServer<'_>) -> Option<String> {
     let target = pane_target_for(pane_id)?;
-    let output = server
-        .command()
-        .args(["display-message", "-t", &target, "-p", PANE_ID_FORMAT])
-        .output()
-        .ok()?;
+    let mut command = server.command();
+    command.args(["display-message", "-t", &target, "-p", PANE_ID_FORMAT]);
+    let output = run_tmux_bounded(command).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -2725,6 +3108,43 @@ mod tests {
         drop(config);
     }
 
+    // ── PR #310 follow-up: per-transport lifecycle authorization ──────────
+
+    #[test]
+    fn call_transport_round_trips_its_wire_spelling() {
+        for transport in [CallTransport::Stdio, CallTransport::Http] {
+            assert_eq!(CallTransport::parse(transport.as_str()), Ok(transport));
+            assert_eq!(transport.to_string(), transport.as_str());
+        }
+        assert_eq!(CallTransport::parse("  HTTP\t"), Ok(CallTransport::Http));
+        assert_eq!(CallTransport::parse("Stdio"), Ok(CallTransport::Stdio));
+        assert_eq!(CallTransport::default(), CallTransport::Stdio);
+        assert_eq!(CallTransport::ARG_NAME, "call_transport");
+    }
+
+    #[test]
+    fn call_transport_rejects_anything_else() {
+        for raw in ["", "   ", "https", "http2", "sse", "std io", "http\0"] {
+            assert_eq!(
+                CallTransport::parse(raw),
+                Err(CallTransportError),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_policy_requires_token_only_over_http() {
+        let stdio = LifecycleAuthPolicy::for_transport(CallTransport::Stdio);
+        let http = LifecycleAuthPolicy::for_transport(CallTransport::Http);
+        assert_eq!(stdio, LifecycleAuthPolicy::TokenOrBoundPane);
+        assert_eq!(http, LifecycleAuthPolicy::TokenRequired);
+        assert!(stdio.accepts_bound_pane());
+        assert!(!http.accepts_bound_pane());
+        assert_eq!(stdio.as_str(), "token_or_bound_pane");
+        assert_eq!(http.as_str(), "token_required");
+    }
+
     // ── GH#310: caller tmux server ─────────────────────────────────────────
 
     #[test]
@@ -3229,6 +3649,414 @@ esac
         crate::config::with_process_env_overrides_for_test(&[("AM_TEST_TMUX_BIN", "")], || {
             assert_eq!(binding_liveness(&record), PaneBindingLiveness::Unverifiable);
         });
+    }
+
+    // -- bounded tmux probes (GH#310 follow-up) -----------------------------
+
+    /// Invoked only as an actual child by the bounded-probe tests below.
+    #[test]
+    #[ignore = "subprocess fixture exercised by bounded_probe_captures_real_child_output"]
+    fn tmux_probe_output_child() {
+        use std::io::Write;
+
+        let mode = std::env::var("AM_TEST_PROBE_CHILD_MODE").expect("fixture mode");
+        let pid_file = std::env::var_os("AM_TEST_PROBE_CHILD_PID").expect("fixture PID path");
+        std::fs::write(pid_file, std::process::id().to_string()).expect("publish child PID");
+        let mut stdout = std::io::stdout().lock();
+        // No output at first: an empty open pipe must not be mistaken for EOF.
+        std::thread::sleep(Duration::from_millis(50));
+        if mode == "continuous" {
+            loop {
+                stdout.write_all(&[b'x'; 8192]).expect("write until killed");
+                // Stay below the byte limit while exceeding the time budget.
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let payload = vec![b'x'; 262_144];
+        stdout.write_all(&payload).expect("large output");
+        stdout.write_all(b"\n").expect("output terminator");
+        stdout.flush().expect("flush fixture output");
+        std::process::exit(if mode == "nonzero" { 7 } else { 0 });
+    }
+
+    #[test]
+    fn bounded_probe_captures_real_child_output() {
+        let dir = tempfile::tempdir().expect("child fixture directory");
+        for mode in ["finite", "nonzero", "continuous"] {
+            let pid_file = dir.path().join(format!("{mode}.pid"));
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("test exe"));
+            command
+                .args([
+                    "--exact",
+                    "pane_identity::tests::tmux_probe_output_child",
+                    "--ignored",
+                    "--nocapture",
+                    "--quiet",
+                ])
+                .env("AM_TEST_PROBE_CHILD_MODE", mode)
+                .env("AM_TEST_PROBE_CHILD_PID", &pid_file);
+            let started = Instant::now();
+            let output = crate::config::with_process_env_overrides_for_test(
+                &[(TMUX_PROBE_TIMEOUT_ENV, "1000")],
+                || run_tmux_bounded(command),
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+            if mode == "continuous" {
+                assert!(matches!(output, Err(TmuxProbeError::TimedOut { .. })));
+            } else {
+                let output = output.expect("bounded real child completes");
+                assert_eq!(
+                    output.status.code(),
+                    Some(if mode == "nonzero" { 7 } else { 0 })
+                );
+                // libtest emits its own prefix; the child's entire payload
+                // must still be captured after the initial empty-pipe period.
+                let expected = vec![b'x'; 262_144];
+                assert!(
+                    output
+                        .stdout
+                        .strip_suffix(b"\n")
+                        .is_some_and(|payload| payload.ends_with(&expected))
+                );
+            }
+            let pid = std::fs::read_to_string(&pid_file).expect("real child started");
+            #[cfg(unix)]
+            assert!(process_is_gone(pid.trim()), "owned child must be reaped");
+            #[cfg(not(unix))]
+            assert!(pid.trim().parse::<u32>().is_ok());
+        }
+    }
+
+    /// A real grandchild retains stdout after the probe exits or is killed.
+    /// Linux subreaper ownership lets this test kill and reap that grandchild
+    /// itself, including when an assertion fails, without leaving an orphan.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_probe_releases_readers_while_descendants_retain_stdout() {
+        use nix::sys::prctl::{get_child_subreaper, set_child_subreaper};
+        use nix::sys::signal::{Signal, kill};
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+
+        struct Descendants {
+            previous_subreaper: bool,
+            pids: Vec<Pid>,
+        }
+        impl Drop for Descendants {
+            fn drop(&mut self) {
+                for &pid in &self.pids {
+                    let _ = kill(pid, Signal::SIGKILL);
+                    let _ = waitpid(pid, None);
+                }
+                // Cleanup also runs during unwinding; never double-panic.
+                // The normal path verifies restoration after this drop.
+                let _ = set_child_subreaper(self.previous_subreaper);
+            }
+        }
+
+        let mut descendants = Descendants {
+            previous_subreaper: get_child_subreaper().expect("read subreaper state"),
+            pids: Vec::new(),
+        };
+        set_child_subreaper(true).expect("own the fixture's orphaned grandchildren");
+        let dir = tempfile::tempdir().expect("descendant fixture directory");
+        let thread_ids = || {
+            std::fs::read_dir("/proc/self/task")
+                .expect("read actual live thread inventory")
+                .map(|entry| entry.expect("thread entry").file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = thread_ids();
+        let fd_count = || {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("read actual open file descriptors")
+                .count()
+        };
+        let fds_before = fd_count();
+        let mut observations = Vec::new();
+        for mode in ["exit 0", "exec sleep 30"] {
+            for iteration in 0..3 {
+                let pid_file = dir.path().join(format!("{mode}-{iteration}.pid"));
+                let mut command = std::process::Command::new("sh");
+                command.env("AM_TEST_DESCENDANT_PID", &pid_file).args([
+                    "-c",
+                    &format!(
+                        "sleep 30 &\nprintf '%s\\n' \"$!\" > \"$AM_TEST_DESCENDANT_PID\"\n{mode}"
+                    ),
+                ]);
+                let started = Instant::now();
+                let result = crate::config::with_process_env_overrides_for_test(
+                    &[(TMUX_PROBE_TIMEOUT_ENV, "200")],
+                    || run_tmux_bounded(command),
+                );
+                let elapsed = started.elapsed();
+                let pid = std::fs::read_to_string(&pid_file)
+                    .expect("real child published its descendant PID")
+                    .trim()
+                    .parse::<i32>()
+                    .expect("descendant PID");
+                descendants.pids.push(Pid::from_raw(pid));
+                assert!(
+                    !process_is_gone(&pid.to_string()),
+                    "the real descendant must still retain the output pipe"
+                );
+                observations.push((result, elapsed, thread_ids(), fd_count()));
+            }
+        }
+        // Record live thread state while every writer is still alive, then
+        // reap all owned descendants before asserting the regression result.
+        let pids = descendants.pids.clone();
+        let previous_subreaper = descendants.previous_subreaper;
+        drop(descendants);
+        assert_eq!(
+            get_child_subreaper().expect("verify restored subreaper state"),
+            previous_subreaper
+        );
+        for pid in pids {
+            assert!(
+                process_is_gone(&pid.to_string()),
+                "fixture descendant reaped"
+            );
+        }
+        for (result, elapsed, threads, fds) in observations {
+            assert!(matches!(result, Err(TmuxProbeError::TimedOut { .. })));
+            assert!(elapsed < Duration::from_secs(3));
+            assert_eq!(
+                threads, before,
+                "a completed probe must leave no reader thread"
+            );
+            assert_eq!(fds, fds_before, "a completed probe must close its pipes");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_probe_enforces_output_limit_at_the_exact_boundary() {
+        let dir = tempfile::tempdir().expect("output-limit fixture");
+        for bytes in [MAX_TMUX_PROBE_OUTPUT_BYTES, MAX_TMUX_PROBE_OUTPUT_BYTES + 1] {
+            let pid_file = dir.path().join(format!("{bytes}.pid"));
+            let mut command = std::process::Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    "printf '%s\\n' \"$$\" > \"$AM_TEST_PROBE_CHILD_PID\"; exec head -c \"$AM_TEST_PROBE_BYTES\" /dev/zero",
+                ])
+                .env("AM_TEST_PROBE_CHILD_PID", &pid_file)
+                .env("AM_TEST_PROBE_BYTES", bytes.to_string());
+            let output = run_tmux_bounded(command);
+            if bytes == MAX_TMUX_PROBE_OUTPUT_BYTES {
+                let output = output.expect("the exact byte limit is accepted");
+                assert!(output.status.success());
+                assert_eq!(output.stdout.len(), bytes);
+                assert!(output.stdout.iter().all(|byte| *byte == 0));
+                assert!(output.stdout.capacity() <= MAX_TMUX_PROBE_OUTPUT_BYTES);
+            } else {
+                assert!(matches!(
+                    output,
+                    Err(TmuxProbeError::OutputLimit { limit }) if limit == MAX_TMUX_PROBE_OUTPUT_BYTES
+                ));
+            }
+            let pid = std::fs::read_to_string(pid_file).expect("child PID");
+            assert!(
+                process_is_gone(pid.trim()),
+                "output producer must be reaped"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binding_liveness_is_unverifiable_when_probe_exceeds_output_limit() {
+        let dir = tempfile::tempdir().expect("output-limit liveness fixture");
+        let socket = dir.path().join("present-socket");
+        std::fs::write(&socket, b"").expect("socket placeholder");
+        let mut record = predicate_record();
+        record.socket_path = Some(socket.to_string_lossy().into_owned());
+        let script = format!(
+            "#!/bin/sh\nexec head -c {} /dev/zero\n",
+            MAX_TMUX_PROBE_OUTPUT_BYTES + 1
+        );
+        let tmux_bin = write_tmux_stub(dir.path(), &script);
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str())],
+            || assert_eq!(binding_liveness(&record), PaneBindingLiveness::Unverifiable),
+        );
+    }
+
+    /// A tmux stub that records its pid and then never answers — the shape
+    /// of a `tmux -S <socket>` whose socket is held by a listener that
+    /// accepts the connection and never replies.
+    #[cfg(unix)]
+    fn hung_tmux_stub(dir: &Path) -> (String, PathBuf) {
+        let pid_file = dir.join("stub.pid");
+        // `exec` so the recorded pid IS the process that must be killed.
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nexec sleep 30\n",
+            pid_file.display()
+        );
+        (write_tmux_stub(dir, &script), pid_file)
+    }
+
+    /// `kill -0` succeeds while the process exists, zombies included; the
+    /// bounded probe both kills and reaps, so nothing may remain.
+    #[cfg(unix)]
+    fn process_is_gone(pid: &str) -> bool {
+        !std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn tmux_probe_timeout_defaults_and_clamps() {
+        let timeout_for = |raw: &str| {
+            crate::config::with_process_env_overrides_for_test(
+                &[(TMUX_PROBE_TIMEOUT_ENV, raw)],
+                tmux_probe_timeout,
+            )
+        };
+        assert_eq!(timeout_for(""), DEFAULT_TMUX_PROBE_TIMEOUT);
+        assert_eq!(timeout_for("not-a-number"), DEFAULT_TMUX_PROBE_TIMEOUT);
+        assert_eq!(timeout_for(" 750 "), Duration::from_millis(750));
+        assert_eq!(timeout_for("0"), MIN_TMUX_PROBE_TIMEOUT);
+        assert_eq!(timeout_for("999999999"), MAX_TMUX_PROBE_TIMEOUT);
+    }
+
+    #[test]
+    fn tmux_probe_error_codes_are_stable() {
+        let spawn = TmuxProbeError::Spawn(std::io::Error::other("nope"));
+        assert_eq!(spawn.code(), "TMUX_UNAVAILABLE");
+        let timed_out = TmuxProbeError::TimedOut {
+            timeout: Duration::from_millis(1500),
+        };
+        assert_eq!(timed_out.code(), TMUX_PROBE_TIMEOUT_CODE);
+        assert_eq!(
+            timed_out.to_string(),
+            "TMUX_PROBE_TIMEOUT: tmux did not answer within 1500 ms and was killed"
+        );
+        let output_limit = TmuxProbeError::OutputLimit {
+            limit: MAX_TMUX_PROBE_OUTPUT_BYTES,
+        };
+        assert_eq!(output_limit.code(), "TMUX_PROBE_OUTPUT_LIMIT");
+        assert_eq!(
+            output_limit.to_string(),
+            "TMUX_PROBE_OUTPUT_LIMIT: tmux output exceeded 1048576 bytes; pane facts unavailable"
+        );
+    }
+
+    /// The reviewer's scenario: a caller-steered socket (`X-Tmux-Socket`)
+    /// whose listener never answers must not pin the tool call. The query
+    /// returns "pane facts unavailable" at the deadline and the hung child
+    /// is killed and reaped.
+    #[cfg(unix)]
+    #[test]
+    fn target_pane_facts_query_is_bounded_when_the_socket_never_answers() {
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let (tmux_bin, pid_file) = hung_tmux_stub(stub_dir.path());
+        let started = Instant::now();
+        let facts = crate::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_TEST_TMUX_BIN", tmux_bin.as_str()),
+                (TMUX_PROBE_TIMEOUT_ENV, "200"),
+            ],
+            || query_target_pane_facts("%7", TmuxServer::at_socket("/tmp/never-answers")),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            facts.is_none(),
+            "a hung probe must report pane facts unavailable"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "returned before the deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "probe was not cut off at its deadline: {elapsed:?}"
+        );
+        let pid = std::fs::read_to_string(&pid_file).expect("stub recorded its pid");
+        assert!(
+            process_is_gone(pid.trim()),
+            "the hung tmux child must be killed and reaped (pid {})",
+            pid.trim()
+        );
+    }
+
+    /// The bare/composite normalizations run through the same bound.
+    #[cfg(unix)]
+    #[test]
+    fn pane_key_normalization_is_bounded_when_tmux_never_answers() {
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let (tmux_bin, _pid_file) = hung_tmux_stub(stub_dir.path());
+        let started = Instant::now();
+        crate::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_TEST_TMUX_BIN", tmux_bin.as_str()),
+                (TMUX_PROBE_TIMEOUT_ENV, "100"),
+                ("TMUX_PANE", "%7"),
+            ],
+            || {
+                let server = TmuxServer::at_socket("/tmp/never-answers");
+                assert_eq!(composite_for_bare_pane("%7", server), None);
+                assert_eq!(bare_for_composite_pane("alpha:0:2", server), None);
+                // The caller's own pane falls back to the bare env value.
+                assert_eq!(get_composite_tmux_pane_id().as_deref(), Some("%7"));
+            },
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "three hung probes must each be cut off at their deadline"
+        );
+    }
+
+    /// A liveness probe that times out is *unverifiable*, never *dead*: a
+    /// stalled server is no evidence about the binding, so it can neither
+    /// enable adoption nor a cleanup purge.
+    #[cfg(unix)]
+    #[test]
+    fn binding_liveness_is_unverifiable_when_the_probe_times_out() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sock = tmp.path().join("present-socket");
+        std::fs::write(&sock, b"").expect("create socket placeholder");
+        let mut record = predicate_record();
+        record.socket_path = Some(sock.to_string_lossy().into_owned());
+        let (tmux_bin, pid_file) = hung_tmux_stub(tmp.path());
+        let liveness = crate::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_TEST_TMUX_BIN", tmux_bin.as_str()),
+                (TMUX_PROBE_TIMEOUT_ENV, "200"),
+            ],
+            || binding_liveness(&record),
+        );
+        assert_eq!(liveness, PaneBindingLiveness::Unverifiable);
+        let pid = std::fs::read_to_string(&pid_file).expect("stub recorded its pid");
+        assert!(process_is_gone(pid.trim()));
+    }
+
+    /// The stdout drain must keep up with a chatty child: output larger than
+    /// a pipe buffer is read in full instead of deadlocking the child on a
+    /// full pipe until the deadline kills it.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_probe_drains_output_larger_than_a_pipe_buffer() {
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let tmux_bin = write_tmux_stub(
+            stub_dir.path(),
+            "#!/bin/sh\nhead -c 262144 /dev/zero | tr '\\0' 'x'\nprintf '\\n'\nexit 0\n",
+        );
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str())],
+            || {
+                let output = run_tmux_capture(&["list-panes"])
+                    .expect("stub runs")
+                    .expect("stub succeeds");
+                assert_eq!(output.len(), 262_145);
+                assert!(output.ends_with("x\n"));
+            },
+        );
     }
 
     // -- writers record binding facts ---------------------------------------

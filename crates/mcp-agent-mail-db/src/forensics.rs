@@ -2873,14 +2873,21 @@ fn archive_canonical_project_identities(storage_root: &Path) -> BTreeMap<String,
 /// `Ok(Some(reason))` means the file is present but not a trustworthy SQLite
 /// generation; callers empty the source sets so a healthy archive candidate
 /// can still be promoted (br-r6awv).
-/// `Err` is reserved for probes that failed without proving corruption
-/// (lock/busy, I/O) — those must not look like a successful heal.
+/// `Err` is reserved for probes that failed without saying anything about the
+/// file (disk full, I/O error, descriptor exhaustion, a copy that would not
+/// open) — those must not look like a successful heal.
 ///
 /// `path` is always a PRIVATE staged copy ([`CanonicalSnapshotSource`]), so
 /// the probe opens it writable: a settled copy whose main-file header still
 /// demands WAL recovery is unreadable to a read-only canonical open ("unable
 /// to open database file" on every probe form), which used to make an
 /// unclassifiable source veto a healthy archive candidate.
+///
+/// When the copy opens but `integrity_check` itself then fails on it, that is
+/// a verdict about the copy, not an environmental failure: the promotion gate
+/// cannot demand that a corrupt source pass a check it can no longer run
+/// (GH#312 — every retry produced another refused candidate and the mailbox
+/// stayed down until the operator moved the source aside by hand).
 fn source_full_integrity_refusal(path: &Path) -> Result<Option<String>, SqlError> {
     match crate::pool::sqlite_private_copy_passes_full_integrity_check(path) {
         Ok(true) => Ok(None),
@@ -2890,7 +2897,7 @@ fn source_full_integrity_refusal(path: &Path) -> Result<Option<String>, SqlError
         ))),
         Err(health_error) => {
             let message = health_error.to_string();
-            if crate::pool::is_corruption_error_message(&message) {
+            if crate::pool::private_copy_integrity_probe_failure_is_verdict(&message) {
                 Ok(Some(message))
             } else {
                 Err(health_error)
@@ -2913,6 +2920,22 @@ fn collect_recovery_receipt_evidence(
     archive_identity_overrides: &BTreeMap<String, String>,
 ) -> Result<RecoveryReceiptEvidence, SqlError> {
     let chain = verify_finalized_recovery_receipt_chain(receipts_dir)?;
+    collect_recovery_receipt_evidence_with_chain(
+        receipts_dir,
+        source_path,
+        candidate_path,
+        archive_identity_overrides,
+        chain,
+    )
+}
+
+fn collect_recovery_receipt_evidence_with_chain(
+    receipts_dir: &Path,
+    source_path: Option<&Path>,
+    candidate_path: &Path,
+    archive_identity_overrides: &BTreeMap<String, String>,
+    chain: Option<VerifiedRecoveryReceiptChain>,
+) -> Result<RecoveryReceiptEvidence, SqlError> {
     let (mut source_sets, mut source_snapshot_failure_sha256) = match source_path {
         Some(path) => {
             match collect_recovery_continuity_sets_with_overrides(path, archive_identity_overrides)
@@ -3150,6 +3173,65 @@ fn collect_recovery_receipt_evidence(
 }
 
 const RECOVERY_RECEIPT_SINGLETON_PENDING_FILE: &str = "recovery-admission.receipt.pending";
+
+/// Counts from the validated candidate's semantic inventory, including salvage.
+#[derive(Debug, Serialize)]
+pub struct RecoveryCandidateContinuity {
+    pub projects: usize,
+    pub agents: usize,
+    pub messages: usize,
+    pub recipients: usize,
+    pub reservations: usize,
+    /// False when the source is absent, corrupt, or lacks verifiable recovery lineage.
+    pub source_verified: bool,
+}
+
+/// Validate a built recovery candidate using the promotion receipt's actual
+/// source/candidate stable-key, lifecycle and continuity checks (GH#271).
+///
+/// Reads source-neutral snapshots without creating receipt directories or
+/// intents, acquiring promotion authority, or modifying either generation.
+/// This is a preview of current evidence; promotion must revalidate after
+/// acquiring its own admission and writer barrier.
+/// When `reseed_broken_chain` is requested, require the real quarantine's
+/// read-only admission check and model its absence of a predecessor chain.
+///
+/// # Errors
+///
+/// Returns the same receipt-admission or semantic-evidence refusal as promotion.
+pub fn validate_recovery_candidate_continuity(
+    storage_root: &Path,
+    db_path: &Path,
+    source_path: Option<&Path>,
+    candidate_path: &Path,
+    reseed_broken_chain: bool,
+) -> Result<RecoveryCandidateContinuity, SqlError> {
+    let authority_path = recovery_receipt_db_authority_path(db_path)?;
+    let receipts_dir = recovery_receipts_dir(storage_root, &authority_path)?;
+    let chain = if reseed_broken_chain {
+        broken_recovery_receipt_chain_error_in(&receipts_dir)?;
+        None
+    } else {
+        verify_recovery_receipt_state_for_promotion(storage_root, &authority_path)?;
+        verify_finalized_recovery_receipt_chain(&receipts_dir)?
+    };
+    let archive_identity_overrides = archive_canonical_project_identities(storage_root);
+    let evidence = collect_recovery_receipt_evidence_with_chain(
+        &receipts_dir,
+        source_path,
+        candidate_path,
+        &archive_identity_overrides,
+        chain,
+    )?;
+    Ok(RecoveryCandidateContinuity {
+        projects: evidence.candidate.projects.count,
+        agents: evidence.candidate.agents.count,
+        messages: evidence.candidate.messages.count,
+        recipients: evidence.candidate.message_recipients.count,
+        reservations: evidence.candidate.reservations.count,
+        source_verified: source_path.is_some() && evidence.source_snapshot_failure_sha256.is_none(),
+    })
+}
 
 /// Build and durably persist a promotion intent from deterministic stable-key
 /// snapshots. Any lost coordination/security key aborts before the live path
@@ -4502,6 +4584,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn candidate_preview_and_receipt_refuse_the_same_duplicate_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.sqlite3");
+        let candidate = temp.path().join("candidate.sqlite3");
+        let storage = temp.path().join("archive");
+        std::fs::create_dir(&storage).unwrap();
+        seed_recovery_receipt_db(&source, true);
+        seed_recovery_receipt_db(&candidate, true);
+        let receipts = super::recovery_receipts_dir(&storage, &source).unwrap();
+        let source_before = std::fs::read(&source).unwrap();
+        let valid = super::validate_recovery_candidate_continuity(
+            &storage,
+            &source,
+            Some(&source),
+            &candidate,
+            false,
+        )
+        .unwrap();
+        assert_eq!(valid.reservations, 1);
+        assert!(valid.source_verified);
+        assert!(!receipts.exists(), "preview must not create receipt state");
+        let conn = crate::CanonicalDbConn::open_file(candidate.to_str().unwrap()).unwrap();
+        conn.execute_raw(
+            "INSERT INTO file_reservations \
+             SELECT 99, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts \
+             FROM file_reservations; \
+             INSERT INTO file_reservation_releases VALUES (99, 777777);",
+        ).unwrap();
+        drop(conn);
+        let candidate_before = std::fs::read(&candidate).unwrap();
+        let preview_error = super::validate_recovery_candidate_continuity(
+            &storage,
+            &source,
+            Some(&source),
+            &candidate,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !receipts.exists(),
+            "refused preview must not create an intent"
+        );
+        let receipt_error =
+            super::prepare_recovery_receipt(&storage, &source, Some(&source), &candidate)
+                .unwrap_err()
+                .to_string();
+        assert_eq!(preview_error, receipt_error);
+        assert!(
+            preview_error.contains("reservations produced 2 rows but only 1 unique stable keys"),
+            "{preview_error}"
+        );
+        assert!(preview_error.contains("src/**"), "{preview_error}");
+        assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        assert_eq!(std::fs::read(&candidate).unwrap(), candidate_before);
+        assert_eq!(
+            super::pending_recovery_receipt_paths(&receipts).unwrap(),
+            [] as [std::path::PathBuf; 0]
+        );
+    }
+
     fn seed_recovery_receipt_db(path: &std::path::Path, include_coordination: bool) {
         let conn = crate::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
             .expect("open receipt fixture database");
@@ -5598,6 +5742,64 @@ mod tests {
             "receipt must attest that the garbage source was not used as authority"
         );
         assert_eq!(document.body.source.projects.count, 0);
+    }
+
+    /// GH#312: the source opens, its coordination tables read cleanly (the
+    /// semantic snapshot succeeds), but full `integrity_check` *raises*
+    /// "database disk image is malformed" on a torn page instead of reporting
+    /// rows. Promotion used to treat that raise as an unclassifiable probe
+    /// failure and refuse forever — a check the corrupt source can no longer
+    /// run cannot gate a healthy archive candidate.
+    #[test]
+    fn recovery_receipt_promotes_when_source_integrity_check_raises_on_torn_page() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&source, true);
+        crate::pool::append_filler_btree_and_tear_last_page(&source);
+        seed_recovery_receipt_db(&candidate, true);
+
+        // Preconditions pin the reporter's shape: the semantic snapshot still
+        // succeeds on the torn source, and the full probe raises rather than
+        // reporting rows.
+        collect_recovery_continuity_sets(&source)
+            .expect("semantic snapshot must still succeed on the torn source");
+        let staged =
+            super::CanonicalSnapshotSource::for_family(&source).expect("stage torn source");
+        let probe_error =
+            crate::pool::sqlite_private_copy_passes_full_integrity_check(staged.snapshot_path())
+                .expect_err("integrity_check must raise on the torn page");
+        assert!(
+            probe_error
+                .to_string()
+                .contains("database disk image is malformed"),
+            "unexpected probe failure shape: {probe_error}"
+        );
+        drop(staged);
+
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect(
+                "GH#312: a source whose integrity_check raises must be attested as unverified, \
+                 not veto the healthy candidate",
+            );
+        let document: super::RecoveryReceiptDocument = serde_json::from_slice(
+            &std::fs::read(&prepared.pending_path).expect("read pending receipt"),
+        )
+        .expect("decode pending receipt");
+        assert!(
+            document.body.source_snapshot_failure_sha256.is_some(),
+            "receipt must attest that the torn source was not used as promotion authority"
+        );
+        assert_eq!(
+            document.body.source.projects.count, 0,
+            "a source that cannot pass full integrity must not contribute continuity sets"
+        );
+        assert_eq!(
+            document.body.delta.messages.lost_count, 0,
+            "no loss may be charged against an unverified source"
+        );
     }
 
     /// The identity/volatile split (GH#208): lifecycle state that archive

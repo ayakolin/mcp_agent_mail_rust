@@ -484,8 +484,14 @@ legacy `PI_PROFILE`) use `~/.omp/profiles/<name>/agent/mcp.json`. Profile names
 must use OMP's lowercase `[a-z0-9][a-z0-9._-]{0,63}` syntax; an invalid
 explicit profile fails closed instead of redirecting setup to the default.
 Setup also honors OMP's `PI_CONFIG_DIR` and default-profile `PI_CODING_AGENT_DIR`
-overrides. The project config is profile-independent and applies under every
-named OMP profile.
+overrides, with a stricter path-safety contract: neither may contain `..`
+components. `PI_CONFIG_DIR` is rooted beneath the user's home directory;
+a relative `PI_CODING_AGENT_DIR` is resolved against the working directory,
+and an absolute path is accepted. For example, use `agent` instead of
+`foo/../agent`. Invalid overrides cause setup to fail before writing config
+files; setup also refuses symlink traversal when accessing those files.
+The project config is profile-independent and applies under every named OMP
+profile.
 
 `am setup run --agent omp --no-user-config` leaves active-user bytes untouched,
 but setup and status still read the authorities that decide whether the
@@ -567,13 +573,29 @@ mcp-agent-mail serve --reuse-running    # Reuse existing server on same port
 ### CLI Operator Tool
 
 ```bash
-am                                      # Auto-detect agents, refresh MCP config, start server + TUI
+am                                      # Start server + TUI (non-interactive: robot status)
 am serve-http --port 9000               # Different port
+am serve-http --setup                   # Explicitly update detected MCP clients before serving
 am serve-http --host 0.0.0.0            # Bind to all interfaces
 am serve-http --no-auth                 # Skip authentication (local dev)
 am serve-http --path api                # Use /api/ transport instead of /mcp/
 am --help                               # Full operator CLI
 ```
+
+Server startup preserves existing MCP client configuration by default, including
+project and user-level URLs. Use `am setup run` to configure clients separately,
+or `am serve-http --setup` to update detected clients to that launch's endpoint.
+The setup flag can rewrite existing entries; omit it for temporary test servers.
+
+For CLI deployments that require an explicitly supplied sending credential, set
+`AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN=1`. `am mail send` then requires
+`--sender-token`, `--sender-token-file`, or `AGENT_MAIL_SENDER_TOKEN`; it refuses
+to borrow a token from persisted agent identity state. The same resolver applies
+to queued-send replay and contact handshakes (use the environment variable where
+the command has no token flag). The default retains automatic token reuse.
+This controls CLI token selection; it does not establish MCP session ownership
+or isolate hostile processes sharing the same OS account. Server-side verified
+send enforcement remains `MESSAGING_FAIL_CLOSED_SEND_PROFILE=true`.
 
 When an interactive `am` finds a healthy Agent Mail service already serving the
 configured endpoint, it attaches a read-only terminal view to that service's
@@ -782,7 +804,7 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 | `am robot status` | Dashboard synthesis | `--format`, `--project`, `--agent` |
 | `am robot inbox` | Actionable inbox with urgency/ack synthesis | `--urgent`, `--ack-overdue`, `--unread`, `--all`, `--limit`, `--include-bodies` |
 | `am robot timeline` | Event stream since last check | `--since`, `--kind`, `--source` |
-| `am robot overview` | Cross-project summary | `--format`, `--project`, `--agent`, `--counts` |
+| `am robot overview` | Cross-project summary | `--format`, `--counts` |
 | `am robot thread <id>` | Full thread rendering | `--limit`, `--since`, `--format` |
 | `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--format` |
 | `am robot message <id>` | Single-message deep view | `--format`, `--project`, `--agent` |
@@ -804,6 +826,12 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 - **`toon`** (default at TTY): Token-efficient, compact, optimized for agent parsing
 - **`json`** (default when piped): Machine-readable envelope with `_meta`, `_alerts`, `_actions`
 - **`md`** (thread/message-focused): Human-readable narrative for deep context
+
+`am robot overview` summarizes the whole mailbox; the global `--project` and
+`--agent` flags do not scope this command. Message counts use one grouped query,
+and active reservations use one candidate scan with release-ledger filtering.
+`--counts` returns totals from the same aggregation. The snapshot cache is
+process-local, so separate CLI invocations each read the database.
 
 `am robot atc` reads the live ATC snapshot over `/mail/ws-state` when the local server is running and falls back to a local SQLite rollup/liveness view when that snapshot is unavailable. Use `--since` to trim recent decisions/executions, `--stratum` to focus open-stratum counts, and `--summary-only` for the compact health view.
 
@@ -858,6 +886,18 @@ reservation does not conflict with its commit. Source files reserved by another
 agent remain protected. When no matching mailbox archive can be found (including
 a proven slug collision), the hook emits a warning and allows the commit rather
 than turning stale/missing mailbox state into a universal commit gate.
+
+The pre-push hook lists the paths a push touches with one streamed
+`git rev-list | git diff-tree --stdin` pipeline per pushed ref, so its cost no
+longer grows with a git process per commit. The scan is bounded by
+`AGENT_MAIL_GUARD_PUSH_MAX_COMMITS` (default 2000 commits per ref, newest
+first), `AGENT_MAIL_GUARD_PUSH_MAX_PATHS` (default 100000 path records per
+ref) and `AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS` (default 120 seconds for the
+whole push); `0` removes a bound. Reaching a bound truncates the scan: the
+paths already read are still checked, and if none of them conflicts while
+another agent holds an active lease, the hook fails closed (exit 2) naming what
+was skipped and which variable to raise, the same way every other unfinished
+inspection does. `AGENT_MAIL_GUARD_MODE=warn` turns that into a warning.
 
 | Area | Reserve glob |
 |------|-------------|
@@ -1082,6 +1122,9 @@ All configuration via environment variables. The server reads them at startup vi
 | `DB_JOURNAL_SIZE_LIMIT_BYTES` | `268435456` | `journal_size_limit` WAL truncation cap (256 MiB) |
 | `AM_GIT_BINARY` | (resolver) | Override the `git` binary for all in-process shell-outs (mitigates the git 2.51.0 index race) |
 | `AM_GIT_FLOCK_TIMEOUT_SECS` | `60` | Bounded wait for the per-repo `am.git-serialize.lock` before a git shell-out fails `EX_TEMPFAIL` (75) |
+| `AGENT_MAIL_GUARD_PUSH_MAX_COMMITS` | `2000` | Most commits the pre-push guard inspects per pushed ref (newest first); past it the scan is truncated and fails closed. `0` removes the bound |
+| `AGENT_MAIL_GUARD_PUSH_MAX_PATHS` | `100000` | Most `--name-status` path records the pre-push guard reads per pushed ref before truncating. `0` removes the bound |
+| `AGENT_MAIL_GUARD_PUSH_TIMEOUT_SECS` | `120` | Wall-clock budget for the whole pre-push path scan; git is killed at the deadline and the scan is truncated. `0` removes the bound |
 
 For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.rs`.
 The feature-flag and tuning-knob registry is inspectable at runtime with
@@ -1650,6 +1693,7 @@ am doctor repair --yes          # Auto-confirm everything (CI/automation)
 
 # Archive-first recovery
 am doctor reconstruct           # Rebuild SQLite from the Git archive (+ salvage what it can)
+am doctor reconstruct --dry-run --json  # Build and validate a private preview candidate
 
 # Full auto-remediation
 am doctor fix --dry-run         # Preview all safe/automatic fixes
@@ -1663,6 +1707,17 @@ am doctor support-bundle --stdout-log /tmp/am.stdout --stderr-log /tmp/am.stderr
 am doctor backups               # List available backups
 am doctor restore /path/to/backup.sqlite3
 ```
+
+`am doctor reconstruct --dry-run` builds a candidate in temporary scratch space
+using the same archive and salvage merge as reconstruction. It checks full
+integrity and the promotion receipt's stable-key continuity rules without
+changing the mailbox or publishing a recovery receipt. Budget temporary disk
+space and runtime for a full rebuild. With `--json`, `candidate_validation`
+reports the accepted candidate's counts or the refusal detail; a refused
+preview exits nonzero. With `--reseed-receipt-chain`, it checks that the broken
+chain can be quarantined and validates the candidate against the resulting
+fresh lineage without moving the live receipts. A successful preview does not reserve promotion authority:
+the real operation rechecks the source and candidate under its own locks.
 
 `am doctor locks --json` is the read-only owner report. Repair and reconstruct
 refuse a live, wedged, or unsafe-to-touch owner by default. A separate

@@ -153,9 +153,9 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{DecodingKey, Validation};
 use mcp_agent_mail_core::config::{ConsoleSplitMode, ConsoleUiAnchor};
 use mcp_agent_mail_core::{
-    AtcExecutorMode, EffectKind, ExperienceBuilder, ExperienceOutcome, ExperienceRow,
-    ExperienceState, ExperienceSubsystem, FeatureExtension, FeatureVector, NonExecutionReason,
-    loss_to_bp, prob_to_bp, saturating_u8,
+    AtcExecutorMode, CallTransport, EffectKind, ExperienceBuilder, ExperienceOutcome,
+    ExperienceRow, ExperienceState, ExperienceSubsystem, FeatureExtension, FeatureVector,
+    NonExecutionReason, loss_to_bp, prob_to_bp, saturating_u8,
 };
 use mcp_agent_mail_db::{
     DbConn, DbPoolConfig, QueryTracker, active_tracker, create_pool, set_active_tracker,
@@ -2756,9 +2756,9 @@ fn guard_raw_live_sqlite_engine_open(path: &Path, context: &str) -> std::io::Res
     let nonclean_authority = match mcp_agent_mail_db::recovery_breaker::load(path) {
         Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
             let fingerprint = mcp_agent_mail_db::recovery_breaker::fingerprint_db(path);
-            (state.db_fingerprint == fingerprint).then(|| {
+            state.applies_to(&fingerprint).then(|| {
                 format!(
-                    "durable recovery-breaker state records {} failed attempt(s) for these exact primary bytes{}",
+                    "durable recovery-breaker state records {} failed attempt(s) for this recovery lineage{}",
                     state.consecutive_failures,
                     if state.tripped { " and is tripped" } else { "" }
                 )
@@ -11421,6 +11421,9 @@ impl HttpState {
 
         let mut resp = self.handle_inner(req).await;
         apply_security_headers(&mut resp);
+        if self.config.http_cors_enabled {
+            apply_cors_cache_vary(&mut resp);
+        }
         // The port-ownership probe validates the real MCP POST route even when
         // bearer auth rejects it. Carry a non-secret signature on every
         // response so a signed 401 remains identifiable.
@@ -16800,6 +16803,21 @@ fn accepts_pane_id_header(tool_name: &str) -> bool {
     )
 }
 
+/// The tools whose authorization depends on the transport (PR #310
+/// follow-up): retire / unretire / deregister accept a tmux pane bound to the
+/// agent in place of the registration token over stdio only. Over HTTP the
+/// daemon stamps [`CallTransport::ARG_NAME`] so the tool applies the
+/// token-required policy; the body value, if any, is never trusted.
+fn requires_lifecycle_auth(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "retire_agent" | "unretire_agent" | "deregister_agent"
+    )
+}
+
+/// Fill the transport-owned identity arguments of a `tools/call` that arrived
+/// over HTTP: the trusted `X-Tmux-Pane` / `X-Tmux-Socket` headers (GH#310) and,
+/// for the lifecycle tools, `call_transport = "http"`.
 fn inject_tmux_pane_header(mut request: JsonRpcRequest, req: &Http1Request) -> JsonRpcRequest {
     if request.method != "tools/call" {
         return request;
@@ -16819,8 +16837,9 @@ fn inject_tmux_pane_header(mut request: JsonRpcRequest, req: &Http1Request) -> J
     if !accepts_pane_id_header(tool_name) {
         return request;
     }
+    let lifecycle_tool = requires_lifecycle_auth(tool_name);
 
-    if pane_id.is_none() && socket_path.is_none() {
+    if pane_id.is_none() && socket_path.is_none() && !lifecycle_tool {
         // No trusted transport context: nothing to inject. The body may still
         // not name a socket for the daemon to dial (GH#310) — strip it and
         // otherwise leave the arguments exactly as sent.
@@ -16842,6 +16861,16 @@ fn inject_tmux_pane_header(mut request: JsonRpcRequest, req: &Http1Request) -> J
     let Some(args) = arguments.as_object_mut() else {
         return request;
     };
+
+    if lifecycle_tool {
+        // The transport is a fact about this request, not a claim the body
+        // gets to make: a forged "stdio" would re-enable pane-only
+        // authorization for a remote caller.
+        args.insert(
+            CallTransport::ARG_NAME.to_string(),
+            serde_json::Value::String(CallTransport::Http.as_str().to_string()),
+        );
+    }
 
     let caller_supplied_pane = args
         .get("pane_id")
@@ -17321,6 +17350,22 @@ fn to_http1_response(
         allow_headers,
     );
     out
+}
+
+/// CORS headers depend on Origin, including when it is missing or denied.
+/// Mark responses at the outer handler so errors and non-CORS responses vary too.
+fn apply_cors_cache_vary(resp: &mut Http1Response) {
+    let already_varies = resp.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("vary")
+            && value.split(',').any(|field| {
+                let field = field.trim();
+                field == "*" || field.eq_ignore_ascii_case("origin")
+            })
+    });
+    if !already_varies {
+        resp.headers
+            .push(("vary".to_string(), "Origin".to_string()));
+    }
 }
 
 fn apply_cors_headers(
@@ -17847,6 +17892,7 @@ mod tests {
             last_failure_unix: i64::MAX,
             last_failure_reason: "synthetic repeated recovery failure".to_string(),
             tripped: true,
+            attempt_in_progress: false,
         };
         mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
             .expect("store tripped breaker");
@@ -17926,6 +17972,7 @@ mod tests {
             last_failure_unix: i64::MAX,
             last_failure_reason: "synthetic repeated recovery failure".to_string(),
             tripped: true,
+            attempt_in_progress: false,
         };
         mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
             .expect("store tripped breaker");
@@ -21167,6 +21214,164 @@ first body
         assert_eq!(injected_tmux_socket_path(&injected), None);
     }
 
+    // ── PR #310 follow-up: HTTP stamps the transport on lifecycle tools ────
+
+    fn injected_call_transport(request: &JsonRpcRequest) -> Option<&str> {
+        request
+            .params
+            .as_ref()?
+            .get("arguments")?
+            .get(CallTransport::ARG_NAME)?
+            .as_str()
+    }
+
+    fn tool_call(tool_name: &str, arguments: serde_json::Value) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": tool_name,
+                "arguments": arguments,
+            })),
+            1,
+        )
+    }
+
+    #[test]
+    fn http_lifecycle_calls_are_stamped_with_the_transport() {
+        for tool_name in ["retire_agent", "unretire_agent", "deregister_agent"] {
+            // With the tmux headers present ...
+            let req = make_request(
+                Http1Method::Post,
+                "/mcp/",
+                &[
+                    ("X-Tmux-Pane", "%23"),
+                    ("X-Tmux-Socket", "/tmp/tmux-1000/ntm"),
+                ],
+            );
+            let injected = inject_tmux_pane_header(
+                tool_call(
+                    tool_name,
+                    serde_json::json!({"project_key": "/tmp/project", "agent_name": "BlueLake"}),
+                ),
+                &req,
+            );
+            assert_eq!(
+                injected_call_transport(&injected),
+                Some("http"),
+                "{tool_name}"
+            );
+            assert_eq!(injected_pane_id(&injected), Some("%23"), "{tool_name}");
+            assert_eq!(
+                injected_tmux_socket_path(&injected),
+                Some("/tmp/tmux-1000/ntm"),
+                "{tool_name}"
+            );
+
+            // ... and without any: a body-supplied pane id over HTTP is a
+            // client assertion too, so the transport is stamped regardless.
+            let bare = make_request(Http1Method::Post, "/mcp/", &[]);
+            let injected = inject_tmux_pane_header(
+                tool_call(
+                    tool_name,
+                    serde_json::json!({
+                        "project_key": "/tmp/project",
+                        "agent_name": "BlueLake",
+                        "pane_id": "%7",
+                        "tmux_socket_path": "/tmp/tmux-1000/forged"
+                    }),
+                ),
+                &bare,
+            );
+            assert_eq!(
+                injected_call_transport(&injected),
+                Some("http"),
+                "{tool_name}"
+            );
+            assert_eq!(injected_pane_id(&injected), Some("%7"), "{tool_name}");
+            assert_eq!(
+                injected_tmux_socket_path(&injected),
+                None,
+                "{tool_name}: body socket must still be stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn http_lifecycle_call_cannot_forge_a_stdio_transport() {
+        let req = make_request(Http1Method::Post, "/mcp/", &[("X-Tmux-Pane", "%23")]);
+        let injected = inject_tmux_pane_header(
+            tool_call(
+                "deregister_agent",
+                serde_json::json!({
+                    "project_key": "/tmp/project",
+                    "agent_name": "BlueLake",
+                    "call_transport": "stdio"
+                }),
+            ),
+            &req,
+        );
+        assert_eq!(injected_call_transport(&injected), Some("http"));
+    }
+
+    #[test]
+    fn http_lifecycle_call_with_null_arguments_is_still_stamped() {
+        let req = make_request(Http1Method::Post, "/mcp/", &[]);
+        let injected =
+            inject_tmux_pane_header(tool_call("retire_agent", serde_json::Value::Null), &req);
+        assert_eq!(injected_call_transport(&injected), Some("http"));
+    }
+
+    #[test]
+    fn malformed_socket_header_still_stamps_http_on_lifecycle_calls() {
+        let req = make_request(
+            Http1Method::Post,
+            "/mcp/",
+            &[("X-Tmux-Pane", "%23"), ("X-Tmux-Socket", "relative/socket")],
+        );
+        let injected = inject_tmux_pane_header(
+            tool_call(
+                "retire_agent",
+                serde_json::json!({"project_key": "/tmp/project", "agent_name": "BlueLake"}),
+            ),
+            &req,
+        );
+        assert_eq!(injected_call_transport(&injected), Some("http"));
+        assert_eq!(injected_pane_id(&injected), Some("%23"));
+        assert_eq!(injected_tmux_socket_path(&injected), None);
+    }
+
+    #[test]
+    fn non_lifecycle_identity_tools_are_not_stamped_with_a_transport() {
+        let req = make_request(
+            Http1Method::Post,
+            "/mcp/",
+            &[
+                ("X-Tmux-Pane", "%23"),
+                ("X-Tmux-Socket", "/tmp/tmux-1000/ntm"),
+            ],
+        );
+        for tool_name in [
+            "register_agent",
+            "create_agent_identity",
+            "macro_start_session",
+            "resolve_pane_identity",
+        ] {
+            let injected = inject_tmux_pane_header(
+                tool_call(
+                    tool_name,
+                    serde_json::json!({"project_key": "/tmp/project"}),
+                ),
+                &req,
+            );
+            assert_eq!(injected_call_transport(&injected), None, "{tool_name}");
+            assert_eq!(injected_pane_id(&injected), Some("%23"), "{tool_name}");
+        }
+        // Unrelated tools keep their arguments untouched.
+        let injected =
+            inject_tmux_pane_header(tool_call("health_check", serde_json::json!({})), &req);
+        assert_eq!(injected_call_transport(&injected), None);
+    }
+
     #[test]
     fn explicit_pane_id_wins_over_x_tmux_pane_header() {
         let req = make_request(Http1Method::Post, "/mcp/", &[("X-Tmux-Pane", "%23")]);
@@ -22659,6 +22864,93 @@ first body
     }
 
     #[test]
+    fn cors_cache_vary_preserves_existing_fields_and_is_idempotent() {
+        for (fields, already_varies) in [
+            (vec![], false),
+            (vec![("Vary", "Accept-Encoding")], false),
+            (
+                vec![("vary", "X-Origin"), ("VARY", "Accept-Language")],
+                false,
+            ),
+            (vec![("Vary", "Accept-Encoding, oRiGiN")], true),
+            (
+                vec![("vary", "Accept-Encoding"), ("VARY", " Origin ")],
+                true,
+            ),
+            (vec![("Vary", "*")], true),
+        ] {
+            let mut response = Http1Response::new(200, "OK", Vec::new());
+            response.headers = fields
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect();
+            let mut expected = response.headers.clone();
+            if !already_varies {
+                expected.push(("vary".to_string(), "Origin".to_string()));
+            }
+            apply_cors_cache_vary(&mut response);
+            assert_eq!(response.headers, expected, "original fields: {fields:?}");
+            apply_cors_cache_vary(&mut response);
+            assert_eq!(response.headers, expected, "second application: {fields:?}");
+        }
+    }
+
+    #[test]
+    fn cors_cache_vary_covers_allowed_denied_and_missing_origins_on_every_route() {
+        for enabled in [true, false] {
+            let state = build_state(mcp_agent_mail_core::Config {
+                http_cors_enabled: enabled,
+                http_cors_origins: vec![
+                    "https://a.example.test".to_string(),
+                    "https://b.example.test".to_string(),
+                ],
+                http_cors_allow_credentials: true,
+                http_bearer_token: None,
+                database_url: "sqlite:///:memory:".to_string(),
+                ..Default::default()
+            });
+            for origin in [
+                Some("https://a.example.test"),
+                Some("https://b.example.test"),
+                Some("https://denied.example.test"),
+                None,
+            ] {
+                for (method, path, expected_status) in [
+                    (Http1Method::Get, "/health/liveness", 200),
+                    (Http1Method::Get, "/not-a-real-route", 404),
+                    (Http1Method::Options, "/api/", 204),
+                    (Http1Method::Get, "/web-dashboard", 501),
+                ] {
+                    let headers = origin.map(|origin| ("Origin", origin));
+                    let request = make_request(method, path, headers.as_slice());
+                    let response = block_on(state.handle(request));
+                    assert_eq!(response.status, expected_status, "route {path}");
+                    assert_eq!(
+                        response_header(&response, "vary"),
+                        enabled.then_some("Origin"),
+                        "enabled={enabled}, route={path}, origin={origin:?}"
+                    );
+                    let allowed = enabled
+                        && matches!(
+                            origin,
+                            Some("https://a.example.test" | "https://b.example.test")
+                        );
+                    assert_eq!(
+                        response_header(&response, "access-control-allow-origin"),
+                        origin.filter(|_| allowed),
+                        "origin authorization for {path}"
+                    );
+                    assert_eq!(
+                        response_header(&response, "access-control-allow-credentials"),
+                        allowed.then_some("true"),
+                        "credential authorization for {path}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cors_preflight_includes_configured_headers() {
         let config = mcp_agent_mail_core::Config {
             http_cors_enabled: true,
@@ -22693,6 +22985,7 @@ first body
             Some("*")
         );
         assert!(response_header(&resp, "access-control-allow-credentials").is_none());
+        assert_eq!(response_header(&resp, "vary"), Some("Origin"));
     }
 
     #[test]
@@ -22801,6 +23094,7 @@ first body
         let resp = block_on(state.handle(req));
         assert_eq!(resp.status, 200);
         assert!(response_header(&resp, "access-control-allow-origin").is_none());
+        assert!(response_header(&resp, "vary").is_none());
     }
 
     #[test]
@@ -29886,10 +30180,15 @@ first body
                 std::fs::write(&breaker_path, b"malformed breaker authority")
                     .expect("write malformed breaker authority");
             }
-            "tripped" => {
+            "tripped" | "unfinished-changed" => {
                 let state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
                     schema: 1,
-                    db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(db_path),
+                    attempt_in_progress: breaker_kind == "unfinished-changed",
+                    db_fingerprint: if breaker_kind == "unfinished-changed" {
+                        "missing".into()
+                    } else {
+                        mcp_agent_mail_db::recovery_breaker::fingerprint_db(db_path)
+                    },
                     consecutive_failures:
                         mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
                     last_failure_unix: i64::MAX,
@@ -29910,9 +30209,9 @@ first body
     ) {
         for family_kind in ["damaged-wal", "corrupt-primary"] {
             let breaker_kinds: &[&str] = if family_kind == "damaged-wal" {
-                &["absent", "malformed", "tripped"]
+                &["absent", "malformed", "tripped", "unfinished-changed"]
             } else {
-                &["malformed", "tripped"]
+                &["malformed", "tripped", "unfinished-changed"]
             };
             for &breaker_kind in breaker_kinds {
                 let dir = tempfile::tempdir().expect("tempdir");

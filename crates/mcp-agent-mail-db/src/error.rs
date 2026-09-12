@@ -126,6 +126,10 @@ pub enum DbErrorClass {
     FtsIndexCorruption,
     /// Connection, path, permission, or configuration error.
     ConnectionOrConfigError,
+    /// The request itself was unsatisfiable — a lookup missed, a row already
+    /// existed, an argument was invalid. Storage is healthy; nothing here
+    /// says reads are unsafe or edits must stop (GH#313).
+    RequestSemanticError,
     /// Retryable busy/lock/MVCC contention.
     BusyRetryable,
     /// Process file-descriptor exhaustion.
@@ -150,6 +154,7 @@ impl DbErrorClass {
             Self::ForeignKeyInconsistency => "foreign_key_inconsistency",
             Self::FtsIndexCorruption => "fts_index_corruption",
             Self::ConnectionOrConfigError => "connection_or_config_error",
+            Self::RequestSemanticError => "request_semantic_error",
             Self::BusyRetryable => "busy_retryable",
             Self::FdExhaustion => "fd_exhaustion",
             Self::PoolExhaustion => "pool_exhaustion",
@@ -267,6 +272,19 @@ impl DbErrorClassification {
                 safe_to_continue_read_only: false,
                 blocks_edits: true,
                 recommended_command: "am doctor health",
+            },
+            // A miss or an invalid argument is a fact about the request, not
+            // about storage: reads stay safe, edits stay allowed, and no
+            // doctor command is implied. Retrying the same request will miss
+            // again, so `safe_to_retry` stays false.
+            DbErrorClass::RequestSemanticError => Self {
+                class,
+                severity: DbErrorSeverity::P3,
+                repairable: false,
+                safe_to_retry: false,
+                safe_to_continue_read_only: true,
+                blocks_edits: false,
+                recommended_command: "correct the request arguments; no database remediation is needed",
             },
             DbErrorClass::BusyRetryable => Self {
                 class,
@@ -635,10 +653,14 @@ impl DbError {
             Self::Sqlite(message) | Self::Schema(message) => classify_db_error_message(message),
             Self::Internal(message) => classify_db_error_message(message),
             Self::RetryBudgetExhausted { inner, .. } => inner.classification(),
-            Self::NotFound { .. }
-            | Self::Duplicate { .. }
-            | Self::InvalidArgument { .. }
-            | Self::Serialization(_) => {
+            // GH#313: a semantic miss carried the connection/config policy
+            // (reads unsafe, edits blocked, "run am doctor health"), so a
+            // wrong-tuple `respond_contact` on a healthy mailbox read like a
+            // storage incident.
+            Self::NotFound { .. } | Self::Duplicate { .. } | Self::InvalidArgument { .. } => {
+                DbErrorClassification::for_class(DbErrorClass::RequestSemanticError)
+            }
+            Self::Serialization(_) => {
                 DbErrorClassification::for_class(DbErrorClass::ConnectionOrConfigError)
             }
         }
@@ -1053,14 +1075,22 @@ fn classify_db_error_message_class(msg: &str) -> DbErrorClass {
     if contains_fts_index_corruption(msg) {
         return DbErrorClass::FtsIndexCorruption;
     }
+    // An explicit main-file corruption signature outranks the generic
+    // schema-drift strings. A multi-form integrity probe joins every form's
+    // error into one message, and on current SQLite the table-valued
+    // `pragma_integrity_check(N)` form always fails first with
+    // "no such table: N" (the argument is quoted and looked up as a table
+    // name); letting that noise classify a message that also carries
+    // "database disk image is malformed" as schema drift made recovery treat
+    // a proven-corrupt source as unclassifiable and refuse promotion (GH#312).
+    if contains_main_db_corruption(msg) {
+        return DbErrorClass::MainDbBtreeCorruption;
+    }
     if contains_schema_drift(msg) {
         return DbErrorClass::SchemaDriftOrMissingTables;
     }
     if contains_engine_probe_limitation(msg) {
         return DbErrorClass::EngineProbeLimitation;
-    }
-    if contains_main_db_corruption(msg) {
-        return DbErrorClass::MainDbBtreeCorruption;
     }
     if contains_foreign_key_inconsistency(msg) {
         return DbErrorClass::ForeignKeyInconsistency;
@@ -1293,6 +1323,71 @@ mod tests {
             "unexpected classification for {message:?}: {classification:?}"
         );
         classification
+    }
+
+    /// GH#312: a multi-form integrity probe joins every form's error into one
+    /// message. On current SQLite the table-valued `pragma_integrity_check(N)`
+    /// form fails first with "no such table: N" (the argument is quoted and
+    /// resolved as a table name), so the joined message carries a generic
+    /// schema-drift string *and* the real "database disk image is malformed"
+    /// verdict from the forms that ran. The corruption evidence must win; the
+    /// old order classified this as schema drift, `is_corruption_error`
+    /// returned false, and recovery treated a proven-corrupt source as
+    /// unclassifiable.
+    #[test]
+    fn explicit_main_db_corruption_outranks_schema_drift_noise_in_joined_probe_errors() {
+        let joined = "integrity_check failed: every integrity_check probe form failed — \
+             `SELECT integrity_check FROM pragma_integrity_check(1000000)`: Query error: no such table: 1000000; \
+             `PRAGMA integrity_check(1000000)`: Query error: database disk image is malformed; \
+             `SELECT integrity_check FROM pragma_integrity_check()`: Query error: no such table: pragma_integrity_check; \
+             `PRAGMA integrity_check`: Query error: database disk image is malformed";
+        assert_class(joined, DbErrorClass::MainDbBtreeCorruption);
+        assert!(is_corruption_error(joined));
+
+        // The generic strings alone still classify as drift, and the typed
+        // classifier stays conservative about raw schema-corruption strings.
+        assert_class(
+            "no such table: 1000000",
+            DbErrorClass::SchemaDriftOrMissingTables,
+        );
+        assert_class(
+            "malformed database schema (idx_agent_links_pair_unique) - invalid rootpage (11)",
+            DbErrorClass::SchemaDriftOrMissingTables,
+        );
+    }
+
+    /// GH#313: a lookup miss, a duplicate, or an invalid argument is a fact
+    /// about the request, not about storage. It must not inherit the
+    /// connection/config policy that marks reads unsafe and blocks edits.
+    #[test]
+    fn semantic_request_errors_do_not_carry_storage_failure_policy() {
+        for error in [
+            DbError::not_found("AgentLink", "1:41->1:42"),
+            DbError::duplicate("Agent", "BlueLake"),
+            DbError::invalid("ttl_seconds", "must be positive"),
+        ] {
+            let classification = error.classification();
+            assert_eq!(
+                classification.class,
+                DbErrorClass::RequestSemanticError,
+                "{error}"
+            );
+            assert!(classification.safe_to_continue_read_only, "{error}");
+            assert!(!classification.blocks_edits, "{error}");
+            assert!(!classification.repairable, "{error}");
+            assert!(!classification.safe_to_retry, "{error}");
+            let envelope = error.failure_envelope();
+            assert_eq!(envelope.class, "request_semantic_error");
+            assert!(!envelope.policy.blocks_edits);
+            assert!(envelope.policy.safe_to_continue_read_only);
+        }
+        // A row that cannot be decoded is still a storage-side fault.
+        assert_eq!(
+            DbError::Serialization("bad json".into())
+                .classification()
+                .class,
+            DbErrorClass::ConnectionOrConfigError
+        );
     }
 
     #[test]

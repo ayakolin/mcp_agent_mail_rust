@@ -379,6 +379,9 @@ pub enum Commands {
         /// Disable the interactive TUI and run headless.
         #[arg(long)]
         no_tui: bool,
+        /// Update detected MCP client configs to this server before serving (opt-in).
+        #[arg(long)]
+        setup: bool,
         /// Extra Host header to accept (repeatable; also reads HTTP_ALLOWED_HOSTS).
         #[arg(long = "allowed-host", value_name = "HOST")]
         allowed_host: Vec<String>,
@@ -2581,7 +2584,7 @@ pub enum DoctorCommand {
     /// database from the archived messages and agent profiles. Use this when
     /// the database is corrupt and no healthy backup exists.
     Reconstruct {
-        /// Preview what would be recovered without writing.
+        /// Build and validate a temporary candidate without changing the mailbox.
         #[arg(long)]
         dry_run: bool,
         /// Auto-confirm (skip interactive prompt).
@@ -3557,7 +3560,13 @@ pub fn run_with_invocation_name(invocation_name: &'static str) -> i32 {
         Ok(cli) => cli,
         Err(code) => return code,
     };
-    match execute(cli) {
+    let result = execute(cli);
+    // One-shot commands can enqueue archive writes just before returning.
+    // Drain this process's queue and commits before the binary calls exit;
+    // neither shutdown operation initializes storage for read-only commands.
+    mcp_agent_mail_storage::wbq_shutdown();
+    mcp_agent_mail_storage::flush_async_commits();
+    match result {
         Ok(()) => 0,
         Err(err) => {
             emit_error(&err);
@@ -3884,9 +3893,15 @@ fn dispatch_command(command: Commands) -> CliResult<()> {
             path,
             no_auth,
             no_tui,
+            setup,
             allowed_host,
             takeover,
-        } => handle_serve_http(host, port, path, no_auth, no_tui, allowed_host, takeover),
+        } => handle_serve_http(
+            build_http_config(host, port, path, no_auth, allowed_host),
+            no_tui,
+            takeover,
+            setup,
+        ),
         Commands::ServeStdio => handle_serve_stdio(),
         Commands::Capabilities { format, json } => handle_capabilities(format, json),
         Commands::Agent { action } => handle_agent(action),
@@ -4136,9 +4151,8 @@ fn dispatch_command(command: Commands) -> CliResult<()> {
 /// Default behavior when `am` is invoked with no subcommand.
 ///
 /// **Interactive terminal (human operator):**
-/// 1. Auto-detect installed coding agents and configure their MCP connections
-/// 2. Clear the port if something is already listening
-/// 3. Start the HTTP server with the TUI
+/// Check server ownership and start the HTTP server with the TUI, preserving
+/// existing MCP client configuration. Client setup is an explicit operation.
 ///
 /// **Non-interactive (coding agent, pipe, CI):**
 /// Automatically switches to `am robot status` for a JSON/TOON dashboard
@@ -4152,9 +4166,14 @@ fn handle_default_launch() -> CliResult<()> {
         return handle_noninteractive_default_status();
     }
 
-    // Interactive: full server launch experience (setup self-heal + port check + serve).
+    // Interactive: port check + serve, without implicitly reconfiguring clients.
     // takeover=false: bare `am` never kills a live peer serving this storage root.
-    handle_serve_http(None, None, None, false, false, Vec::new(), false)
+    handle_serve_http(
+        build_http_config(None, None, None, false, Vec::new()),
+        false,
+        false,
+        false,
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -7350,15 +7369,11 @@ mod managed_standby_tests {
 }
 
 fn handle_serve_http(
-    host: Option<String>,
-    port: Option<u16>,
-    path: Option<String>,
-    no_auth: bool,
+    mut config: Config,
     no_tui: bool,
-    allowed_host: Vec<String>,
     takeover: bool,
+    setup: bool,
 ) -> CliResult<()> {
-    let mut config = build_http_config(host, port, path, no_auth, allowed_host);
     config.validate_user_env_authority()?;
     if no_tui {
         config.tui_enabled = false;
@@ -7513,15 +7528,16 @@ fn handle_serve_http(
     let preflight_report =
         mcp_agent_mail_server::startup_checks::run_http_startup_preflight_probes(&config);
     if !preflight_report.is_ok() {
-        // Defer setup self-heal until after preflight passes. Otherwise a
+        // Defer explicitly requested setup until after preflight passes. Otherwise a
         // crashed startup (#93) would silently rewrite Codex/Gemini/Claude
         // MCP client configs to point at a port that never opened, leaving
         // every client wedged after a single failed `am serve-http` run.
         return Err(CliError::Other(preflight_report.format_errors()));
     }
-    if !running_under_managed_service()
-        && let Err(e) = run_setup_self_heal_for_server(&config)
-    {
+    // Starting a temporary server is not authority to repoint existing clients
+    // to its endpoint (GH#318). The same rule applies to the default port and
+    // bare interactive launch; setup requires the operator's explicit request.
+    if setup && let Err(e) = run_setup_self_heal_for_server(&config) {
         output::warn(&format!(
             "Agent setup self-heal encountered an issue (non-fatal): {e}"
         ));
@@ -8865,6 +8881,8 @@ fn setup_self_heal_cache_path(config: &Config, project_dir: &Path) -> PathBuf {
 
 /// Environment variable carrying a `mail send` sender token (non-echoing path).
 const AGENT_MAIL_SENDER_TOKEN_ENV: &str = "AGENT_MAIL_SENDER_TOKEN";
+const AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN_ENV: &str =
+    "AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN";
 
 /// On-disk record of a registered agent's sender token for one project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8959,9 +8977,11 @@ fn persist_sender_identity_token_from_agent_payload(
 ///   3. `AGENT_MAIL_SENDER_TOKEN` environment variable
 ///   4. persisted identity state from `agents register` / `macros start-session`
 ///
-/// Returns `Ok(None)` when no source yields a token (send proceeds unverified,
-/// preserving prior behavior). Returns an error only when an explicitly-named
-/// `--sender-token-file` cannot be read.
+/// In the default mode, returns `Ok(None)` when no source yields a token.
+/// With `AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN=1`, refuses before reading
+/// persisted identity state if the first three sources yield no token. This
+/// applies equally to send, queued replay and contact-handshake callers.
+/// An explicitly named unreadable or empty token file always fails.
 fn resolve_sender_token(
     config: &Config,
     project_key: &str,
@@ -8993,6 +9013,13 @@ fn resolve_sender_token(
         if !env_tok.is_empty() {
             return Ok(Some(env_tok));
         }
+    }
+    if env_var_is_truthy(AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN_ENV) {
+        return Err(CliError::InvalidArgument(format!(
+            "{AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN_ENV} is enabled: provide \
+             --sender-token, --sender-token-file, or {AGENT_MAIL_SENDER_TOKEN_ENV}; \
+             persisted identity tokens are not reused"
+        )));
     }
     Ok(load_sender_identity_token(config, project_key, sender))
 }
@@ -16094,7 +16121,7 @@ fn open_db_async_canonical_read_with_database_url(
             context,
         )?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
         .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
@@ -16119,7 +16146,7 @@ fn open_db_sync_async_canonical_read_with_database_url(
         )?;
     let conn = source.open_read_only(context)?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
         .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
@@ -16150,7 +16177,7 @@ fn open_db_sync_async_canonical_read_best_effort_with_database_url(
         )?;
     let conn = source.open_read_only(context)?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
     pool_cfg.run_migrations = false;
     pool_cfg.warmup_connections = 0;
@@ -16205,7 +16232,7 @@ fn open_atc_simulate_read_pool_with_database_url(
     }
     let conn = source.open_read_only("ATC simulate snapshot")?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
     pool_cfg.run_migrations = false;
     pool_cfg.warmup_connections = 0;
@@ -26777,8 +26804,10 @@ fn doctor_open_private_immutable_canonical_snapshot(
 /// recover the WAL frames into a fresh `-shm` inside the tempdir
 /// (`immutable=1` would hide those frames — see the revert of the
 /// sidecar-free `immutable=1` fallback). Canonical SQLite never opens the
-/// live main inode, so no live FrankenSQLite `fcntl` lock can be disturbed,
-/// and the cross-engine refusal for Franken-admitted families stays intact.
+/// live main inode. On Linux, the raw copy itself must also exclude live
+/// namespace users: closing its source descriptor would otherwise release
+/// another connection's process-wide `fcntl` locks. A busy namespace falls
+/// back to the guarded logical export, whose verdict remains inconclusive.
 fn doctor_open_staged_family_copy_canonical(
     db_path: &Path,
     operation: &str,
@@ -31318,10 +31347,11 @@ fn doctor_fold_probe_authority(
 /// corroborates corruption, or is inconclusive.
 ///
 /// An offline canonical database is opened through true read-only flags. A
-/// live FrankenSQLite family is first exported to a private logical image, so
-/// canonical SQLite never opens or closes the live main inode. A clean logical
-/// rebuild cannot prove the physical live b-tree healthy and is therefore
-/// inconclusive rather than `Healthy`. The battery, in increasing cost, is:
+/// live FrankenSQLite family is first staged as a private physical copy, with
+/// logical export as a fallback, so canonical SQLite never opens or closes the
+/// live main inode. A clean logical rebuild cannot prove the physical live
+/// b-tree healthy and is therefore inconclusive rather than `Healthy`.
+/// The battery, in increasing cost, is:
 /// `quick_check`, full `integrity_check`,
 /// `foreign_key_check`, a schema-table probe (core tables present and readable),
 /// and an FTS read probe when a legacy FTS table exists.
@@ -32571,6 +32601,28 @@ fn doctor_mcp_config_check_status(
     } else {
         "warn"
     }
+}
+
+/// Reuse setup's effective OMP view: a project entry can be disabled by a
+/// separate active-profile file that contains no Agent Mail entry of its own.
+fn doctor_omp_runtime_drift(params: &mcp_agent_mail_core::setup::SetupParams) -> Vec<String> {
+    mcp_agent_mail_core::setup::check_status(params)
+        .iter()
+        .filter(|status| status.slug == "omp")
+        .flat_map(|status| {
+            status.config_files.iter().filter_map(|file| {
+                if file.exists
+                    && (file.omp_active_user_config_drift
+                        || file.omp_settings_config_drift
+                        || file.omp_mcp_alias_drift)
+                {
+                    Some(setup_status_file_drift_summary(&status.slug, file))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
 }
 
 fn normalize_mcp_config_status_url_host(host: &str) -> &str {
@@ -34343,6 +34395,40 @@ fn handle_doctor_check_with_target(
                 )
             };
             let desired_urls_label = desired_urls.join(" or ");
+
+            if existing
+                .iter()
+                .any(|loc| loc.tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp)
+            {
+                use mcp_agent_mail_core::setup::{self, AgentPlatform, SetupParams};
+
+                let runtime_drift = std::env::current_dir()
+                    .map_err(|error| error.to_string())
+                    .and_then(|project_dir| {
+                        let overlays = setup::omp_settings_overlay_paths_from_env(&project_dir)
+                            .map_err(|error| error.to_string())?;
+                        Ok(doctor_omp_runtime_drift(&SetupParams {
+                            host: env_config.http_host.clone(),
+                            port: env_config.http_port,
+                            path: env_config.http_path.clone(),
+                            token: env_config.http_bearer_token.clone().unwrap_or_default(),
+                            project_dir,
+                            omp_settings_overlay_paths: overlays,
+                            agents: Some(vec![AgentPlatform::Omp]),
+                            skip_hooks: true,
+                            ..SetupParams::default()
+                        }))
+                    })
+                    .unwrap_or_else(|error| {
+                        vec![format!(
+                            "OMP runtime configuration cannot be resolved: {error}"
+                        )]
+                    });
+                if !runtime_drift.is_empty() {
+                    omp_contract_issues += 1;
+                    detail_parts.extend(runtime_drift);
+                }
+            }
 
             for loc in &existing {
                 if let Err(error) =
@@ -38769,49 +38855,46 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             }
 
             reject_local_registration_if_proof_gate_enabled("agents register")?;
+            let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(
+                &database_url,
+                Some(&server_config.storage_root),
+            )?;
             let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
+            let cx = asupersync::Cx::current().ok_or_else(|| {
+                CliError::Other("agents register requires an active async context".into())
+            })?;
 
-            // Resolve project
+            // Preserve CLI slug/human-key resolution and absolute-path creation,
+            // then use the native tool for token rotation and archived identity.
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
-
-            // Resolve or generate agent name
-            let agent_name = name
-                .map(|value| value.trim().to_string())
-                .unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name);
-
-            let row = match mcp_agent_mail_db::queries::register_agent(
-                &cx,
-                &ctx.pool,
-                proj.id.unwrap_or(0),
-                &agent_name,
-                &program,
-                &model,
-                task.as_deref(),
-                Some(attachments_policy.as_str()),
+            let mcp_ctx = McpContext::new(cx, 1);
+            // Absolute-path registration may have just created this project;
+            // persist its canonical archive metadata as the session macro does.
+            mcp_agent_mail_tools::identity::ensure_project(&mcp_ctx, proj.human_key.clone(), None)
+                .await
+                .map_err(mcp_error_to_cli_error)?;
+            let result = mcp_agent_mail_tools::identity::register_agent(
+                &mcp_ctx,
+                proj.human_key,
+                program,
+                model,
+                name,
+                task,
+                Some(attachments_policy),
+                None,
+                None,
+                None,
                 None,
             )
             .await
-            {
-                asupersync::Outcome::Ok(r) => r,
-                asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
-                    message,
-                    ..
-                }) => {
-                    return Err(CliError::InvalidArgument(message));
-                }
-                asupersync::Outcome::Err(e) => {
-                    return Err(CliError::Other(format!("register_agent failed: {e}")));
-                }
-                asupersync::Outcome::Cancelled(_) => {
-                    return Err(CliError::Other("request cancelled".into()));
-                }
-                asupersync::Outcome::Panicked(p) => {
-                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
-                }
-            };
-
-            render_agent_row(&row, fmt);
+            .map_err(mcp_error_to_cli_error)?;
+            let payload = parse_tool_json_payload("register_agent", &result)?;
+            persist_sender_identity_token_from_agent_payload(
+                &server_config,
+                &project_key,
+                &payload,
+            );
+            render_agent_payload(&payload, fmt);
             Ok(())
         }
 
@@ -40094,6 +40177,13 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             .map_err(mcp_error_to_cli_error)?;
             let payload = parse_tool_json_payload("macro_contact_handshake", &result)?;
             let welcome_sent = payload.get("welcome_message").is_some_and(|v| !v.is_null());
+            if welcome_sent {
+                // This offline command exits immediately after rendering. Drain
+                // its queued welcome archive before the process ends, while the
+                // mailbox mutation locks still protect this operation.
+                mcp_agent_mail_storage::wbq_shutdown();
+                mcp_agent_mail_storage::flush_async_commits();
+            }
             output::emit_output(&payload, fmt, || {
                 output::success(&format!("Contact handshake: {from} → {to}"));
                 if auto_accept {
@@ -40256,6 +40346,39 @@ fn truncate_str(s: &str, max: usize) -> String {
 }
 
 fn server_message_payload_to_cli_json(payload: serde_json::Value) -> Option<serde_json::Value> {
+    use mcp_agent_mail_tools::messaging::{
+        RedactedReplyMessageReceipt, RedactedSendMessageReceipt,
+    };
+
+    if payload
+        .get("receipt_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("redacted")
+    {
+        let message_id = payload.get("message_id")?.as_i64().filter(|id| *id > 0)?;
+        let replay = payload
+            .get("idempotent_replay")
+            .and_then(serde_json::Value::as_bool);
+        // A verified send may intentionally omit the message payload. Decode
+        // the native receipt contract instead of reporting a committed send as
+        // failed, and serialize only its allowed fields to preserve redaction.
+        let mut receipt = if payload.get("reply_to").is_some() {
+            serde_json::to_value(
+                serde_json::from_value::<RedactedReplyMessageReceipt>(payload).ok()?,
+            )
+            .ok()?
+        } else {
+            serde_json::to_value(
+                serde_json::from_value::<RedactedSendMessageReceipt>(payload).ok()?,
+            )
+            .ok()?
+        };
+        receipt["id"] = message_id.into();
+        if let Some(replay) = replay {
+            receipt["idempotent_replay"] = replay.into();
+        }
+        return Some(receipt);
+    }
     let delivery_payload = payload
         .get("deliveries")
         .and_then(|v| v.as_array())
@@ -41927,6 +42050,41 @@ mod mail_server_cli_bridge_tests {
                 .and_then(|v| v.as_str()),
             Some("GreenStone")
         );
+    }
+
+    #[test]
+    fn server_message_payload_bridge_preserves_redacted_receipts() {
+        let payload = serde_json::json!({
+            "receipt_mode": "redacted", "project": "/tmp/project", "message_id": 42,
+            "project_id": 1, "sender_id": 2, "thread_id": "br-42",
+            "created_ts": "2026-09-11T04:00:00Z", "verified_sender": true,
+            "target_outcomes": [], "idempotent_replay": true,
+            "subject": "must not echo", "body_md": "must not echo",
+            "attachments": ["must not echo"], "deliveries": ["must not echo"]
+        });
+        for reply in [false, true] {
+            let mut input = payload.clone();
+            if reply {
+                input["reply_to"] = 41.into();
+            }
+            let bridged = server_message_payload_to_cli_json(input).expect("redacted receipt");
+            assert_eq!(bridged["id"], 42);
+            assert_eq!(bridged["message_id"], 42);
+            assert_eq!(bridged["verified_sender"], true);
+            assert_eq!(bridged["idempotent_replay"], true);
+            assert_eq!(bridged.get("reply_to").is_some(), reply);
+            for forbidden in ["subject", "body_md", "attachments", "deliveries", "to"] {
+                assert!(bridged.get(forbidden).is_none(), "leaked {forbidden}");
+            }
+        }
+        for invalid_id in [serde_json::Value::Null, 0.into(), (-1).into(), "42".into()] {
+            let mut malformed = payload.clone();
+            malformed["message_id"] = invalid_id;
+            assert!(server_message_payload_to_cli_json(malformed).is_none());
+        }
+        let mut malformed = payload;
+        malformed["target_outcomes"] = "not an array".into();
+        assert!(server_message_payload_to_cli_json(malformed).is_none());
     }
 
     #[test]
@@ -45584,6 +45742,59 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn doctor_omp_runtime_drift_correlates_active_user_denylist_read_only() {
+        use mcp_agent_mail_core::setup::{AgentPlatform, SetupParams};
+
+        let temp = canonical_test_tempdir("am-doctor-omp-runtime-");
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        let project_config = project.join(".omp/mcp.json");
+        let active = home.join(".omp/profiles/work/agent/mcp.json");
+        let inactive = home.join(".omp/agent/mcp.json");
+        for path in [&project_config, &active, &inactive] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        let healthy = r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","enabled":true}}}"#;
+        let disabled = r#"{"disabledServers":["mcp-agent-mail"]}"#;
+        std::fs::write(&project_config, healthy).unwrap();
+        std::fs::write(&inactive, disabled).unwrap();
+        let params = SetupParams {
+            project_dir: project,
+            home_dir_override: Some(home),
+            omp_user_config_path_override: Some(active.clone()),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+        // The former per-file logic sees neither file as broken.
+        assert!(!omp_config_needs_native_contract_repair(healthy));
+        assert!(!omp_config_needs_native_contract_repair(disabled));
+        for (user_config, expect_drift) in [
+            ("{}", false),
+            (disabled, true),
+            (r#"{"disabledServers":"mcp-agent-mail"}"#, true),
+            (r#"{"disabledServers":["other",7]}"#, true),
+            (r#"{"disabledServers":["other"]}"#, false),
+        ] {
+            std::fs::write(&active, user_config).unwrap();
+            let findings = doctor_omp_runtime_drift(&params);
+            assert_eq!(
+                !findings.is_empty(),
+                expect_drift,
+                "{user_config}: {findings:?}"
+            );
+            if expect_drift {
+                assert!(findings.iter().any(|finding| finding.contains("am setup")));
+                assert_eq!(doctor_mcp_config_check_status(true, false, true), "fail");
+            }
+            assert_eq!(std::fs::read_to_string(&active).unwrap(), user_config);
+            assert_eq!(std::fs::read_to_string(&inactive).unwrap(), disabled);
+            assert_eq!(std::fs::read_to_string(&project_config).unwrap(), healthy);
+        }
+    }
+
+    #[test]
     fn normalize_agent_mail_url_preserves_query_and_fragment() {
         assert_eq!(
             normalize_agent_mail_url("http://127.0.0.1:8765/mcp?x=1#frag", "/api/"),
@@ -47495,6 +47706,7 @@ http_headers = { Authorization = "Bearer secret" }
                 path,
                 no_auth,
                 no_tui,
+                setup,
                 allowed_host,
                 takeover,
             } => {
@@ -47503,6 +47715,7 @@ http_headers = { Authorization = "Bearer secret" }
                 assert_eq!(path.as_deref(), Some("/api/x/"));
                 assert!(!no_auth);
                 assert!(!no_tui);
+                assert!(!setup, "startup must preserve client configs by default");
                 assert!(
                     allowed_host.is_empty(),
                     "--allowed-host defaults to empty (loopback-only)"
@@ -47539,6 +47752,15 @@ http_headers = { Authorization = "Bearer secret" }
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_parses_serve_http_explicit_setup() {
+        let cli = Cli::try_parse_from(["am", "serve-http", "--setup"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::ServeHttp { setup: true, .. })
+        ));
     }
 
     #[test]
@@ -55943,16 +56165,16 @@ http_headers = { Authorization = "Bearer secret" }
             .write(true)
             .open(&lock_path)
             .unwrap();
-        let mut child = match std::process::Command::new("flock")
+        // Replace flock with sleep in the same process so killing and waiting
+        // reaps the lock holder without leaving a descendant's output pipe open.
+        let mut child = std::process::Command::new("flock")
+            .arg("--no-fork")
             .arg("-x")
             .arg(&lock_path)
             .arg("sleep")
             .arg("5")
             .spawn()
-        {
-            Ok(child) => child,
-            Err(_) => return,
-        };
+            .expect("flock must be available for the real lock-holder test");
         let child_pid = child.id();
         let mut observed = None;
         for _ in 0..50 {
@@ -55981,16 +56203,14 @@ http_headers = { Authorization = "Bearer secret" }
         let lock_path = tmp.path().join(".mailbox.activity.lock");
         std::os::unix::fs::symlink(&target_path, &lock_path).unwrap();
 
-        let mut child = match std::process::Command::new("flock")
+        let mut child = std::process::Command::new("flock")
+            .arg("--no-fork")
             .arg("-x")
             .arg(&target_path)
             .arg("sleep")
             .arg("5")
             .spawn()
-        {
-            Ok(child) => child,
-            Err(_) => return,
-        };
+            .expect("flock must be available for the real symlink lock-holder test");
         let child_pid = child.id();
         let mut target_lock_visible = false;
         for _ in 0..50 {
@@ -57280,6 +57500,7 @@ startup_timeout_sec = 42
             last_failure_reason: "reservations produced 220 rows but only 215 unique stable keys"
                 .to_string(),
             tripped: false,
+            attempt_in_progress: false,
         };
         mcp_agent_mail_db::recovery_breaker::store(&db_path, &state).expect("store breaker");
         let note = doctor_recovery_breaker_note(&database_url)
@@ -58970,6 +59191,7 @@ startup_timeout_sec = 42
                 last_failure_unix: now_unix,
                 last_failure_reason: "parked recovery".to_string(),
                 tripped: true,
+                attempt_in_progress: false,
             },
         )
         .expect("plant tripped breaker authority");
@@ -59051,6 +59273,7 @@ startup_timeout_sec = 42
                         last_failure_unix: now_unix,
                         last_failure_reason: "parked recovery".to_string(),
                         tripped: true,
+                        attempt_in_progress: false,
                     },
                 )
                 .expect("plant tripped breaker authority");
@@ -59549,16 +59772,30 @@ startup_timeout_sec = 42
         assert_eq!(rows[0].get_named::<i64>("count").expect("count"), 50);
         mcp_agent_mail_db::close_db_conn(admitted, "settle live Franken index-corruption fixture");
 
+        let logical_is_healthy = with_private_canonical_snapshot_from_live_franken(
+            &db_path,
+            "index-corruption logical export control",
+            |snapshot| {
+                sqlite_conn_check_ok_canonical(snapshot, mcp_agent_mail_db::CheckKind::Full)
+                    .map_err(|error| CliError::Other(error.to_string()))
+            },
+        )
+        .expect("check actual rebuilt logical image");
+        assert!(
+            logical_is_healthy,
+            "VACUUM rebuild should normalize the damaged secondary index in the private image"
+        );
+
         let opened = open_db_for_doctor_check_read_only_with_context(&db_url)
-            .expect("materialize guarded live logical snapshot");
+            .expect("stage guarded live physical family");
         assert_eq!(
             opened.source_kind,
-            DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot
+            DoctorCanonicalDiagnosticSourceKind::StagedFamilyCopy
         );
         assert!(
-            sqlite_conn_check_ok_canonical(&opened.conn, mcp_agent_mail_db::CheckKind::Full)
-                .expect("check rebuilt logical image"),
-            "VACUUM rebuild should normalize the damaged secondary index in the private image"
+            !sqlite_conn_check_ok_canonical(&opened.conn, mcp_agent_mail_db::CheckKind::Full)
+                .expect("check physical family copy"),
+            "the staged copy must preserve the damaged secondary index"
         );
         assert!(
             !doctor_read_only_physical_integrity_check(&opened, mcp_agent_mail_db::CheckKind::Full)
@@ -60450,6 +60687,7 @@ startup_timeout_sec = 42
             false,
             true,
             false,
+            false,
         );
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -60477,6 +60715,7 @@ startup_timeout_sec = 42
             Some(&linked_storage),
             false,
             true,
+            false,
             false,
         )
         .expect_err("symlinked storage root should be rejected");
@@ -60511,6 +60750,7 @@ startup_timeout_sec = 42
             Some(&storage_root),
             false,
             true,
+            false,
             false,
         )
         .expect_err("symlinked destination should be rejected");
@@ -60548,9 +60788,15 @@ startup_timeout_sec = 42
         symlink(&real_parent, &linked_parent).unwrap();
 
         let db_path = linked_parent.join("reconstructed.sqlite3");
-        let err =
-            handle_doctor_reconstruct_with(Some(&db_path), Some(&storage_root), false, true, false)
-                .expect_err("symlinked destination parent should be rejected");
+        let err = handle_doctor_reconstruct_with(
+            Some(&db_path),
+            Some(&storage_root),
+            false,
+            true,
+            false,
+            false,
+        )
+        .expect_err("symlinked destination parent should be rejected");
 
         match err {
             CliError::Other(msg) => {
@@ -60572,8 +60818,14 @@ startup_timeout_sec = 42
         std::fs::create_dir_all(&projects_dir).unwrap();
         let db_path = tmp.path().join("test.db");
 
-        let result =
-            handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), true, false, true);
+        let result = handle_doctor_reconstruct_with(
+            Some(&db_path),
+            Some(tmp.path()),
+            true,
+            false,
+            true,
+            false,
+        );
         assert!(result.is_ok());
     }
 
@@ -60588,7 +60840,7 @@ startup_timeout_sec = 42
         let db_path = tmp.path().join("empty-json.sqlite3");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), true, true, true)
+        handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), true, true, true, false)
             .expect("empty archive should emit a structured skip");
         let output = capture.drain_to_string();
         let payload: serde_json::Value =
@@ -60618,7 +60870,7 @@ startup_timeout_sec = 42
         let db_path = tmp.path().join("empty-archive-reconstruct.sqlite3");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), false, true, false)
+        handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), false, true, false, false)
             .expect("empty archive should be a non-mutating skip");
         let output = capture.drain_to_string();
 
@@ -60826,7 +61078,7 @@ startup_timeout_sec = 42
         let db_path = tmp.path().join("reconstructed.db");
 
         let result =
-            handle_doctor_reconstruct_with(Some(&db_path), Some(storage), false, true, true);
+            handle_doctor_reconstruct_with(Some(&db_path), Some(storage), false, true, true, false);
         assert!(result.is_ok(), "reconstruct failed: {result:?}");
         assert!(db_path.exists(), "reconstructed DB file should exist");
 
@@ -60899,6 +61151,7 @@ startup_timeout_sec = 42
                     false,
                     true,
                     true,
+                    false,
                 );
                 let output = capture.drain_to_string();
                 assert!(result.is_ok(), "reconstruct failed: {result:?}");
@@ -60970,6 +61223,140 @@ startup_timeout_sec = 42
         );
     }
 
+    /// GH#312: the live database still opens and its coordination tables read
+    /// cleanly, but full `integrity_check` *raises* "database disk image is
+    /// malformed" on a torn page instead of reporting rows. `am doctor
+    /// reconstruct --yes` used to rebuild a clean candidate and then refuse to
+    /// promote it because the promotion receipt could not classify the corrupt
+    /// source ("semantic snapshot succeeded but full integrity_check failed"),
+    /// leaving a `reconstruct-failed-*` artifact on every retry until the
+    /// operator moved the source aside by hand.
+    #[test]
+    fn doctor_reconstruct_promotes_over_a_source_whose_integrity_check_raises() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = tmp.path().join("storage");
+        let db_path = tmp.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage.to_string_lossy().to_string();
+        let db_url_text = db_url.clone();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("DATABASE_URL", db_url_text.as_str()),
+            ],
+            || {
+                handle_migrate_with_database_url(&db_url).expect("migrate");
+                {
+                    let conn = open_db_sync_with_database_url(&db_url).expect("open");
+                    conn.execute_raw(
+                        "INSERT INTO projects (slug, human_key, created_at)
+                         VALUES ('legacy-project', '/tmp/legacy-project', 0)",
+                    )
+                    .expect("insert legacy project");
+                }
+                tear_last_page_behind_readable_tables(&db_path);
+
+                // Precondition: the reporter's shape. Coordination tables
+                // read cleanly while the full check raises.
+                {
+                    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+                        db_path.display().to_string(),
+                    )
+                    .expect("reopen torn live db");
+                    let rows = conn
+                        .query_sync("SELECT slug FROM projects", &[])
+                        .expect("projects must stay readable on the torn live db");
+                    assert_eq!(rows.len(), 1);
+                    let raise = conn
+                        .query_sync("PRAGMA integrity_check", &[])
+                        .expect_err("integrity_check must raise on the torn page");
+                    assert!(
+                        raise
+                            .to_string()
+                            .contains("database disk image is malformed"),
+                        "unexpected raise: {raise}"
+                    );
+                }
+
+                let archive_project = storage.join("projects").join("archive-only-project");
+                let archive_agent = archive_project.join("agents").join("ArchiveFox");
+                let archive_messages = archive_project.join("messages").join("2026").join("03");
+                std::fs::create_dir_all(&archive_agent).expect("create archive agent dir");
+                std::fs::create_dir_all(&archive_messages).expect("create archive message dir");
+                std::fs::write(
+                    archive_project.join("project.json"),
+                    r#"{"slug":"archive-only-project","human_key":"/tmp/archive-only-project"}"#,
+                )
+                .expect("write project.json");
+                std::fs::write(
+                    archive_agent.join("profile.json"),
+                    r#"{"name":"ArchiveFox","program":"codex","model":"gpt-5","task_description":"archive seed","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z","attachments_policy":"auto","contact_policy":"auto"}"#,
+                )
+                .expect("write profile");
+                std::fs::write(
+                    archive_messages.join("20260322T000001Z__9001.md"),
+                    "---json\n{\"id\":9001,\"from\":\"ArchiveFox\",\"to\":[\"LegacyAgent\"],\"subject\":\"Archive only message\",\"thread_id\":\"archive-thread\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T00:00:01Z\",\"attachments\":[]}\n---\nRecovered from archive only.\n",
+                )
+                .expect("write archive message");
+
+                let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+                let result = handle_doctor_reconstruct_with(
+                    Some(&db_path),
+                    Some(&storage),
+                    false,
+                    true,
+                    true,
+                    false,
+                );
+                let output = capture.drain_to_string();
+                assert!(
+                    result.is_ok(),
+                    "GH#312: reconstruct must promote over a source whose integrity_check raises: {result:?}\n{output}"
+                );
+                assert!(
+                    mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(
+                        &db_path
+                    )
+                    .expect("probe promoted db"),
+                    "the promoted database must pass full integrity"
+                );
+
+                let verify =
+                    mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                        .expect("reopen promoted db");
+                let slugs = verify
+                    .query_sync("SELECT slug FROM projects ORDER BY slug", &[])
+                    .expect("query projects")
+                    .iter()
+                    .map(|row| row.get_named::<String>("slug").expect("slug"))
+                    .collect::<Vec<_>>();
+                assert!(
+                    slugs.iter().any(|slug| slug == "archive-only-project"),
+                    "archive state must be promoted: {slugs:?}"
+                );
+
+                let artifacts = std::fs::read_dir(tmp.path())
+                    .expect("read tmp dir")
+                    .filter_map(|entry| entry.ok())
+                    .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+                    .collect::<Vec<_>>();
+                assert!(
+                    artifacts.iter().any(|name| name.contains(".corrupt-")),
+                    "the torn source must be quarantined beside the live path, not deleted: {artifacts:?}"
+                );
+                assert!(
+                    !artifacts
+                        .iter()
+                        .any(|name| name.contains(".reconstruct-failed-")),
+                    "no refused candidate may be left behind: {artifacts:?}"
+                );
+            },
+        );
+    }
+
     #[test]
     fn doctor_reconstruct_salvages_quarantined_artifact_when_primary_is_missing() {
         let _guard = stdio_capture_lock()
@@ -61029,6 +61416,7 @@ startup_timeout_sec = 42
                     false,
                     true,
                     true,
+                    false,
                 );
                 let output = capture.drain_to_string();
                 assert!(result.is_ok(), "reconstruct failed: {result:?}");
@@ -61622,8 +62010,15 @@ startup_timeout_sec = 42
         std::fs::write(threads_dir.join("thread-1.md"), "# Thread thread-1\n").unwrap();
 
         let capture = ftui_runtime::StdioCapture::install().expect("install capture");
-        handle_doctor_reconstruct_with(Some(&db_path), Some(&storage_root), true, false, true)
-            .expect("dry run should succeed");
+        handle_doctor_reconstruct_with(
+            Some(&db_path),
+            Some(&storage_root),
+            true,
+            false,
+            true,
+            false,
+        )
+        .expect("dry run should succeed");
         let output = capture.drain_to_string();
         let payload = output
             .lines()
@@ -65473,7 +65868,7 @@ startup_timeout_sec = 42
     #[test]
     fn help_serve_http_lists_flags() {
         let h = help_text_for(&["am", "serve-http", "--help"]);
-        for flag in ["--host", "--port", "--path", "--no-auth"] {
+        for flag in ["--host", "--port", "--path", "--no-auth", "--setup"] {
             assert!(
                 h.contains(flag),
                 "serve-http help missing flag '{flag}'\n{h}"
@@ -72707,6 +73102,7 @@ startup_timeout_sec = 42
                 last_failure_unix: now_unix,
                 last_failure_reason: "parked recovery".to_string(),
                 tripped: true,
+                attempt_in_progress: false,
             },
         )
         .expect("plant tripped breaker authority");
@@ -73857,6 +74253,7 @@ startup_timeout_sec = 42
                         last_failure_unix: now_unix,
                         last_failure_reason: "parked CLI recovery".to_string(),
                         tripped: true,
+                        attempt_in_progress: false,
                     },
                 )
                 .expect("plant tripped breaker authority");
@@ -74127,20 +74524,20 @@ startup_timeout_sec = 42
         match cross_check {
             DoctorCanonicalCrossCheck::Inconclusive(detail) => assert!(
                 detail.contains("private logical rebuild"),
-                "a clean private rebuild must be explicitly non-authoritative for live physical bytes: {detail}"
+                "a busy namespace must use the non-authoritative logical fallback: {detail}"
             ),
             other => panic!(
-                "a clean logical snapshot must never override the live physical verdict: {other:?}"
+                "a live writer must exclude physical staging without losing its locks: {other:?}"
             ),
         }
         assert_child_observes_busy(&db_path);
 
         let database_url = format!("sqlite:///{}", db_path.display());
         let read_only = open_db_for_doctor_check_read_only_with_context(&database_url)
-            .expect("open live doctor diagnostics through a retained private snapshot");
+            .expect("open live doctor diagnostics through the retained logical fallback");
         assert!(
             read_only._snapshot_source.is_some(),
-            "live read-only doctor diagnostics must retain their private snapshot"
+            "busy-namespace diagnostics must retain their private logical snapshot"
         );
         assert_eq!(
             read_only.source_kind,
@@ -75555,8 +75952,9 @@ startup_timeout_sec = 42
     #[test]
     fn open_db_sync_with_database_url_ignores_unrelated_implicit_archive_root() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let fake_home = dir.path().join("home");
-        let fake_data_home = dir.path().join("xdg-data");
+        let private_root = std::fs::canonicalize(dir.path()).expect("canonicalize private root");
+        let fake_home = private_root.join("home");
+        let fake_data_home = private_root.join("xdg-data");
         let fake_home_text = fake_home.to_string_lossy().into_owned();
         let fake_data_home_text = fake_data_home.to_string_lossy().into_owned();
         std::fs::create_dir_all(&fake_home).expect("create fake home");
@@ -75564,6 +75962,7 @@ startup_timeout_sec = 42
         let implicit_storage_root = fake_data_home
             .join("mcp-agent-mail")
             .join("git_mailbox_repo");
+        let implicit_storage_root_text = implicit_storage_root.to_string_lossy().into_owned();
         let unrelated_message_dir = seed_archive_mailbox_project(&implicit_storage_root);
         write_archive_mailbox_message(
             &unrelated_message_dir,
@@ -75591,10 +75990,19 @@ startup_timeout_sec = 42
             &[
                 ("DATABASE_URL", db_url.as_str()),
                 ("HOME", fake_home_text.as_str()),
+                ("USERPROFILE", fake_home_text.as_str()),
                 ("XDG_DATA_HOME", fake_data_home_text.as_str()),
+                // Pin the redirected default: ambient config.env must not select
+                // the operator's explicitly configured mailbox for this fixture.
+                ("STORAGE_ROOT", implicit_storage_root_text.as_str()),
+                ("AM_ALLOW_HOME_STORAGE_ROOT", "1"),
             ],
             || {
                 let resolved_storage_root = resolve_mailbox_activity_storage_root(None);
+                assert_eq!(resolved_storage_root, implicit_storage_root);
+                assert!(mcp_agent_mail_core::config::is_default_storage_root(
+                    &resolved_storage_root
+                ));
                 assert!(
                     !should_lock_mailbox_storage_root(&db_path, &resolved_storage_root, None),
                     "external custom DB should not lock unrelated implicit storage root {}; db={}",
@@ -81429,6 +81837,7 @@ fn handle_doctor_repair_with_options(
                 false,
                 yes,
                 false,
+                false,
             );
         }
         if dry_run {
@@ -81483,6 +81892,7 @@ fn handle_doctor_repair_with_options(
                     Some(storage_root),
                     false,
                     yes,
+                    false,
                     false,
                 );
             }
@@ -81562,6 +81972,7 @@ fn handle_doctor_repair_with_options(
                         false,
                         yes,
                         false,
+                        false,
                     );
                 }
                 ftui_runtime::ftui_println!(
@@ -81590,6 +82001,7 @@ fn handle_doctor_repair_with_options(
                         Some(storage_root),
                         false,
                         yes,
+                        false,
                         false,
                     );
                 }
@@ -81679,6 +82091,7 @@ fn handle_doctor_repair_with_options(
                 false,
                 yes,
                 false,
+                false,
             );
         }
         Err(error) => {
@@ -81727,6 +82140,7 @@ fn handle_doctor_repair_with_options(
                 Some(storage_root),
                 false,
                 yes,
+                false,
                 false,
             );
         }
@@ -82138,11 +82552,13 @@ fn handle_doctor_reconstruct_locked_with_path(
                 &storage_root,
                 &db_path,
             ) {
-                Ok(chain_error) => output::info(&format!(
+                Ok(chain_error) => ftui_runtime::ftui_eprintln!(
                     "--reseed-receipt-chain would quarantine the receipt chain (broken: {chain_error})"
-                )),
+                ),
                 Err(refusal) => {
-                    output::info(&format!("--reseed-receipt-chain would refuse: {refusal}"));
+                    return Err(CliError::Other(format!(
+                        "--reseed-receipt-chain would refuse: {refusal}"
+                    )));
                 }
             }
         } else {
@@ -82158,7 +82574,14 @@ fn handle_doctor_reconstruct_locked_with_path(
             ));
         }
     }
-    handle_doctor_reconstruct_with(Some(&db_path), Some(&storage_root), dry_run, yes, json)
+    handle_doctor_reconstruct_with(
+        Some(&db_path),
+        Some(&storage_root),
+        dry_run,
+        yes,
+        json,
+        dry_run && reseed_receipt_chain,
+    )
 }
 
 #[cfg(test)]
@@ -83071,21 +83494,24 @@ impl DoctorReconstructSalvagePreview {
     }
 }
 
-/// Run the real command's salvage selection and validation without writing
-/// anything, so `--dry-run` and `-y` cannot disagree about whether a recovery
-/// is possible (GH#302).
-fn doctor_reconstruct_salvage_preview(db_path: &Path) -> DoctorReconstructSalvagePreview {
+fn doctor_reconstruct_salvage_attempt(db_path: &Path) -> Option<DoctorSalvageAttempt> {
     let candidates = doctor_salvage_artifact_candidates(db_path);
-    if candidates.is_empty() {
-        return DoctorReconstructSalvagePreview::NoCandidate;
-    }
-    match attempt_best_doctor_salvage_artifact_from_candidates(db_path, candidates) {
-        DoctorSalvageAttempt::Failed(detail) => {
-            DoctorReconstructSalvagePreview::NotMaterializable(detail)
+    (!candidates.is_empty())
+        .then(|| attempt_best_doctor_salvage_artifact_from_candidates(db_path, candidates))
+}
+
+/// Describe the same retained source that the candidate builder will consume.
+fn doctor_reconstruct_salvage_preview(
+    attempt: Option<&DoctorSalvageAttempt>,
+) -> DoctorReconstructSalvagePreview {
+    match attempt {
+        None => DoctorReconstructSalvagePreview::NoCandidate,
+        Some(DoctorSalvageAttempt::Failed(detail)) => {
+            DoctorReconstructSalvagePreview::NotMaterializable(detail.clone())
         }
-        DoctorSalvageAttempt::Succeeded(artifact) => {
-            let source = artifact.db_path.clone();
-            match mcp_agent_mail_db::classify_salvage_source(&source) {
+        Some(DoctorSalvageAttempt::Succeeded(artifact)) => {
+            let source = artifact.reported_path.clone();
+            match mcp_agent_mail_db::classify_salvage_source(&artifact.db_path) {
                 mcp_agent_mail_db::SalvageSourceVerdict::Mergeable => {
                     DoctorReconstructSalvagePreview::WouldMerge(source)
                 }
@@ -83100,12 +83526,60 @@ fn doctor_reconstruct_salvage_preview(db_path: &Path) -> DoctorReconstructSalvag
     }
 }
 
+/// Build the actual archive/salvage candidate in both preview and repair modes.
+/// The caller chooses a fresh scratch path; this never promotes a generation.
+fn build_doctor_reconstruct_candidate(
+    candidate_path: &Path,
+    storage_root: &Path,
+    salvage_attempt: Option<&DoctorSalvageAttempt>,
+) -> CliResult<mcp_agent_mail_db::ReconstructStats> {
+    let salvage_db_path = salvage_attempt.and_then(|attempt| match attempt {
+        DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
+        DoctorSalvageAttempt::Failed(_) => None,
+    });
+    let reconstruct = salvage_db_path.map_or_else(
+        || mcp_agent_mail_db::reconstruct_from_archive(candidate_path, storage_root),
+        |private_salvage_db_path| {
+            mcp_agent_mail_db::reconstruct_from_archive_with_private_salvage(
+                candidate_path,
+                storage_root,
+                private_salvage_db_path,
+            )
+        },
+    );
+    let mut stats = reconstruct.map_err(|error| {
+        preserve_doctor_temp_sqlite_artifact(candidate_path);
+        CliError::Other(format!(
+            "reconstruction failed (original database is untouched): {error}"
+        ))
+    })?;
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(candidate_path)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "failed to run full integrity check on reconstructed database {}: {error}",
+                candidate_path.display()
+            ))
+        })?
+    {
+        preserve_doctor_temp_sqlite_artifact(candidate_path);
+        return Err(CliError::Other(format!(
+            "reconstructed database at {} did not pass full integrity checks; original database is untouched",
+            candidate_path.display()
+        )));
+    }
+    if let Some(DoctorSalvageAttempt::Failed(detail)) = salvage_attempt {
+        stats.warnings.push(detail.clone());
+    }
+    Ok(stats)
+}
+
 fn handle_doctor_reconstruct_with(
     db_path_override: Option<&Path>,
     storage_root_override: Option<&Path>,
     dry_run: bool,
     yes: bool,
     json: bool,
+    preview_reseed_broken_chain: bool,
 ) -> CliResult<()> {
     // Caller must acquire mailbox activity locks before invoking this helper
     // because it can replace the live SQLite file and reconcile archive state.
@@ -83197,13 +83671,64 @@ fn handle_doctor_reconstruct_with(
     }
 
     if dry_run {
-        // Walk the archive to report what would be recovered, without writing.
-        ftui_runtime::ftui_println!("Dry run — scanning archive at {}", storage_root.display());
+        // Build only in a private scratch directory, never beside the live DB
+        // or inside its archive. Promotion's actual semantic evidence collector
+        // catches conflicts that archive file counts cannot predict (GH#271).
+        ftui_runtime::ftui_eprintln!(
+            "Dry run — validating reconstruction at {}",
+            storage_root.display()
+        );
         let stats = scan_archive_stats(&storage_root);
-        // GH#302: run the SAME salvage validation the real command runs. The
-        // dry run used to skip it entirely and promise a recovery that the
-        // real `am doctor reconstruct -y` then refused on the salvage source.
-        let salvage_preview = doctor_reconstruct_salvage_preview(&db_path);
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).map_err(|error| {
+            CliError::Other(format!(
+                "cannot resolve reconstruct preview temporary directory: {error}"
+            ))
+        })?;
+        let archive_root = std::fs::canonicalize(&storage_root).map_err(|error| {
+            CliError::Other(format!(
+                "cannot resolve reconstruct preview archive: {error}"
+            ))
+        })?;
+        if temp_root.starts_with(&archive_root) {
+            return Err(CliError::InvalidArgument(
+                "reconstruct preview temporary directory must be outside the mailbox archive; set TMPDIR to a separate directory".to_string(),
+            ));
+        }
+        let scratch = canonical_snapshot_tempdir_in(
+            &temp_root,
+            "am-reconstruct-preview-",
+            "reconstruct preview",
+        )?;
+        let candidate_path = scratch.path().join("candidate.sqlite3");
+        let salvage_attempt = doctor_reconstruct_salvage_attempt(&db_path);
+        let salvage_preview = doctor_reconstruct_salvage_preview(salvage_attempt.as_ref());
+        let candidate = build_doctor_reconstruct_candidate(
+            &candidate_path,
+            &storage_root,
+            salvage_attempt.as_ref(),
+        )
+        .and_then(|recovered| {
+            let continuity = mcp_agent_mail_db::forensics::validate_recovery_candidate_continuity(
+                &storage_root,
+                &db_path,
+                path_is_real_file(&db_path).then_some(db_path.as_path()),
+                &candidate_path,
+                preview_reseed_broken_chain,
+            )
+            .map_err(|error| CliError::Other(error.to_string()))?;
+            Ok((recovered, continuity))
+        });
+        let validation = match &candidate {
+            Ok((recovered, continuity)) => serde_json::json!({
+                "status": "valid", "would_refuse": false,
+                "recovered": continuity,
+                "parse_errors": recovered.parse_errors,
+                "warnings": recovered.warnings,
+            }),
+            Err(error) => serde_json::json!({
+                "status": "would_refuse", "would_refuse": true, "detail": error.to_string(),
+            }),
+        };
         if json {
             ftui_runtime::ftui_println!(
                 "{}",
@@ -83222,6 +83747,9 @@ fn handle_doctor_reconstruct_with(
                         "unparseable_canonical_message_files": stats.unparseable_canonical_message_files,
                     },
                     "salvage": salvage_preview.to_json(),
+                    "candidate_validation": validation,
+                    "would_reseed_receipt_chain": preview_reseed_broken_chain,
+                    "actions_taken": 0,
                 })
             );
         } else {
@@ -83248,14 +83776,15 @@ fn handle_doctor_reconstruct_with(
             }
             ftui_runtime::ftui_println!("  Database path: {}", db_path.display());
             ftui_runtime::ftui_println!("  Salvage:       {}", salvage_preview.summary());
-            ftui_runtime::ftui_println!("No changes made.");
+            match &candidate {
+                Ok(_) => ftui_runtime::ftui_println!(
+                    "  Candidate:     passed full integrity and promotion continuity checks"
+                ),
+                Err(error) => ftui_runtime::ftui_println!("  Candidate:     WOULD REFUSE: {error}"),
+            }
+            ftui_runtime::ftui_println!("No mailbox changes made; no candidate promoted.");
         }
-        if let DoctorReconstructSalvagePreview::WouldRefuse { detail, .. } = &salvage_preview {
-            output::warn(&format!(
-                "`am doctor reconstruct -y` would REFUSE with: {detail}"
-            ));
-        }
-        return Ok(());
+        return candidate.map(|_| ());
     }
 
     if !confirm_mutating_doctor_action(
@@ -83293,58 +83822,9 @@ fn handle_doctor_reconstruct_with(
     // Attempt salvage through a guarded private snapshot of the original DB
     // (no rename yet), or from nearby offline doctor artifacts when an
     // operator already moved the primary aside.
-    let salvage_candidates = doctor_salvage_artifact_candidates(&db_path);
-    let salvage_attempt = if salvage_candidates.is_empty() {
-        None
-    } else {
-        Some(attempt_best_doctor_salvage_artifact_from_candidates(
-            &db_path,
-            salvage_candidates,
-        ))
-    };
-    let salvage_db_path = salvage_attempt.as_ref().and_then(|attempt| match attempt {
-        DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
-        DoctorSalvageAttempt::Failed(_) => None,
-    });
-
-    // Reconstruct into the TEMP path — original DB is still untouched.
-    let reconstruct = salvage_db_path.map_or_else(
-        || mcp_agent_mail_db::reconstruct_from_archive(&temp_db_path, &storage_root),
-        |private_salvage_db_path| {
-            mcp_agent_mail_db::reconstruct_from_archive_with_private_salvage(
-                &temp_db_path,
-                &storage_root,
-                private_salvage_db_path,
-            )
-        },
-    );
-    let mut stats = match reconstruct {
-        Ok(stats) => stats,
-        Err(e) => {
-            // Clean up the partial temp file; original DB is safe.
-            preserve_doctor_temp_sqlite_artifact(&temp_db_path);
-            return Err(CliError::Other(format!(
-                "reconstruction failed (original database is untouched): {e}"
-            )));
-        }
-    };
-
-    // Validate the reconstructed temp DB before swapping.
-    if !mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(&temp_db_path)
-        .map_err(|error| {
-            CliError::Other(format!(
-                "failed to run full integrity check on reconstructed database {}: {error}",
-                temp_db_path.display()
-            ))
-        })?
-    {
-        preserve_doctor_temp_sqlite_artifact(&temp_db_path);
-        return Err(CliError::Other(format!(
-            "reconstructed database at {} did not pass full integrity checks; \
-             original database is untouched",
-            temp_db_path.display()
-        )));
-    }
+    let salvage_attempt = doctor_reconstruct_salvage_attempt(&db_path);
+    let stats =
+        build_doctor_reconstruct_candidate(&temp_db_path, &storage_root, salvage_attempt.as_ref())?;
 
     mcp_agent_mail_db::promote_recovery_candidate(&db_path, &temp_db_path, &storage_root).map_err(
         |err| {
@@ -83403,15 +83883,6 @@ fn handle_doctor_reconstruct_with(
             Err(error) => ftui_runtime::ftui_eprintln!(
                 "  Warning: post-swap archive id-floor scan failed: {error}"
             ),
-        }
-    }
-
-    if let Some(attempt) = &salvage_attempt {
-        match attempt {
-            DoctorSalvageAttempt::Failed(detail) => {
-                stats.warnings.push(detail.clone());
-            }
-            DoctorSalvageAttempt::Succeeded(_) => {}
         }
     }
 
@@ -92371,6 +92842,50 @@ fn seed_malformed_btree_db(db_path: &Path) {
         *byte = 0xA5;
     }
     std::fs::write(db_path, &bytes).expect("write corrupted malformed fixture db file");
+}
+
+/// GH#312: append a multi-page filler b-tree to an existing mailbox database
+/// and zero-fill the file's last page. Every pre-existing table stays
+/// readable, while canonical SQLite *raises* `database disk image is
+/// malformed` from inside `PRAGMA integrity_check` instead of reporting error
+/// rows — the source shape that used to make promotion unclassifiable.
+#[cfg(test)]
+fn tear_last_page_behind_readable_tables(db_path: &Path) {
+    let db_path_text = db_path.display().to_string();
+    {
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text)
+            .expect("open canonical db for torn-page fixture");
+        for statement in [
+            "CREATE TABLE gh312_filler (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)",
+            "CREATE INDEX idx_gh312_filler_payload ON gh312_filler(payload)",
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 300) \
+             INSERT INTO gh312_filler (payload) SELECT zeroblob(900) FROM seq",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+        ] {
+            conn.execute_raw(statement)
+                .unwrap_or_else(|error| panic!("torn-page fixture `{statement}`: {error}"));
+        }
+    }
+
+    let mut bytes = std::fs::read(db_path).expect("read torn-page fixture db file");
+    let page_size = {
+        let raw = u16::from_be_bytes([bytes[16], bytes[17]]);
+        if raw == 1 {
+            65_536usize
+        } else {
+            usize::from(raw)
+        }
+    };
+    assert!(
+        bytes.len() >= page_size * 8 && bytes.len().is_multiple_of(page_size),
+        "torn-page fixture must span whole pages (len={}, page_size={page_size})",
+        bytes.len()
+    );
+    let last_page = bytes.len() - page_size;
+    for byte in bytes.iter_mut().skip(last_page) {
+        *byte = 0;
+    }
+    std::fs::write(db_path, &bytes).expect("write torn-page fixture db file");
 }
 
 #[cfg(test)]

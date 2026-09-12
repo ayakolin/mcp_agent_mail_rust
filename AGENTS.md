@@ -81,7 +81,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 |-------|---------|
 | `asupersync` (`=0.4.9`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
 | `fastmcp-rust` (`0.7.1`, crates.io; imported as `fastmcp`) | MCP protocol implementation (JSON-RPC, stdio, HTTP transport) |
-| `sqlmodel` (`=0.4.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; the FrankenSQLite driver (`fsqlite =0.3.17`) is the runtime `DbConn` |
+| `sqlmodel` (`=0.4.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; the FrankenSQLite driver (`fsqlite =0.3.18`) is the runtime `DbConn` |
 | `sqlmodel-sqlite` (`=0.4.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
 | `ftui` / `ftui-*` (`0.5.0`, FrankenTUI) | TUI rendering for operations console |
 | `frankensearch` (`0.4`, path dep `../frankensearch-rel-0332`, a gated clone at dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Never point this at a live checkout: the live tree already moved to asupersync 0.4.10, which fastmcp cannot follow yet |
@@ -694,6 +694,17 @@ documented (GH#290).
   authoritative; legacy parity never overrides reliability, security, bounded
   work, or structured-concurrency invariants.
 - **Dual-mode interface** — MCP server and CLI share tools but enforce surface separation
+- **Per-transport lifecycle authorization** — `retire_agent`, `unretire_agent`
+  and `deregister_agent` authorize by `registration_token` on every transport.
+  A tmux pane bound to the agent stands in for the token **over stdio only**
+  (the caller is a same-user process). Over `am serve-http` the pane context
+  (`X-Tmux-Pane` / `X-Tmux-Socket`, or a body `pane_id`) is a client assertion,
+  so the daemon stamps the transport-owned `call_transport = "http"` argument and
+  the tools apply `LifecycleAuthPolicy::TokenRequired`; the refusal is
+  `AUTHENTICATION_REQUIRED` with `reason: token_required` and names where the
+  token came from (the `registration_token` field of the register_agent /
+  create_agent_identity / macro_start_session response). Agents must keep that
+  token if they intend to retire or deregister themselves over HTTP.
 - **Advisory file reservations** — symmetric fnmatch with archive reading and rename handling
 - **Pre-commit guard** — enforces reservation compliance at `git commit` time
 - **Query-only reads** — direct reads use an existing live SQLite pool and do not wait for archive reconstruction or write-behind coalescing

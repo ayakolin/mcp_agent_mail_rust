@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read as _};
+use std::io::{self, Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -1915,8 +1915,50 @@ impl Default for Config {
     }
 }
 
-/// Module-level shared config cache (used by `Config::get` and `Config::reset_cached`).
-static CONFIG_CACHE: std::sync::RwLock<Option<Config>> = std::sync::RwLock::new(None);
+/// Parsed settings and their user-file authority always belong to one generation.
+#[derive(Default)]
+struct ConfigGeneration {
+    config: std::sync::RwLock<Option<Config>>,
+    user_env: OnceLock<std::sync::Arc<UserEnvLoad>>,
+}
+
+static CONFIG_CACHE: std::sync::LazyLock<std::sync::RwLock<std::sync::Arc<ConfigGeneration>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(std::sync::Arc::default()));
+
+thread_local! {
+    // Config construction is synchronous. Pin the generation for all nested
+    // environment lookups, including the final authority-error field.
+    static CONFIG_GENERATION_SCOPE: std::cell::RefCell<Option<std::sync::Arc<ConfigGeneration>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn current_config_generation() -> std::sync::Arc<ConfigGeneration> {
+    CONFIG_GENERATION_SCOPE
+        .with(|scope| scope.borrow().clone())
+        .unwrap_or_else(|| {
+            CONFIG_CACHE
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+}
+
+struct ConfigGenerationGuard {
+    previous: Option<std::sync::Arc<ConfigGeneration>>,
+}
+
+impl ConfigGenerationGuard {
+    fn enter(generation: std::sync::Arc<ConfigGeneration>) -> Self {
+        let previous = CONFIG_GENERATION_SCOPE.with(|scope| scope.replace(Some(generation)));
+        Self { previous }
+    }
+}
+
+impl Drop for ConfigGenerationGuard {
+    fn drop(&mut self) {
+        CONFIG_GENERATION_SCOPE.with(|scope| scope.replace(self.previous.take()));
+    }
+}
 
 fn test_config_env_overrides_active() -> bool {
     let process_overrides_empty = process_env_overrides()
@@ -1927,13 +1969,19 @@ fn test_config_env_overrides_active() -> bool {
 }
 
 fn global_config_cache_get() -> Config {
+    global_config_cache_get_with_hook(|| {})
+}
+
+fn global_config_cache_get_with_hook(after_snapshot: impl FnOnce()) -> Config {
     if test_config_env_overrides_active() {
-        return Config::from_env();
+        return Config::from_env_with_generation_hook(after_snapshot);
     }
 
+    let generation = current_config_generation();
     // Fast path: read lock, return clone if present
     {
-        let guard = CONFIG_CACHE
+        let guard = generation
+            .config
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(ref c) = *guard {
@@ -1942,8 +1990,14 @@ fn global_config_cache_get() -> Config {
     }
     // Slow path: build outside the write lock so recursive `Config::get()`
     // calls during `from_env()` cannot deadlock on this cache.
-    let fresh = Config::from_env();
-    let mut guard = CONFIG_CACHE
+    let fresh = {
+        let _scope = ConfigGenerationGuard::enter(std::sync::Arc::clone(&generation));
+        Config::from_env_with_generation_hook(after_snapshot)
+    };
+    // A reset can replace the global generation while this build is in flight.
+    // Publish only to the captured generation, never into its successor.
+    let mut guard = generation
+        .config
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(ref cached) = *guard {
@@ -1957,7 +2011,7 @@ fn global_config_cache_reset() {
     let mut guard = CONFIG_CACHE
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = None;
+    *guard = std::sync::Arc::default();
 }
 
 impl std::fmt::Debug for Config {
@@ -2011,10 +2065,23 @@ impl Config {
         self.http_cors_enabled = is_dev;
     }
 
-    /// Load configuration from environment variables
+    /// Parse process environment variables using the current user-file generation.
+    ///
+    /// User-file values and authority errors stay pinned for the whole parse.
+    /// Call [`Config::reset_cached`] after replacing or repairing `config.env`
+    /// to reload that file; calling `from_env` alone retains its cached authority.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn from_env() -> Self {
+        Self::from_env_with_generation_hook(|| {})
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn from_env_with_generation_hook(after_snapshot: impl FnOnce()) -> Self {
+        let _scope = ConfigGenerationGuard::enter(current_config_generation());
+        // Load before the hook so tests can pause a real in-flight snapshot.
+        // Production uses a no-op; every field still follows this same path.
+        let _user_env = user_env_load();
+        after_snapshot();
         let mut config = Self::default();
 
         // Interface mode is stamped by the binary at startup (ADR-001).
@@ -3040,8 +3107,8 @@ impl Config {
     /// clone of the cached value, avoiding repeated env-var parsing.
     ///
     /// Use this in hot paths (tool handlers) instead of `Config::from_env()`.
-    /// For tests or CLI commands that need a fresh or mutated config, continue
-    /// using `Config::from_env()` directly.
+    /// `Config::from_env()` reparses process variables. To reload a replaced or
+    /// repaired user config file as well, first call [`Config::reset_cached`].
     ///
     /// Cloning a ~60-field struct is ~2-3 KB and takes <1 microsecond — far
     /// cheaper than parsing 40+ environment variables with string conversions.
@@ -3050,9 +3117,16 @@ impl Config {
         global_config_cache_get()
     }
 
-    /// Reset the global config cache, forcing the next [`Config::get`] call to
-    /// re-parse environment variables. Intended for tests that modify env vars
-    /// between test cases.
+    /// Start a new generation for parsed settings and the user env-file authority.
+    ///
+    /// After an atomic `config.env` replacement or repair, call this before
+    /// [`Config::get`] or [`Config::from_env`] to reload both values and rejection
+    /// state. Reads already in flight may finish with their complete old
+    /// generation; they cannot repopulate the new cache with old settings.
+    /// Reads begun after this call returns use the new generation. Existing
+    /// `Config` clones remain snapshots; separate `env_value` calls are separate
+    /// reads. Process env is still read normally and project `.env` caching is
+    /// unchanged. This does not mutate files or the process environment.
     pub fn reset_cached() {
         global_config_cache_reset();
     }
@@ -3376,10 +3450,11 @@ pub fn detect_source(key: &str) -> ConfigSource {
     if env::var(key).is_ok() {
         return ConfigSource::ProcessEnv;
     }
-    if user_env_value(key).is_some() {
+    let user_env = user_env_load();
+    if user_env.values.contains_key(key) {
         return ConfigSource::UserEnvFile;
     }
-    if user_env_load().authority_error.is_some() {
+    if user_env.authority_error.is_some() {
         return ConfigSource::Default;
     }
     if dotenv_value(key).is_some() {
@@ -3391,7 +3466,6 @@ pub fn detect_source(key: &str) -> ConfigSource {
 // Helper functions for environment variable parsing
 
 static DOTENV_VALUES: OnceLock<HashMap<String, String>> = OnceLock::new();
-static USER_ENV_LOAD: OnceLock<UserEnvLoad> = OnceLock::new();
 static PROCESS_ENV_OVERRIDES: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
 
 /// Maximum accepted size for one environment-file authority.
@@ -3637,7 +3711,12 @@ fn user_env_file_candidates(home: Option<&Path>, xdg_config_dir: Option<&Path>) 
     candidates
 }
 
-fn read_open_user_env_file_bounded(file: &mut std::fs::File, path: &Path) -> io::Result<Vec<u8>> {
+fn read_open_user_env_file_bounded(
+    file: &mut std::fs::File,
+    path: &Path,
+    after_metadata: impl FnOnce(),
+    after_read: impl FnOnce(),
+) -> io::Result<Vec<u8>> {
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -3657,6 +3736,7 @@ fn read_open_user_env_file_bounded(file: &mut std::fs::File, path: &Path) -> io:
         ));
     }
 
+    after_metadata();
     let allocation =
         usize::try_from(metadata.len().min(USER_ENV_FILE_MAX_BYTES)).unwrap_or(1024 * 1024);
     let mut bytes = Vec::with_capacity(allocation);
@@ -3670,6 +3750,40 @@ fn read_open_user_env_file_bounded(file: &mut std::fs::File, path: &Path) -> io:
                 "{} grew beyond the {}-byte user configuration limit",
                 path.display(),
                 USER_ENV_FILE_MAX_BYTES
+            ),
+        ));
+    }
+    after_read();
+
+    // A retained inode alone does not bind content: an in-place writer can
+    // rewrite it while we read. Require two bounded observations to agree,
+    // as well as stable handle metadata around both reads. This is bounded
+    // race detection, not a lock or an atomic snapshot against a writer that
+    // deliberately changes and restores bytes between observations.
+    file.rewind()?;
+    let mut confirmed = Vec::with_capacity(bytes.len());
+    file.by_ref()
+        .take(USER_ENV_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut confirmed)?;
+    let after = file.metadata()?;
+    let unchanged = metadata.len() == after.len()
+        && metadata.modified()? == after.modified()?
+        && u64::try_from(bytes.len()).ok() == Some(metadata.len());
+    #[cfg(unix)]
+    let unchanged = {
+        use std::os::unix::fs::MetadataExt as _;
+        unchanged
+            && metadata.ctime() == after.ctime()
+            && metadata.ctime_nsec() == after.ctime_nsec()
+    };
+    // Platforms without Unix ctime rely on size, mtime and repeated bytes.
+    // In particular, restored/coarse mtime is never sufficient by itself.
+    if !unchanged || bytes != confirmed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} changed file identity or content generation during read",
+                path.display()
             ),
         ));
     }
@@ -3748,6 +3862,7 @@ fn read_user_env_candidate_with_hooks(
     path: &Path,
     after_parent_open: impl FnOnce(),
     after_file_open: impl FnOnce(),
+    after_read: impl FnOnce(),
 ) -> io::Result<Option<Vec<u8>>> {
     use nix::errno::Errno;
     use nix::fcntl::{AtFlags, OFlag, open, openat};
@@ -3784,9 +3899,8 @@ fn read_user_env_candidate_with_hooks(
         }
         Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
     };
-    after_file_open();
     let mut file = std::fs::File::from(file_fd);
-    let bytes = read_open_user_env_file_bounded(&mut file, path)?;
+    let bytes = read_open_user_env_file_bounded(&mut file, path, after_file_open, after_read)?;
     let opened_file = fstat(&file).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3902,6 +4016,7 @@ fn read_user_env_candidate_with_hooks(
     path: &Path,
     after_parent_open: impl FnOnce(),
     after_file_open: impl FnOnce(),
+    after_read: impl FnOnce(),
 ) -> io::Result<Option<Vec<u8>>> {
     let parent = env_authority_parent(path);
     let parent_before = match bind_user_env_parent(parent) {
@@ -3923,15 +4038,14 @@ fn read_user_env_candidate_with_hooks(
         }
         Err(error) => return Err(error),
     };
-    after_file_open();
-    let bytes = read_open_user_env_file_bounded(&mut file, path)?;
+    let bytes = read_open_user_env_file_bounded(&mut file, path, after_file_open, after_read)?;
     revalidate_open_user_env_leaf(path, file)?;
     revalidate_user_env_parent(parent, &parent_before)?;
     Ok(Some(bytes))
 }
 
 fn read_user_env_candidate(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    read_user_env_candidate_with_hooks(path, || {}, || {})
+    read_user_env_candidate_with_hooks(path, || {}, || {}, || {})
 }
 
 fn env_authority_parent(path: &Path) -> &Path {
@@ -3944,13 +4058,14 @@ fn env_authority_parent(path: &Path) -> &Path {
 ///
 /// Setup and legacy import use this fresh (uncached) seam. Keeping it beside
 /// runtime discovery ensures every caller gets the same regular-file,
-/// no-follow, parent-binding, size-bound, and identity-revalidation guarantees
-/// as normal user configuration loading.
+/// no-follow, parent-binding, size-bound, identity-revalidation, and repeated
+/// content/metadata checks as normal user configuration loading. These checks
+/// detect observed races; they do not lock out arbitrary in-place writers.
 ///
 /// # Errors
 ///
 /// Returns an error when an existing authority is unsafe, unreadable,
-/// oversized, invalid UTF-8, or changes identity during the read.
+/// oversized, invalid UTF-8, or changes identity/content generation during the read.
 pub fn read_env_authority_text(path: &Path) -> io::Result<Option<String>> {
     let Some(bytes) = read_user_env_candidate(path)? else {
         return Ok(None);
@@ -4027,16 +4142,15 @@ fn load_user_env_values_from(home: Option<&Path>, xdg_config_dir: Option<&Path>)
     load_user_env_values_from_with_reader(home, xdg_config_dir, read_user_env_candidate)
 }
 
-fn user_env_load() -> &'static UserEnvLoad {
-    USER_ENV_LOAD.get_or_init(|| {
-        let home = configured_home_dir().filter(|path| path.is_absolute());
-        let xdg = xdg_config_dir();
-        load_user_env_values_from(home.as_deref(), xdg.as_deref())
-    })
-}
-
-fn user_env_values() -> &'static HashMap<String, String> {
-    &user_env_load().values
+fn user_env_load() -> std::sync::Arc<UserEnvLoad> {
+    current_config_generation()
+        .user_env
+        .get_or_init(|| {
+            let home = configured_home_dir().filter(|path| path.is_absolute());
+            let xdg = xdg_config_dir();
+            std::sync::Arc::new(load_user_env_values_from(home.as_deref(), xdg.as_deref()))
+        })
+        .clone()
 }
 
 /// Return the reason the user-global env-file authority was rejected.
@@ -4052,7 +4166,7 @@ pub fn user_env_authority_error() -> Option<String> {
 /// Read a value from the user-global env file (`~/.mcp_agent_mail/.env`).
 #[must_use]
 pub fn user_env_value(key: &str) -> Option<String> {
-    user_env_values().get(key).cloned()
+    user_env_load().values.get(key).cloned()
 }
 
 /// Read a value with full precedence: process env → user env file → project `.env`.
@@ -4911,7 +5025,9 @@ mod tests {
                 atc_write_mode: AtcWriteMode::Off,
                 ..Config::default()
             };
-            let mut guard = CONFIG_CACHE
+            let generation = current_config_generation();
+            let mut guard = generation
+                .config
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard = Some(stale);
@@ -6243,6 +6359,7 @@ mod tests {
                 std::fs::rename(&replacement, &parent).unwrap();
             },
             || {},
+            || {},
         )
         .expect_err("parent replacement must invalidate the authority");
         assert!(error.to_string().contains("identity"));
@@ -6266,6 +6383,7 @@ mod tests {
                 std::fs::rename(&parent, &detached).unwrap();
                 std::fs::rename(&replacement, &parent).unwrap();
             },
+            || {},
             || {},
         )
         .expect_err("an absent leaf in a detached authority must not permit fallback");
@@ -6307,9 +6425,298 @@ mod tests {
                 std::fs::rename(&candidate, &displaced).unwrap();
                 std::fs::write(&candidate, "FOO=swapped\n").unwrap();
             },
+            || {},
         )
         .expect_err("leaf replacement must invalidate the authority");
         assert!(error.to_string().contains("identity"));
+    }
+
+    #[test]
+    fn user_env_in_place_mutation_rejects_without_legacy_fallback() {
+        for (after_first_read, replacement) in [
+            (false, "FOO=grown-after-metadata\n"),
+            (false, "FOO=x\n"),
+            (true, "FOO=after!\n"), // Same length; restored mtime cannot hide changed bytes.
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let xdg = tmp.path().join("authority");
+            let legacy = tmp.path().join(".mcp_agent_mail");
+            fs::create_dir(&xdg).unwrap();
+            fs::create_dir(&legacy).unwrap();
+            let candidate = xdg.join("config.env");
+            fs::write(&candidate, "FOO=before\n").unwrap();
+            fs::write(legacy.join(".env"), "FOO=stale\n").unwrap();
+            let identity = same_file::Handle::from_path(&candidate).unwrap();
+            let modified = fs::metadata(&candidate).unwrap().modified().unwrap();
+            let mutate = || {
+                use std::io::Write as _;
+                let mut writer = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&candidate)
+                    .unwrap();
+                writer.write_all(replacement.as_bytes()).unwrap();
+                writer.sync_all().unwrap();
+                writer.set_modified(modified).unwrap();
+                assert_eq!(identity, same_file::Handle::from_path(&candidate).unwrap());
+                assert_eq!(
+                    fs::metadata(&candidate).unwrap().modified().unwrap(),
+                    modified
+                );
+                if after_first_read {
+                    assert_eq!(fs::metadata(&candidate).unwrap().len(), 11);
+                }
+            };
+            let mut consulted = Vec::new();
+            let load =
+                load_user_env_values_from_with_reader(Some(tmp.path()), Some(&xdg), |path| {
+                    consulted.push(path.to_path_buf());
+                    read_user_env_candidate_with_hooks(
+                        path,
+                        || {},
+                        || {
+                            if !after_first_read {
+                                mutate();
+                            }
+                        },
+                        || {
+                            if after_first_read {
+                                mutate();
+                            }
+                        },
+                    )
+                });
+            assert!(
+                load.values.is_empty(),
+                "mutation phase after_read={after_first_read}"
+            );
+            assert!(
+                load.authority_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("changed"))
+            );
+            assert_eq!(
+                consulted,
+                [candidate],
+                "rejected authority must suppress fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn user_env_read_accepts_stable_generation_at_size_bounds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let candidate = tmp.path().join("config.env");
+        for size in [0, 1, USER_ENV_FILE_MAX_BYTES] {
+            let contents = "x".repeat(usize::try_from(size).unwrap());
+            fs::write(&candidate, &contents).unwrap();
+            assert_eq!(read_env_authority_text(&candidate).unwrap(), Some(contents));
+        }
+        fs::write(
+            &candidate,
+            vec![b'x'; usize::try_from(USER_ENV_FILE_MAX_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        assert!(read_env_authority_text(&candidate).is_err());
+    }
+
+    #[test]
+    fn fresh_process_config_reload_replaces_cached_token() {
+        run_config_reload_case("token");
+    }
+
+    #[test]
+    fn fresh_process_config_reload_repairs_cached_rejection() {
+        run_config_reload_case("rejection");
+    }
+
+    #[test]
+    fn fresh_process_config_reload_isolates_concurrent_readers() {
+        run_config_reload_case("concurrent");
+    }
+
+    #[test]
+    fn fresh_process_config_reload_restores_scope_after_panic() {
+        run_config_reload_case("panic");
+    }
+
+    fn replace_reload_fixture(path: &Path, token: &str, port: u16) {
+        use std::io::Write as _;
+
+        let mut staged = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
+        writeln!(staged, "HTTP_BEARER_TOKEN={token}\nHTTP_PORT={port}").unwrap();
+        staged.as_file().sync_all().unwrap();
+        staged
+            .persist(path)
+            .expect("atomic configuration replacement");
+    }
+
+    fn assert_reload_config(config: &Config, token: &str, port: u16) {
+        assert_eq!(config.http_bearer_token.as_deref(), Some(token));
+        assert_eq!(config.http_port, port);
+        config.validate_user_env_authority().unwrap();
+    }
+
+    fn exercise_concurrent_reload(path: &Path) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Repeat with an accepted and a rejected old authority. The hook pauses
+        // actual Config construction after its real file snapshot is loaded.
+        for rejected in [false, true] {
+            if rejected {
+                fs::write(path, [0xff]).unwrap();
+            } else {
+                replace_reload_fixture(path, "reload-old", 8761);
+            }
+            Config::reset_cached();
+            let old = user_env_load();
+            assert_eq!(old.authority_error.is_some(), rejected);
+            std::thread::scope(|scope| {
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let mut releases = Vec::new();
+                let mut readers = Vec::new();
+                for index in 0..8 {
+                    let (release_tx, release_rx) = mpsc::channel();
+                    releases.push(release_tx);
+                    let ready_tx = ready_tx.clone();
+                    readers.push(scope.spawn(move || {
+                        let pause = || {
+                            ready_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        };
+                        if index % 2 == 0 {
+                            global_config_cache_get_with_hook(pause)
+                        } else {
+                            Config::from_env_with_generation_hook(pause)
+                        }
+                    }));
+                }
+                for _ in 0..8 {
+                    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+                replace_reload_fixture(path, "reload-new", 8762);
+                Config::reset_cached();
+                assert_reload_config(&Config::get(), "reload-new", 8762);
+                assert_reload_config(&Config::from_env(), "reload-new", 8762);
+                for release in releases {
+                    release.send(()).unwrap();
+                }
+                for reader in readers {
+                    let config = reader.join().unwrap();
+                    if rejected {
+                        assert!(config.http_bearer_token.is_none());
+                        assert_eq!(config.http_port, Config::default().http_port);
+                        assert!(config.validate_user_env_authority().is_err());
+                    } else {
+                        assert_reload_config(&config, "reload-old", 8761);
+                    }
+                }
+            });
+            // Old in-flight builders must not repopulate the replacement cache.
+            assert_reload_config(&Config::get(), "reload-new", 8762);
+            assert!(user_env_authority_error().is_none());
+        }
+    }
+
+    fn run_config_reload_case(case: &str) {
+        const CHILD_MARKER: &str = "AM_TEST_CONFIG_RELOAD_CHILD";
+        if std::env::var(CHILD_MARKER).as_deref() == Ok(case) {
+            let path = user_env_authority_candidates().into_iter().next().unwrap();
+            if case == "concurrent" {
+                exercise_concurrent_reload(&path);
+                println!("{CHILD_MARKER}:{case}:executed");
+                return;
+            }
+            if case == "panic" {
+                assert_reload_config(&Config::get(), "reload-old", 8761);
+                let panic = std::panic::catch_unwind(|| {
+                    Config::from_env_with_generation_hook(|| {
+                        replace_reload_fixture(&path, "reload-new", 8762);
+                        Config::reset_cached();
+                        panic!("deliberate configuration parse interruption");
+                    });
+                });
+                assert!(panic.is_err());
+                assert_reload_config(&Config::get(), "reload-new", 8762);
+                println!("{CHILD_MARKER}:{case}:executed");
+                return;
+            }
+            let before = Config::get();
+            if case == "rejection" {
+                assert!(before.http_bearer_token.is_none());
+                assert!(before.validate_user_env_authority().is_err());
+                assert_eq!(detect_source("HTTP_BEARER_TOKEN"), ConfigSource::Default);
+            } else {
+                assert_reload_config(&before, "reload-old", 8761);
+            }
+
+            replace_reload_fixture(&path, "reload-new", 8762);
+            // Replacing the file alone does not silently change a running generation.
+            assert_eq!(Config::get().http_bearer_token, before.http_bearer_token);
+            Config::reset_cached();
+            assert_reload_config(&Config::get(), "reload-new", 8762);
+            assert_reload_config(&Config::from_env(), "reload-new", 8762);
+            assert_eq!(
+                user_env_value("HTTP_BEARER_TOKEN").as_deref(),
+                Some("reload-new")
+            );
+            assert!(user_env_authority_error().is_none());
+            assert_eq!(
+                detect_source("HTTP_BEARER_TOKEN"),
+                ConfigSource::UserEnvFile
+            );
+            println!("{CHILD_MARKER}:{case}:executed");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let xdg = root.join("config");
+        let config_dir = xdg.join(XDG_APP_DIR);
+        let project = root.join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let path = config_dir.join("config.env");
+        if case == "rejection" {
+            fs::write(&path, [0xff]).unwrap();
+        } else {
+            replace_reload_fixture(&path, "reload-old", 8761);
+        }
+        fs::write(
+            project.join(".env"),
+            "HTTP_BEARER_TOKEN=forbidden-fallback\n",
+        )
+        .unwrap();
+
+        let test = match case {
+            "token" => "fresh_process_config_reload_replaces_cached_token",
+            "rejection" => "fresh_process_config_reload_repairs_cached_rejection",
+            "concurrent" => "fresh_process_config_reload_isolates_concurrent_readers",
+            "panic" => "fresh_process_config_reload_restores_scope_after_panic",
+            _ => unreachable!("known reload case"),
+        };
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("config::tests::{test}"), "--nocapture"])
+            .current_dir(&project)
+            .env(CHILD_MARKER, case)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("STORAGE_ROOT", root.join("storage"))
+            .env_remove("HTTP_BEARER_TOKEN")
+            .env_remove("HTTP_PORT")
+            .output()
+            .expect("isolated reload child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains(&format!("{CHILD_MARKER}:{case}:executed")),
+            "child did not execute the selected test: {stdout}\n{stderr}"
+        );
     }
 
     #[test]
