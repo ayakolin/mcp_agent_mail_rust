@@ -46,6 +46,7 @@ test('install preserves existing configuration, backs up originals and runs quot
   assert.ok(installedCodex.startsWith(toml));
   assert.match(installedCodex, /agent-mail-wake managed hooks/);
   assert.match(installedCodex, /\[\[hooks\.SessionStart\]\]/);
+  assert.match(installedCodex, /matcher = "startup\|resume\|clear"/);
   assert.deepEqual(read(ompFile).disabledServers, ['existing']);
   const manifest = read(path.join(result.backup, 'manifest.json'));
   const savedClaude = manifest.find(entry => entry.file === claudeFile);
@@ -62,6 +63,11 @@ test('install preserves existing configuration, backs up originals and runs quot
   const second = applyInstallation(installationPlan({ home, url: 'http://127.0.0.1:9123/mcp/' }));
   assert.deepEqual(second.changed, []);
   assert.equal(second.backup, null);
+});
+
+test('Codex SessionStart matcher includes thread-restart clear', () => {
+  const merged = mergeCodexHooks('', 'agent-mail-wake-hook');
+  assert.match(merged, /matcher = "startup\|resume\|clear"/);
 });
 
 test('client selection only installs selected host entry points', t => {

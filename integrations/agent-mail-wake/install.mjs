@@ -50,7 +50,7 @@ function mailEntry(data, entry) {
 export function mergeCodexHooks(before, command) {
   const block = `# agent-mail-wake managed hooks
 [[hooks.SessionStart]]
-matcher = "startup|resume"
+matcher = "startup|resume|clear"
 
 [[hooks.SessionStart.hooks]]
 type = "command"

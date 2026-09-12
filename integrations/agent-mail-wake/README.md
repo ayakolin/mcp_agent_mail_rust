@@ -82,9 +82,9 @@ agent-mail-wake resume LISTENER_ID
 Claude's custom Channel uses its development-channel startup flag and requires the
 client's local-channel confirmation. Plain `claude` keeps the added Channel MCP
 server passive. Ordinary `codex` attaches through the installed SessionStart hook
-and `codex queue`; trust the hook in `/hooks` before it can run. `codex-mail`
-remains the managed App Server path. Kimi prints its Web UI URL and uses the
-existing `server.token`; its adapter does not attach to an unrelated live Kimi TUI.
+(`startup`, `resume`, and `/clear`) and `codex queue`; trust the hook in `/hooks`
+before it can run. `codex-mail` remains the managed App Server path. Kimi prints
+its Web UI URL and uses the existing `server.token`; its adapter does not attach to an unrelated live Kimi TUI.
 
 Grok runs headless: `grok-mail` owns a `grok agent --always-approve -m MODEL stdio`
 process and prompts its ACP session per batch (`--session ID` reuses a stored

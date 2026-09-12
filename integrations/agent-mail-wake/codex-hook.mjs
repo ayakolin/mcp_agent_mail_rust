@@ -22,15 +22,27 @@ export function shouldAttach(event, env = process.env) {
     event.source !== 'compact' && !isSessionEnd(event);
 }
 
-export function stopQueueListeners(session) {
+const FRESH_ATTACH_MS = 15_000;
+
+export function isFreshListener(state, now = Date.now()) {
+  const ts = Date.parse(state?.updatedAt || '');
+  return Number.isFinite(ts) && (now - ts) < FRESH_ATTACH_MS;
+}
+
+export function stopQueueListeners(session, now = Date.now(), roots = {}) {
   if (!session) return [];
+  const dataRoot = roots.dataRoot || DATA_ROOT;
+  const stateRoot = roots.stateRoot || STATE_ROOT;
   const stopped = [];
-  for (const state of listStates()) {
+  for (const state of listStates(stateRoot)) {
     if (state.host !== 'codex' || state.session !== session) continue;
-    const binding = readJson(path.join(DATA_ROOT, 'bindings', `${state.id}.json`), {});
+    const binding = readJson(path.join(dataRoot, 'bindings', `${state.id}.json`), {});
     if (binding.delivery !== 'queue') continue;
-    const full = readJson(path.join(STATE_ROOT, `${state.id}.json`), {});
+    const full = readJson(path.join(stateRoot, `${state.id}.json`), {});
     if (!full.pid || full.pid === process.pid) continue;
+    // Thread restart fires SessionEnd after SessionStart(clear). A just-attached
+    // listener must survive that late stop so auto-wake stays online.
+    if (isFreshListener(full, now)) continue;
     try { process.kill(full.pid, 'SIGTERM'); stopped.push(full.pid); } catch { /* already gone */ }
   }
   return stopped;
@@ -49,7 +61,9 @@ export async function handleHook(raw, env = process.env, spawner = spawn) {
   const event = parseHookEvent(raw);
   const id = sessionId(event);
   if (isSessionEnd(event)) {
-    stopQueueListeners(id);
+    const dataRoot = env.AGENT_MAIL_WAKE_HOME || DATA_ROOT;
+    const stateRoot = env.AGENT_MAIL_WAKE_STATE_DIR || path.join(dataRoot, 'state');
+    stopQueueListeners(id, Date.now(), { dataRoot, stateRoot });
     return { stdout: '{}\n', spawned: false };
   }
   if (!shouldAttach(event, env)) return { stdout: '{}\n', spawned: false };

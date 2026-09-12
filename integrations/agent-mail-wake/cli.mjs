@@ -194,6 +194,13 @@ async function opencodeMain(options) {
 function usage() {
   console.log(`Agent Mail Wake\n\nagent-mail-wake list\nagent-mail-wake pause|resume <listener-id>\nagent-mail-wake doctor\ncodex-mail [--project DIR] [--session ID] [--headless] [-- native flags]\ncodex-mail attach --session ID [--project DIR]\nclaude-mail [--project DIR] [--session ID] [-- native flags]\nkimi-mail [--project DIR] [--server URL --session ID]\ngrok-mail [--project DIR] [--session ID] [--model ID]\nopencode-mail [--project DIR] [--session ID] [--model provider/model]\n\nOMP: automatically enabled in new interactive sessions; /mail-wake status|pause|resume\nCodex: a SessionStart hook attaches a queue listener to ordinary \`codex\` sessions after the hook is trusted; \`codex-mail\` still owns a managed App Server.\nClaude: start \`claude-mail\` to enable the Channel listener. Plain \`claude\` keeps the Channel MCP passive.\nGrok Build: managed ACP session (grok agent stdio); approvals run always-approve.`);
 }
+export function refreshListenerTimestamp(file, now = new Date()) {
+  const existing = readJson(file, {});
+  if (!existing?.id) return false;
+  existing.updatedAt = now.toISOString();
+  saveJson(file, existing);
+  return true;
+}
 export async function attachCodexSession({ session, project }) {
   if (!session) throw new Error('codex attach requires --session');
   const cwd = projectPath(project);
@@ -212,6 +219,9 @@ export async function attachCodexSession({ session, project }) {
     await watcher.init();
   } catch (error) {
     if (/already running/.test(errorText(error))) {
+      // /clear SessionStart can race SessionEnd. Refresh updatedAt so
+      // stopQueueListeners treats this existing listener as fresh.
+      refreshListenerTimestamp(watcher.file);
       process.stderr.write(`[Agent Mail] Codex session ${session} already has a listener\n`);
       watcher = undefined;
       return;

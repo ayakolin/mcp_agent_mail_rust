@@ -73,6 +73,9 @@ test('OMP extension delivers mail mid-run via deliverAs aside without an idle ga
   while (!sent.some(s => s.options.deliverAs === 'aside') && Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 100));
   }
+  // Same-session restart must keep the live listener, not mint a second mailbox.
+  await handlers.get('session_start')(undefined, ctx);
+  assert.equal(sent.filter(s => s.message.customType === 'agent-mail-identity').length, 1);
   await handlers.get('session_shutdown')();
 
   const identity = sent.find(s => s.message.customType === 'agent-mail-identity');

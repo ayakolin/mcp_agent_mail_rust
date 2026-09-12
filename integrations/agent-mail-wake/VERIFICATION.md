@@ -97,6 +97,9 @@ Verified on this machine against Codex 0.154.0:
   without throwing. When aliased (`alias codex=codex-mail`), `codex resume`
   invokes native resume, fires the SessionStart hook, and attaches auto-wake.
   Resuming or attaching also unpauses sessions that previously hit the turn limit.
+  `/clear` thread restarts re-attach because the SessionStart matcher includes
+  `clear`. SessionEnd skips a listener whose `updatedAt` was refreshed within
+  15 seconds (covers SessionStart(clear) racing a late SessionEnd).
 
 Claude, Kimi, Grok, and OpenCode still need their dedicated launchers. OMP
 already attaches inside ordinary interactive sessions.

@@ -97,7 +97,7 @@ Claude 首次使用自定义 Channel 的启动入口时，会要求确认这是�
 这个要求由 Claude 自己执行。启动器仅启用 `server:agent_mail_wake`，
 不启用跳过工具权限检查的选项。直接运行普通 `claude` 时，Channel MCP 保持被动。
 
-普通 `codex` 会在 SessionStart 时挂上 `codex queue` 监听器。新安装或变更后的钩子
+普通 `codex` 会在 SessionStart（`startup`、`resume`、`/clear`）时挂上 `codex queue` 监听器。新安装或变更后的钩子
 需要在 Codex 里用 `/hooks` 审查并信任后才会运行；未信任时行为与安装前相同。
 `AGENT_MAIL_WAKE_ENABLED=0` 可关闭本次会话的自动挂接。
 `codex-mail` 会将 `resume`、`queue` 等原生子命令与 `--yolo` 等原生参数透明透传到底层 Codex；若设置了 `alias codex=codex-mail`，`codex resume` 会正常启动原生恢复并触发 SessionStart 自动挂接。重新连接或恢复会话时还会自动重置暂停状态。

@@ -1,9 +1,16 @@
 import { MailWatcher, identityInstructions, errorText, projectPath } from './common.mjs';
 
 export default function agentMailWake(pi) {
-  let watcher, generation = 0, initPromise;
+  let watcher, generation = 0, keepEpoch = 0, initPromise;
   const show = (ctx, text) => { if (ctx.hasUI) ctx.ui.notify(text, 'info'); };
   async function start(ctx) {
+    const session = ctx.sessionManager.getSessionId();
+    // Same-session reload/switch/branch must keep the live listener. Stopping it
+    // here is what drops auto-wake when a thread restarts in-process.
+    if (watcher && watcher.session === session && !watcher.stopped) {
+      keepEpoch++;
+      return;
+    }
     const current = ++generation;
     if (watcher) await watcher.stop();
     watcher = undefined;
@@ -12,9 +19,8 @@ export default function agentMailWake(pi) {
     if (process.env.AGENT_MAIL_WAKE_ENABLED === '0' ||
       (!ctx.hasUI && process.env.AGENT_MAIL_WAKE_ENABLED !== '1')) return;
     try {
-      const candidate = new MailWatcher({ host: 'omp', session: ctx.sessionManager.getSessionId(),
-        project: projectPath(process.env.AGENT_MAIL_PROJECT || ctx.cwd), model: ctx.model?.id,
-        interval: Number(process.env.AGENT_MAIL_WAKE_INTERVAL_MS || 3000),
+      const candidate = new MailWatcher({ host: 'omp', session, project: projectPath(process.env.AGENT_MAIL_PROJECT || ctx.cwd),
+        model: ctx.model?.id, interval: Number(process.env.AGENT_MAIL_WAKE_INTERVAL_MS || 3000),
         // deliverAs:"aside" injects at the next agent step boundary without
         // interrupting the current tool batch, and starts a turn when idle — so
         // mail is deliverable mid-run, not only between turns.
@@ -40,7 +46,18 @@ export default function agentMailWake(pi) {
   pi.on('session_start', (_, ctx) => { initPromise = start(ctx); return initPromise; });
   pi.on('session_switch', (_, ctx) => { initPromise = start(ctx); return initPromise; });
   pi.on('session_branch', (_, ctx) => { initPromise = start(ctx); return initPromise; });
-  pi.on('session_shutdown', async () => { generation++; await initPromise; await watcher?.stop(); });
+  pi.on('session_shutdown', async () => {
+    const existing = watcher;
+    const shutting = generation;
+    const keepAt = keepEpoch;
+    await initPromise;
+    // Same-session keep increments keepEpoch so a late dispose cannot
+    // kill the listener that thread restart just reaffirmed.
+    if (watcher !== existing || generation !== shutting || keepEpoch !== keepAt) return;
+    generation++;
+    await existing?.stop();
+    if (watcher === existing) watcher = undefined;
+  });
   pi.on('input', event => {
     if (event.source === 'interactive' && watcher && !watcher.state.paused) {
       watcher.state.wakeups = 0; watcher.save();
