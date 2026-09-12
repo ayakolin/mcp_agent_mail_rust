@@ -8455,7 +8455,7 @@ fn message_paths_for_bundle(
 ) -> Result<(MessageArchivePaths, DateTime<Utc>, String)> {
     let created = parse_message_timestamp(message);
     let timestamp_str = created.to_rfc3339();
-    let paths = message_paths(
+    let mut paths = message_paths(
         archive,
         sender,
         recipients,
@@ -8466,7 +8466,76 @@ fn message_paths_for_bundle(
             .unwrap_or("message"),
         positive_message_id(message).unwrap_or(0),
     )?;
+    if let Some(source) = message_source_archive(archive, message)? {
+        paths.outbox = message_paths(
+            &source,
+            sender,
+            &[],
+            &created,
+            message
+                .get("subject")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("message"),
+            positive_message_id(message).unwrap_or(0),
+        )?
+        .outbox;
+    }
     Ok((paths, created, timestamp_str))
+}
+
+/// Source and destination share one archive repository. Only the outbox is
+/// routed to the source; canonical messages and recipient copies stay local.
+fn message_source_archive(
+    archive: &ProjectArchive,
+    message: &serde_json::Value,
+) -> Result<Option<ProjectArchive>> {
+    let Some(slug) = message.get("from_project_slug") else {
+        return Ok(None);
+    };
+    let slug = slug.as_str().ok_or_else(|| {
+        StorageError::InvalidPath("from_project_slug must be a string".to_string())
+    })?;
+    let slug = validate_archive_component("source project slug", slug)?;
+    if slug == archive.slug {
+        return Ok(None);
+    }
+    let root = archive_repo_root_checked(archive)?
+        .join("projects")
+        .join(slug);
+    let source = ProjectArchive {
+        slug: slug.to_string(),
+        lock_path: root.join(".archive.lock"),
+        root,
+        repo_root: archive.repo_root.clone(),
+        canonical_repo_root: archive.canonical_repo_root.clone(),
+    };
+    archive_project_root_checked(&source)?;
+    Ok(Some(source))
+}
+
+fn with_message_project_locks<'a, T>(
+    archive: &ProjectArchive,
+    messages: impl IntoIterator<Item = &'a serde_json::Value>,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    fn lock_all<T>(archives: &[ProjectArchive], f: &mut dyn FnMut() -> Result<T>) -> Result<T> {
+        if let Some((archive, rest)) = archives.split_first() {
+            with_project_lock(archive, || lock_all(rest, f))
+        } else {
+            f()
+        }
+    }
+    let mut archives = vec![archive.clone()];
+    for message in messages {
+        if let Some(source) = message_source_archive(archive, message)? {
+            archives.push(source);
+        }
+    }
+    // A -> B and B -> A must acquire locks in the same order.
+    archives.sort_by(|left, right| left.slug.cmp(&right.slug));
+    archives.dedup_by(|left, right| left.slug == right.slug);
+    let mut f = Some(f);
+    lock_all(&archives, &mut || f.take().expect("called once")())
 }
 
 fn reject_message_bundle_archive_collision_from_index(
@@ -8703,7 +8772,7 @@ pub fn write_message_batch_bundle(
     let mut single_auto_commit_message: Option<String> = None;
 
     let disk_started = Instant::now();
-    with_project_lock(archive, || {
+    with_message_project_locks(archive, entries.iter().map(|entry| entry.message), || {
         let existing_message_ids = collect_existing_batch_message_ids(archive, entries)?;
 
         for entry in entries {
@@ -8838,7 +8907,7 @@ pub fn write_message_bundle(
     extra_paths: &[String],
     commit_text: Option<&str>,
 ) -> Result<()> {
-    with_project_lock(archive, || {
+    with_message_project_locks(archive, [message], || {
         let repo_root = archive_repo_root_checked(archive)?;
         let mut rel_paths = Vec::with_capacity(
             2 + recipients.len()
@@ -13644,6 +13713,141 @@ mod tests {
         // Check thread digest (sanitize_thread_id lowercases)
         let digest = archive.root.join("messages/threads/tkt-1.md");
         assert!(digest.exists());
+    }
+
+    #[test]
+    fn cross_project_message_bundle_routes_only_outbox_to_source() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let source = ensure_archive(&config, "source").unwrap();
+        let destination = ensure_archive(&config, "destination").unwrap();
+        let recipients = vec!["RecipientAgent".to_string()];
+        for (id, batch) in [(41, false), (42, true)] {
+            let message = serde_json::json!({
+                "id": id,
+                "subject": "Cross project",
+                "created_ts": "2026-01-15T10:00:00Z",
+                "project": "destination",
+                "from_project": "/workspace/source",
+                "from_project_slug": "source",
+                "from": "SenderAgent",
+                "to": recipients,
+            });
+            let entry = MessageBundleBatchEntry {
+                message: &message,
+                body_md: "Across directories",
+                sender: "SenderAgent",
+                recipients: &recipients,
+                extra_paths: &[],
+            };
+            if batch {
+                write_message_batch_bundle(&destination, &config, &[entry], None).unwrap();
+            } else {
+                write_message_bundle(
+                    &destination,
+                    &config,
+                    &message,
+                    entry.body_md,
+                    entry.sender,
+                    &recipients,
+                    &[],
+                    None,
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            list_message_files(&destination.root.join("messages"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            list_agent_inbox(&destination, "RecipientAgent")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(list_agent_outbox(&source, "SenderAgent").unwrap().len(), 2);
+        assert!(
+            list_agent_outbox(&destination, "SenderAgent")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            list_message_files(&source.root.join("messages"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cross_project_message_bundle_rejects_unsafe_source_before_writing() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "destination").unwrap();
+        for source_slug in [
+            serde_json::json!("../escape"),
+            serde_json::json!(""),
+            serde_json::json!(42),
+        ] {
+            let message = serde_json::json!({
+                "id": 1,
+                "subject": "Rejected",
+                "from_project_slug": source_slug,
+            });
+            let result = write_message_bundle(
+                &archive,
+                &config,
+                &message,
+                "body",
+                "SenderAgent",
+                &[],
+                &[],
+                None,
+            );
+            assert!(matches!(result, Err(StorageError::InvalidPath(_))));
+            assert!(
+                list_message_files(&archive.root.join("messages"))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cross_project_message_bundle_rejects_symlinked_source() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "destination").unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, archive.repo_root.join("projects/source")).unwrap();
+        let message = serde_json::json!({
+            "id": 1,
+            "subject": "Rejected",
+            "from_project_slug": "source",
+        });
+        assert!(matches!(
+            write_message_bundle(
+                &archive,
+                &config,
+                &message,
+                "body",
+                "SenderAgent",
+                &[],
+                &[],
+                None,
+            ),
+            Err(StorageError::InvalidPath(_))
+        ));
+        assert!(
+            list_message_files(&archive.root.join("messages"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     #[test]

@@ -206,6 +206,7 @@ fn test_send_message_empty_to_error() {
             None, // auto_contact_if_blocked
             None, // sender_token
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect_err("empty to should fail");
@@ -257,6 +258,7 @@ fn test_invalid_importance_error() {
             None,                              // auto_contact_if_blocked
             None,                              // sender_token
             None,                              // idempotency_key
+            None,                              // to_project
         )
         .await
         .expect_err("invalid importance should fail");
@@ -373,6 +375,7 @@ fn test_reply_message_cross_project_reports_owning_project() {
             None, // auto_contact_if_blocked
             None, // sender_token
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect("send_message should succeed");
@@ -480,6 +483,7 @@ fn test_reply_message_subject_prefix() {
             None, // auto_contact_if_blocked
             None, // sender_token
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect("send_message should succeed");
@@ -585,6 +589,7 @@ fn test_broadcast_with_explicit_to_error() {
             None,       // auto_contact_if_blocked
             None,       // sender_token
             None,       // idempotency_key
+            None,       // to_project
         )
         .await
         .expect_err("broadcast + explicit to should fail");
@@ -759,6 +764,7 @@ fn fail_closed_profile_gates_reply_message_sender_verification() {
                 None,
                 Some(blue_token),
                 None, // idempotency_key
+                None, // to_project
             )
             .await
             .expect("verified send under the fail-closed profile");
@@ -881,6 +887,7 @@ fn reply_message_without_profile_returns_full_payload() {
             None,
             None,
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect("send without profile");

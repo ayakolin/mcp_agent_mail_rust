@@ -440,6 +440,8 @@ pub async fn request_contact(
         let msg_json = serde_json::json!({
             "id": message_id,
             "from": &from_agent_name,
+            "from_project": &project.human_key,
+            "from_project_slug": &project.slug,
             "to": &all_recipient_names,
             "cc": [],
             "bcc": [],

@@ -1752,8 +1752,12 @@ fn reconstruct_from_archive_impl(
                     &mut stats,
                 )?;
             }
+        }
 
-            // Phase 3: Discover messages for this project
+        // Phase 3: Resolve senders only after every project's identities exist.
+        // A message may live in a recipient project that sorts before its sender.
+        for (slug, project_path) in &project_dirs {
+            let pid = query_last_insert_or_existing_id(&conn, "projects", "slug", slug)?;
             let messages_dir = project_path.join("messages");
             if is_real_directory(&messages_dir) {
                 discover_messages(
@@ -2567,8 +2571,10 @@ fn parse_and_insert_message(
         stats,
     );
 
-    // Ensure sender agent exists
-    let sender_id = ensure_agent_exists(conn, project_id, &sender_name, agent_ids)?;
+    // Canonical copies belong to the recipient project for cross-project mail.
+    // Preserve the source identity instead of synthesizing a local namesake.
+    let sender_project_id = archive_sender_project_id(conn, &msg, project_id)?;
+    let sender_id = ensure_agent_exists(conn, sender_project_id, &sender_name, agent_ids)?;
 
     let (recipients_json, to_names, cc_names, bcc_names) =
         normalize_archive_recipients_json(&msg, &file_path.display().to_string(), stats);
@@ -2736,6 +2742,42 @@ fn parse_and_insert_message(
     }
 
     Ok(())
+}
+
+/// Resolve the sender's independently archived project identity.
+fn archive_sender_project_id(
+    conn: &DbConn,
+    message: &serde_json::Value,
+    default_project_id: i64,
+) -> DbResult<i64> {
+    let Some(source_slug) = message.get("from_project_slug") else {
+        return Ok(default_project_id);
+    };
+    let source_slug = source_slug
+        .as_str()
+        .filter(|slug| !slug.trim().is_empty())
+        .ok_or_else(|| DbError::Sqlite("invalid archive from_project_slug".to_string()))?;
+    let rows = conn
+        .query_sync(
+            "SELECT id, human_key FROM projects WHERE slug = ?",
+            &[Value::Text(source_slug.to_string())],
+        )
+        .map_err(|error| DbError::Sqlite(format!("resolve archived sender project: {error}")))?;
+    let row = rows.first().ok_or_else(|| {
+        DbError::Sqlite(format!("archive sender project {source_slug:?} is missing"))
+    })?;
+    if let Some(source_key) = json_str(message, "from_project") {
+        let human_key = row
+            .get_named::<String>("human_key")
+            .map_err(|error| DbError::Sqlite(format!("decode sender project key: {error}")))?;
+        if source_key != human_key {
+            return Err(DbError::Sqlite(format!(
+                "archive sender project {source_slug:?} disagrees with from_project"
+            )));
+        }
+    }
+    row.get_named::<i64>("id")
+        .map_err(|error| DbError::Sqlite(format!("decode sender project id: {error}")))
 }
 
 /// Ensure an agent row exists, creating a placeholder if needed.
@@ -5545,13 +5587,9 @@ fn merge_salvaged_database(
                     let target_sender_id = if let Some(mapped) =
                         agent_id_map.get(&source_sender_id).copied()
                     {
-                        if agent_project_id(&target_conn, mapped)? != Some(target_project_id) {
-                            stats.push_warning(format!(
-                                "skipped salvaged message {source_message_id}: sender {source_sender_id} maps outside project {source_project_id} (cross-generation artifact); the canonical archive copy is authoritative"
-                            ));
-                            stats.salvaged_rows_skipped_unmapped += 1;
-                            continue;
-                        }
+                        // Sender IDs are mapped through their own project's
+                        // stable identity. Cross-project messages intentionally
+                        // have a different sender and recipient project.
                         mapped
                     } else {
                         let placeholder_name = format!("unknown-agent-{source_sender_id}");
@@ -7411,6 +7449,89 @@ mod tests {
                 .get_named::<String>("contact_policy")
                 .expect("contact_policy"),
             "auto"
+        );
+    }
+
+    #[test]
+    fn reconstruct_cross_project_sender_preserves_source_identity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("cross-project.db");
+        // Destination deliberately sorts first to exercise discovery order.
+        for (slug, human_key) in [
+            ("a-destination", "/workspace/destination"),
+            ("z-source", "/workspace/source"),
+        ] {
+            let project = storage_root.join("projects").join(slug);
+            let agent = project.join("agents/Alice");
+            std::fs::create_dir_all(&agent).unwrap();
+            std::fs::write(
+                project.join("project.json"),
+                serde_json::json!({"slug": slug, "human_key": human_key}).to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                agent.join("profile.json"),
+                serde_json::json!({"name": "Alice", "program": slug, "model": "test"}).to_string(),
+            )
+            .unwrap();
+        }
+        let messages = storage_root.join("projects/a-destination/messages/2026/09");
+        std::fs::create_dir_all(&messages).unwrap();
+        std::fs::write(
+            messages.join("2026-09-12T12-00-00Z__cross-project__41.md"),
+            r#"---json
+{"id":41,"from":"Alice","from_project_slug":"z-source","from_project":"/workspace/source","to":["Alice"],"subject":"Cross project","created_ts":"2026-09-12T12:00:00Z"}
+---
+
+Across directories
+"#,
+        )
+        .unwrap();
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("reconstruct");
+        assert_eq!(stats.projects, 2);
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.parse_errors, 0);
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT destination.slug AS destination, source.slug AS source, sender.program AS program, recipient.project_id AS recipient_project_id, m.project_id AS message_project_id \
+                 FROM messages m JOIN projects destination ON destination.id = m.project_id \
+                 JOIN agents sender ON sender.id = m.sender_id JOIN projects source ON source.id = sender.project_id \
+                 JOIN message_recipients mr ON mr.message_id = m.id JOIN agents recipient ON recipient.id = mr.agent_id WHERE m.id = 41",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_named::<String>("destination").unwrap(),
+            "a-destination"
+        );
+        assert_eq!(rows[0].get_named::<String>("source").unwrap(), "z-source");
+        assert_eq!(rows[0].get_named::<String>("program").unwrap(), "z-source");
+        assert_eq!(
+            rows[0].get_named::<i64>("recipient_project_id").unwrap(),
+            rows[0].get_named::<i64>("message_project_id").unwrap()
+        );
+        assert!(
+            archive_sender_project_id(
+                &conn,
+                &serde_json::json!({"from_project_slug": "missing"}),
+                1
+            )
+            .is_err()
+        );
+        assert!(
+            archive_sender_project_id(&conn, &serde_json::json!({"from_project_slug": ""}), 1)
+                .is_err()
+        );
+        assert!(
+            archive_sender_project_id(
+                &conn,
+                &serde_json::json!({"from_project_slug": "z-source", "from_project": "/wrong"}),
+                1
+            )
+            .is_err()
         );
     }
 

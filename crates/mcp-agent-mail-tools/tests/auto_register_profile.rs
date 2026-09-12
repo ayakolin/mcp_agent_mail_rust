@@ -133,6 +133,7 @@ fn auto_registered_recipient_gets_an_archived_profile() {
             None, // auto_contact_if_blocked
             None, // sender_token
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect("send to an unregistered recipient auto-registers it");

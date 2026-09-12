@@ -332,6 +332,7 @@ fn send_message_null_auto_contact_contract() {
             None,
             None,
             None,
+            None, // to_project
         )
         .await
         .expect("direct send with None auto_contact_if_blocked");

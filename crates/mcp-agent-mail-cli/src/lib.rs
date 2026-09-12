@@ -2050,6 +2050,9 @@ pub enum MailCommand {
         /// Project key (slug or human_key).
         #[arg(long = "project", short = 'p')]
         project_key: String,
+        /// Recipient project key (slug or directory); defaults to --project.
+        #[arg(long)]
+        to_project: Option<String>,
         /// Sender agent name.
         #[arg(long = "from")]
         sender: String,
@@ -2267,6 +2270,8 @@ const PENDING_SEND_MAX_DUPLICATE_SLOTS: u32 = 10_000;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PendingMailSendEnvelope {
     project_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to_project: Option<String>,
     sender: String,
     to: Vec<String>,
     cc: Vec<String>,
@@ -36694,6 +36699,7 @@ async fn send_mail_envelope_via_server_or_local(
             envelope.thread_id.as_deref(),
             envelope.topic.as_deref(),
             sender_token,
+            envelope.to_project.as_deref(),
         ),
     )
     .await
@@ -36738,6 +36744,7 @@ async fn send_mail_envelope_via_server_or_local(
         envelope.thread_id.as_deref(),
         envelope.topic.as_deref(),
         sender_token,
+        envelope.to_project.as_deref(),
     ));
     let payload = match asupersync::time::timeout(
         asupersync::time::wall_now(),
@@ -37375,6 +37382,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
 
         MailCommand::Send {
             project_key,
+            to_project,
             sender,
             to,
             subject,
@@ -37405,6 +37413,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             }
             let envelope = PendingMailSendEnvelope {
                 project_key,
+                to_project,
                 sender,
                 to: to_names,
                 cc: split_optional_cli_agent_list(cc.as_ref()),
@@ -38269,6 +38278,7 @@ fn build_server_send_message_arguments(
     thread_id: Option<&str>,
     topic: Option<&str>,
     sender_token: Option<&str>,
+    to_project: Option<&str>,
 ) -> serde_json::Value {
     let mut arguments = serde_json::Map::from_iter([
         ("project_key".to_string(), serde_json::json!(project_key)),
@@ -38290,6 +38300,9 @@ fn build_server_send_message_arguments(
     }
     if let Some(sender_token) = sender_token.filter(|t| !t.is_empty()) {
         arguments.insert("sender_token".to_string(), serde_json::json!(sender_token));
+    }
+    if let Some(to_project) = to_project {
+        arguments.insert("to_project".to_string(), serde_json::json!(to_project));
     }
     serde_json::Value::Object(arguments)
 }
@@ -40357,6 +40370,7 @@ mod mail_server_cli_bridge_tests {
             None,
             None,
             None,
+            None,
         );
 
         let object = args.as_object().expect("object arguments");
@@ -40364,6 +40378,7 @@ mod mail_server_cli_bridge_tests {
         assert!(!object.contains_key("thread_id"));
         assert!(!object.contains_key("topic"));
         assert!(!object.contains_key("sender_token"));
+        assert!(!object.contains_key("to_project"));
     }
 
     #[test]
@@ -40381,6 +40396,7 @@ mod mail_server_cli_bridge_tests {
             None,
             None,
             Some("secret-tok"),
+            None,
         );
         let object = args.as_object().expect("object arguments");
         assert_eq!(
@@ -40402,8 +40418,33 @@ mod mail_server_cli_bridge_tests {
             None,
             None,
             Some(""),
+            None,
         );
         assert!(!args_empty.as_object().unwrap().contains_key("sender_token"));
+    }
+
+    #[test]
+    fn send_message_server_arguments_preserve_source_and_recipient_projects() {
+        let to_names = vec!["WindyGate".to_string()];
+        let args = build_server_send_message_arguments(
+            "/tmp/source",
+            "PinkStone",
+            &to_names,
+            "Subject",
+            "Body",
+            None,
+            "normal",
+            false,
+            None,
+            None,
+            Some("source-token"),
+            Some("/tmp/destination"),
+        );
+
+        assert_eq!(args["project_key"], "/tmp/source");
+        assert_eq!(args["to_project"], "/tmp/destination");
+        assert_eq!(args["sender_token"], "source-token");
+        assert_eq!(args["to"], serde_json::json!(["WindyGate"]));
     }
 
     // ---- #147: mail send sender-token UX ----
@@ -40418,6 +40459,7 @@ mod mail_server_cli_bridge_tests {
     fn pending_send_test_envelope() -> PendingMailSendEnvelope {
         PendingMailSendEnvelope {
             project_key: "/tmp/project".to_string(),
+            to_project: None,
             sender: "PinkStone".to_string(),
             to: vec!["WindyGate".to_string()],
             cc: vec!["BlueLake".to_string()],
@@ -40478,6 +40520,30 @@ mod mail_server_cli_bridge_tests {
                 .expect("idempotent create");
         assert_eq!(second_path, path);
         assert_eq!(second_artifact.content_hash, loaded.content_hash);
+    }
+
+    #[test]
+    fn queued_send_preserves_recipient_project_and_distinguishes_routes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_storage_root(temp.path());
+        let mut envelope = pending_send_test_envelope();
+        let local_hash = pending_send_content_hash(&envelope).expect("local hash");
+        envelope.to_project = Some("/tmp/destination".to_string());
+        let failure =
+            pending_send_failure_from_error(&CliError::Other("database is locked".to_string()))
+                .expect("queueable failure");
+        let (path, artifact) = create_pending_send_artifact(&config, &envelope, failure, false)
+            .expect("queue cross-project send");
+
+        assert_ne!(artifact.content_hash, local_hash);
+        let loaded = load_pending_send_artifact(&path).expect("reload cross-project send");
+        validate_pending_send_artifact(&path, &loaded).expect("valid queued send");
+        assert_eq!(loaded.envelope, envelope);
+        envelope.to_project = Some("/tmp/another-destination".to_string());
+        assert_ne!(
+            pending_send_content_hash(&envelope).expect("other route hash"),
+            artifact.content_hash
+        );
     }
 
     // ---- GH#306: audited discard path for stale queued sends ----
@@ -40968,6 +41034,7 @@ mod mail_server_cli_bridge_tests {
             false,
             Some("br-123"),
             Some("br-123.1"),
+            None,
             None,
         );
 
@@ -64550,6 +64617,43 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn clap_parses_mail_send_recipient_project() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "mail",
+            "send",
+            "--project",
+            "/tmp/source",
+            "--to-project",
+            "/tmp/destination",
+            "--from",
+            "BlueLake",
+            "--to",
+            "RedFox",
+            "--subject",
+            "Release",
+            "--body",
+            "Ready",
+        ])
+        .expect("mail send should accept --to-project");
+
+        match cli.command.expect("expected command") {
+            Commands::Mail {
+                action:
+                    MailCommand::Send {
+                        project_key,
+                        to_project,
+                        ..
+                    },
+            } => {
+                assert_eq!(project_key, "/tmp/source");
+                assert_eq!(to_project.as_deref(), Some("/tmp/destination"));
+            }
+            other => panic!("expected Mail Send, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn clap_parses_mail_summarize_thread() {
         let cli = Cli::try_parse_from([
             "am",
@@ -86476,6 +86580,7 @@ async fn call_send_message_tool_locally(
     thread_id: Option<&str>,
     topic: Option<&str>,
     sender_token: Option<&str>,
+    to_project: Option<&str>,
 ) -> CliResult<serde_json::Value> {
     let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
     let payload = mcp_agent_mail_tools::messaging::send_message(
@@ -86497,6 +86602,7 @@ async fn call_send_message_tool_locally(
         None,
         sender_token.filter(|t| !t.is_empty()).map(str::to_string),
         None, // idempotency_key
+        to_project.map(str::to_string),
     )
     .await
     .map_err(mcp_error_to_cli_error)?;

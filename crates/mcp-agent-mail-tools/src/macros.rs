@@ -775,6 +775,7 @@ pub async fn macro_contact_handshake(
                 // closed under MESSAGING_FAIL_CLOSED_SEND_PROFILE).
                 sender_token,
                 None, // idempotency_key
+                None, // to_project
             )
             .await?;
             Some(parse_json(welcome_json, "welcome_message")?)

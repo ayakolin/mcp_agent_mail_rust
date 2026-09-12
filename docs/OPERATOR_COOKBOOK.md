@@ -271,6 +271,53 @@ list) > `--sender-token-file` > `AGENT_MAIL_SENDER_TOKEN` > persisted identity.
 with `am agents list --project "$PROJECT"`. Do not look for a broadcast flag;
 targeted delivery is the only supported path.
 
+### Send across project directories
+
+Use `--project` for the sender's directory and `--to-project` for the recipient's
+directory. Both projects must use the same Agent Mail service and shared mailbox
+storage; this does not route messages to another server. The destination project
+and every recipient must already be registered. Discover recipient names with
+`resource://agents/{destination_project}` or `am agents list --project`.
+
+```bash
+am mail send \
+  --project /abs/path/backend \
+  --to-project /abs/path/frontend \
+  --from BrownDove \
+  --to BlueLake \
+  --subject "API contract ready" \
+  --body "Please review the updated response fields." \
+  --ack-required
+```
+
+The equivalent MCP `send_message` arguments are:
+
+```json
+{
+  "project_key": "/abs/path/backend",
+  "to_project": "/abs/path/frontend",
+  "sender_name": "BrownDove",
+  "to": ["BlueLake"],
+  "subject": "API contract ready",
+  "body_md": "Please review the updated response fields.",
+  "ack_required": true
+}
+```
+
+The sender identity and `sender_token` belong to `project_key`. All `to`, `cc`,
+and `bcc` names resolve within `to_project`; omitting it keeps delivery within
+the sender's project. When contact enforcement is enabled, the recipient must
+have an `open` policy or an approved contact link from this sender in the source
+project. Cross-directory delivery does not infer permission from matching agent
+names, thread participation, or other local-project heuristics, and does not
+automatically request a contact handshake.
+
+The recipient calls `fetch_inbox` and `acknowledge_message` using the destination
+`project_key` and their own agent name. To reply, call `reply_message` with that
+same destination project, the delivered message ID, and the recipient as sender.
+With `to` omitted, the reply routes back to the original sender's directory.
+An explicit `to` list instead addresses agents in the replying sender's project.
+
 ## 11. Export a mailbox bundle for a collaborator [stateful]
 
 **Goal:** Produce a share bundle, preview it first, then export an encrypted

@@ -619,6 +619,7 @@ fn run_selftest_sequence_in_process(project_key: &str) -> WriteSelftestReport {
             None,
             None,
             None, // idempotency_key
+            None, // to_project
         )
         .await
         {

@@ -155,6 +155,7 @@ async fn send_with_key(
         None, // auto_contact_if_blocked
         None, // sender_token
         key.map(str::to_string),
+        None, // to_project
     )
     .await
 }

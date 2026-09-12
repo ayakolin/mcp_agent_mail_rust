@@ -445,6 +445,7 @@ fn format_direct_send_message_diagnostic(
         None,
         None,
         None, // idempotency_key
+        None, // to_project
     )) {
         Ok(payload) => format!("direct send_message unexpectedly succeeded: {payload}"),
         Err(error) => {

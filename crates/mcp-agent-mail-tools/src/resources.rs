@@ -6278,6 +6278,7 @@ mod resource_shape_tests {
                         None, // auto_contact_if_blocked
                         None, // sender_token
                         None, // idempotency_key
+                        None, // to_project
                     )
                     .await
                     .expect("send_message"),

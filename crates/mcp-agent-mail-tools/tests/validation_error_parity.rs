@@ -204,6 +204,7 @@ fn test_invalid_thread_id_message() {
             None,
             None,
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect_err("invalid thread_id should fail");
@@ -280,6 +281,7 @@ fn test_numeric_thread_id_reserved_message() {
             None,
             None,
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect_err("numeric thread_id should fail");
@@ -565,6 +567,7 @@ fn test_subject_truncation_at_200() {
             None,
             None,
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect("long subject should succeed with truncation");
@@ -615,6 +618,7 @@ fn test_subject_exactly_200_not_truncated() {
             None,
             None,
             None, // idempotency_key
+            None, // to_project
         )
         .await
         .expect("200-char subject should succeed without truncation");

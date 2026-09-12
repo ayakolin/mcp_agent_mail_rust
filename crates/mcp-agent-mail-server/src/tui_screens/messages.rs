@@ -1662,6 +1662,7 @@ impl MessageBrowserScreen {
             None,
             None,
             None, // idempotency_key
+            None, // to_project
         ));
 
         match result {

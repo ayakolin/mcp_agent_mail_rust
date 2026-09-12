@@ -1198,9 +1198,14 @@ async fn push_recipient(
     let agent = if let Some(existing) = recipient_map.get(&name_key) {
         existing.clone()
     } else {
-        let agent = match resolve_or_register_agent(ctx, pool, project_id, name, sender, config)
-            .await
-        {
+        // Cross-directory targets must be real registered recipients. Never
+        // create a lookalike identity in a different project's mailbox.
+        let resolved = if sender.project_id == project_id {
+            resolve_or_register_agent(ctx, pool, project_id, name, sender, config).await
+        } else {
+            resolve_agent(ctx, pool, project_id, name, project_slug, project_human_key).await
+        };
+        let agent = match resolved {
             Ok(a) => a,
             Err(e) => {
                 // Re-wrap NOT_FOUND as RECIPIENT_NOT_FOUND with Python-parity message.
@@ -1245,6 +1250,59 @@ async fn push_recipient(
     if !all_recipients.iter().any(|(id, _)| *id == agent_id) {
         all_recipients.push((agent_id, kind.to_string()));
         resolved_list.push(agent.name);
+    }
+    Ok(())
+}
+
+/// Cross-project approval is identity-bound. Local name/thread/reservation
+/// heuristics cannot establish shared scope across two directories.
+async fn enforce_cross_project_contacts(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    sender: &mcp_agent_mail_db::AgentRow,
+    recipients: &HashMap<String, mcp_agent_mail_db::AgentRow>,
+) -> McpResult<()> {
+    let (outgoing, incoming) = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_contacts(
+            ctx.cx(),
+            pool,
+            sender.project_id,
+            sender.id.unwrap_or(0),
+        )
+        .await,
+    )?;
+    let now = mcp_agent_mail_db::now_micros();
+    for recipient in recipients.values() {
+        let policy = recipient.contact_policy.to_ascii_lowercase();
+        if policy == "block_all" {
+            return Err(contact_blocked_error());
+        }
+        if policy == "open" {
+            continue;
+        }
+        let recipient_id = recipient.id.unwrap_or(0);
+        let approved = outgoing.iter().any(|link| {
+            link.b_project_id == recipient.project_id
+                && link.b_agent_id == recipient_id
+                && link.status == "approved"
+                && link.expires_ts.is_none_or(|ts| ts > now)
+        }) || incoming.iter().any(|link| {
+            link.a_project_id == recipient.project_id
+                && link.a_agent_id == recipient_id
+                && link.status == "approved"
+                && link.expires_ts.is_none_or(|ts| ts > now)
+        });
+        if !approved {
+            return Err(legacy_tool_error(
+                "CONTACT_REQUIRED",
+                format!(
+                    "Cross-project contact approval required for '{}'. Use request_contact with to_project, then have the recipient approve with respond_contact.",
+                    recipient.name
+                ),
+                true,
+                json!({"recipient": recipient.name, "to_project_id": recipient.project_id}),
+            ));
+        }
     }
     Ok(())
 }
@@ -1813,6 +1871,7 @@ pub struct ReplyMessageResponse {
 /// - `topic`: Optional 1-64 character case-insensitive topic tag
 /// - `auto_contact_if_blocked`: Auto-request contact if blocked (optional)
 /// - `sender_token`: Registration token for sender identity verification (optional by default; mandatory in the fail-closed profile)
+/// - `to_project`: Existing recipient project (absolute directory or slug); defaults to `project_key`.
 ///
 /// # Conformance
 /// Python-parity.
@@ -1822,7 +1881,7 @@ pub struct ReplyMessageResponse {
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
+    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior.\n\nCross-directory delivery\n------------------------\nto_project : Optional[str]\n    Destination project directory or slug on the same shared Agent Mail service.\n    Omit for delivery within project_key. This does not route to another server.\n    The sender identity and sender_token remain scoped to project_key; all to/cc/bcc\n    recipients resolve in to_project. The destination and recipients must already\n    be registered. Discover them using resource://agents/{to_project}.\n    With contact enforcement enabled, each recipient needs an open policy or an\n    approved cross-project contact link from this sender. Local name/thread\n    heuristics do not grant access, and no contact handshake is requested automatically.\n    Recipients fetch and acknowledge using the destination project. reply_message\n    without to routes back to the original sender's directory; explicit to stays\n    within the replying sender's project. CLI equivalent: am mail send --project\n    /abs/path/backend --to-project /abs/path/frontend --from GreenCastle --to BlueLake\n    --subject Plan --body 'Please review.'"
 )]
 pub async fn send_message(
     ctx: &McpContext,
@@ -1843,6 +1902,7 @@ pub async fn send_message(
     auto_contact_if_blocked: Option<bool>,
     sender_token: Option<String>,
     idempotency_key: Option<String>,
+    to_project: Option<String>,
 ) -> McpResult<String> {
     // Normalize names
     let sender_name = normalize_agent_name_or_original(sender_name);
@@ -1868,6 +1928,7 @@ pub async fn send_message(
             "send_message",
             &[
                 ("sender", sender_name.clone()),
+                ("to_project", to_project.clone().unwrap_or_default()),
                 ("to", sorted(&to)),
                 ("cc", sorted(cc.as_deref().unwrap_or(&[]))),
                 ("bcc", sorted(bcc.as_deref().unwrap_or(&[]))),
@@ -1986,13 +2047,9 @@ effective_free_bytes={free}"
     }
 
     let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
-    let project_id = project.id.unwrap_or(0);
-    let base_dir = Path::new(&project.human_key);
-
-    if let Some(ref tid) = thread_id {
-        validate_explicit_thread_id_for_send(ctx, &pool, project_id, tid).await?;
-    }
+    let source_project = resolve_project(ctx, &pool, &project_key).await?;
+    let source_project_id = source_project.id.unwrap_or(0);
+    let base_dir = Path::new(&source_project.human_key);
 
     // Validate attachment + total sizes with project-relative path resolution.
     validate_message_size_limits(
@@ -2007,10 +2064,10 @@ effective_free_bytes={free}"
     let sender = resolve_agent(
         ctx,
         &pool,
-        project_id,
+        source_project_id,
         &sender_name,
-        &project.slug,
-        &project.human_key,
+        &source_project.slug,
+        &source_project.human_key,
     )
     .await?;
     ensure_agent_accepts_new_messages(ctx, &pool, &sender).await?;
@@ -2026,6 +2083,26 @@ effective_free_bytes={free}"
         config.messaging_fail_closed_send_profile,
     )?;
 
+    // Resolve the destination only after verifying the source identity. An
+    // explicit destination must already exist: a typo must never mint a mailbox.
+    let project = match to_project.as_deref() {
+        Some(key) if key.trim().is_empty() => {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                "to_project must be an existing project directory or slug",
+                true,
+                json!({"field": "to_project"}),
+            ));
+        }
+        Some(key) => resolve_existing_project(ctx, &pool, key.trim()).await?,
+        None => source_project.clone(),
+    };
+    let project_id = project.id.unwrap_or(0);
+    let cross_project = source_project_id != project_id;
+    if let Some(ref tid) = thread_id {
+        validate_explicit_thread_id_for_send(ctx, &pool, project_id, tid).await?;
+    }
+
     // Self-send detection: warn if sender is sending to themselves (Python parity)
     {
         let sender_lower = sender_name.trim().to_ascii_lowercase();
@@ -2035,9 +2112,10 @@ effective_free_bytes={free}"
             .chain(bcc.iter().flatten())
             .map(String::as_str)
             .collect();
-        if all_named
-            .iter()
-            .any(|r| r.trim().to_ascii_lowercase() == sender_lower)
+        if !cross_project
+            && all_named
+                .iter()
+                .any(|r| r.trim().to_ascii_lowercase() == sender_lower)
         {
             tracing::warn!(
                 "[note] You ({sender_name}) are sending a message to yourself. \
@@ -2209,8 +2287,12 @@ effective_free_bytes={free}"
         tracing::debug!("Auto contact if blocked: {}", auto_contact);
     }
 
-    // Enforce contact policies (best-effort parity with legacy)
-    if config.contact_enforcement_enabled {
+    if config.contact_enforcement_enabled && cross_project {
+        enforce_cross_project_contacts(ctx, &pool, &sender, &recipient_map).await?;
+    }
+    // Same-project contact heuristics must never authorize a different
+    // directory merely because names, thread IDs, or file patterns coincide.
+    if config.contact_enforcement_enabled && !cross_project {
         let mut auto_ok_names: HashSet<String> = HashSet::new();
 
         if let Some(thread) = thread_id.as_deref() {
@@ -2519,7 +2601,7 @@ effective_free_bytes={free}"
     {
         let key = idempotency_key.as_deref().unwrap_or_default();
         let claim = mcp_agent_mail_db::IdempotencyClaim {
-            project_id,
+            project_id: source_project_id,
             tool: "send_message",
             key,
             fingerprint,
@@ -2661,6 +2743,8 @@ effective_free_bytes={free}"
             let msg_json = serde_json::json!({
                 "id": message_id,
                 "from": &sender.name,
+                "from_project": &source_project.human_key,
+                "from_project_slug": &source_project.slug,
                 "to": &resolved_to,
                 "cc": &resolved_cc_recipients,
                 "bcc": &resolved_bcc_recipients,
@@ -3055,12 +3139,30 @@ effective_free_bytes={free}"
 
     // Validate attachment + total sizes with project-relative path resolution,
     // matching send_message's enforcement (fail fast before processing).
+    let source_project = project;
+    let source_project_id = source_project.id.unwrap_or(0);
+    // An ordinary reply to incoming cross-directory mail returns to the
+    // original sender's home project. Explicit recipients remain local.
+    let project = if to.is_none() && original_sender.project_id != source_project_id {
+        db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_project_by_id(
+                ctx.cx(),
+                &pool,
+                original_sender.project_id,
+            )
+            .await,
+        )?
+    } else {
+        source_project.clone()
+    };
+    let project_id = project.id.unwrap_or(0);
+    let cross_project = source_project_id != project_id;
     validate_message_size_limits(
         config,
         &subject,
         &body_md,
         attachment_paths.as_deref(),
-        Some(Path::new(&project.human_key)),
+        Some(Path::new(&source_project.human_key)),
     )?;
 
     let embed_policy =
@@ -3079,7 +3181,7 @@ effective_free_bytes={free}"
         config,
         &project.slug,
         &project.human_key,
-        Path::new(&project.human_key),
+        Path::new(&source_project.human_key),
         &subject,
         &body_md,
         attachment_paths.as_deref(),
@@ -3243,7 +3345,10 @@ effective_free_bytes={free}"
         ));
     }
 
-    if config.contact_enforcement_enabled {
+    if config.contact_enforcement_enabled && cross_project {
+        enforce_cross_project_contacts(ctx, &pool, &sender, &recipient_map).await?;
+    }
+    if config.contact_enforcement_enabled && !cross_project {
         let mut auto_ok_names: HashSet<String> = HashSet::new();
 
         if !thread_id.is_empty() {
@@ -3478,7 +3583,7 @@ effective_free_bytes={free}"
     let (reply, idempotent_replay) = if let Some(fingerprint) = idempotency_fingerprint.as_deref() {
         let key = idempotency_key.as_deref().unwrap_or_default();
         let claim = mcp_agent_mail_db::IdempotencyClaim {
-            project_id,
+            project_id: source_project_id,
             tool: "reply_message",
             key,
             fingerprint,
@@ -3617,6 +3722,8 @@ effective_free_bytes={free}"
             let msg_json = serde_json::json!({
                 "id": reply_id,
                 "from": &sender.name,
+                "from_project": &source_project.human_key,
+                "from_project_slug": &source_project.slug,
                 "to": &resolved_to,
                 "cc": &resolved_cc_recipients,
                 "bcc": &resolved_bcc_recipients,
@@ -4930,6 +5037,385 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cross_project_send_roundtrip_and_identity_isolation() {
+        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("cross-project tempdir");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&database_path);
+        let storage_root = temp.path().join("archive");
+        let signals_root = temp.path().join("signals");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root.to_str().unwrap()),
+                ("CONTACT_ENFORCEMENT_ENABLED", "1"),
+                ("NOTIFICATIONS_ENABLED", "1"),
+                ("NOTIFICATIONS_SIGNALS_DIR", signals_root.to_str().unwrap()),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let pool = get_db_pool().expect("pool");
+                    let source = ensure_project_row(&cx, &pool, "/cross-directory/source").await;
+                    let target = ensure_project_row(&cx, &pool, "/cross-directory/target").await;
+                    let source_id = source.id.unwrap();
+                    let target_id = target.id.unwrap();
+                    // Identical names in distinct directories must stay distinct.
+                    let sender = register_agent_row(&cx, &pool, source_id, "BlueLake").await;
+                    let receiver = register_agent_row(&cx, &pool, target_id, "BlueLake").await;
+                    let observer = register_agent_row(&cx, &pool, source_id, "GreenStone").await;
+                    let send =
+                        async |destination: Option<String>, recipients: Vec<String>, key: &str| {
+                            send_message(
+                                &ctx,
+                                source.human_key.clone(),
+                                sender.name.clone(),
+                                recipients,
+                                "Cross-directory delivery".into(),
+                                "Hello from the source directory".into(),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some(true),
+                                Some("cross-directory-thread".into()),
+                                None,
+                                None,
+                                Some(false),
+                                sender.registration_token.clone(),
+                                Some(key.into()),
+                                destination,
+                            )
+                            .await
+                        };
+                    let blocked = send(
+                        Some(target.human_key.clone()),
+                        vec![receiver.name.clone()],
+                        "delivery",
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(blocked.data.unwrap()["error"]["type"], "CONTACT_REQUIRED");
+                    let missing = send(
+                        Some("/cross-directory/missing".into()),
+                        vec![receiver.name.clone()],
+                        "missing",
+                    )
+                    .await;
+                    assert!(missing.is_err(), "unknown destination must not be created");
+                    assert!(
+                        resolve_existing_project(&ctx, &pool, "/cross-directory/missing")
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        send(Some("  ".into()), vec![receiver.name.clone()], "empty")
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        send(Some(target.human_key.clone()), vec![], "empty-recipient")
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        send(
+                            Some(target.human_key.clone()),
+                            vec!["RedFox".into()],
+                            "missing-recipient"
+                        )
+                        .await
+                        .is_err()
+                    );
+                    assert!(
+                        queries::get_agent(&cx, &pool, target_id, "RedFox")
+                            .await
+                            .into_result()
+                            .is_err()
+                    );
+
+                    queries::request_contact(
+                        &cx,
+                        &pool,
+                        source_id,
+                        sender.id.unwrap(),
+                        target_id,
+                        receiver.id.unwrap(),
+                        "cross-directory",
+                        3600,
+                    )
+                    .await
+                    .into_result()
+                    .expect("request contact");
+                    queries::respond_contact(
+                        &cx,
+                        &pool,
+                        source_id,
+                        sender.id.unwrap(),
+                        target_id,
+                        receiver.id.unwrap(),
+                        true,
+                        3600,
+                    )
+                    .await
+                    .into_result()
+                    .expect("approve contact");
+                    let delivery: Value = serde_json::from_str(
+                        &send(
+                            Some(target.human_key.clone()),
+                            vec![receiver.name.clone()],
+                            "delivery",
+                        )
+                        .await
+                        .expect("cross-project send"),
+                    )
+                    .unwrap();
+                    let payload = &delivery["deliveries"][0]["payload"];
+                    let message_id = payload["id"].as_i64().unwrap();
+                    assert_eq!(payload["project_id"], target_id);
+                    assert_eq!(payload["sender_id"], sender.id.unwrap());
+                    assert_eq!(delivery["deliveries"][0]["project"], target.human_key);
+                    let retried: Value = serde_json::from_str(
+                        &send(
+                            Some(target.human_key.clone()),
+                            vec![receiver.name.clone()],
+                            "delivery",
+                        )
+                        .await
+                        .expect("retry"),
+                    )
+                    .unwrap();
+                    assert_eq!(retried["deliveries"][0]["payload"]["id"], message_id);
+                    assert_eq!(retried["idempotent_replay"], true);
+                    let conflict = send(None, vec![sender.name.clone()], "delivery")
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        conflict.data.unwrap()["error"]["type"],
+                        "IDEMPOTENCY_KEY_CONFLICT"
+                    );
+
+                    let inbox: Value = serde_json::from_str(
+                        &fetch_inbox(
+                            &ctx,
+                            target.human_key.clone(),
+                            receiver.name.clone(),
+                            None,
+                            None,
+                            None,
+                            Some(true),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                        )
+                        .await
+                        .expect("destination inbox"),
+                    )
+                    .unwrap();
+                    assert_eq!(inbox.as_array().unwrap().len(), 1);
+                    assert_eq!(inbox[0]["id"], message_id);
+                    assert_eq!(inbox[0]["body_md"], "Hello from the source directory");
+                    let events: Value = serde_json::from_str(
+                        &fetch_inbox_events(
+                            &ctx,
+                            target.human_key.clone(),
+                            receiver.name.clone(),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect("destination delivery events"),
+                    )
+                    .unwrap();
+                    assert_eq!(events["events"].as_array().unwrap().len(), 1);
+                    assert_eq!(events["events"][0]["message_id"], message_id);
+                    let receipt: Value = serde_json::from_str(
+                        &get_message_delivery_receipt(&ctx, target.human_key.clone(), message_id)
+                            .await
+                            .expect("delivery receipt"),
+                    )
+                    .unwrap();
+                    assert_eq!(receipt["recipients"][0]["signaled"], true);
+                    assert!(
+                        queries::fetch_inbox(
+                            &cx,
+                            &pool,
+                            source_id,
+                            sender.id.unwrap(),
+                            false,
+                            None,
+                            10
+                        )
+                        .await
+                        .into_result()
+                        .unwrap()
+                        .is_empty()
+                    );
+                    let ack: Value = serde_json::from_str(
+                        &acknowledge_message(
+                            &ctx,
+                            target.human_key.clone(),
+                            receiver.name.clone(),
+                            message_id,
+                            None,
+                        )
+                        .await
+                        .expect("destination ack"),
+                    )
+                    .unwrap();
+                    assert_eq!(ack["acknowledged"], true);
+
+                    // A real reply returns to the original directory with the
+                    // original sender ID, even though the names are identical.
+                    let reply: Value = serde_json::from_str(
+                        &reply_message(
+                            &ctx,
+                            target.human_key.clone(),
+                            message_id,
+                            receiver.name.clone(),
+                            "Reply from target".into(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            receiver.registration_token.clone(),
+                            Some("reply".into()),
+                        )
+                        .await
+                        .expect("cross-project reply"),
+                    )
+                    .unwrap();
+                    assert_eq!(reply["project_id"], source_id);
+                    assert_eq!(reply["sender_id"], receiver.id.unwrap());
+                    assert_eq!(reply["thread_id"], "cross-directory-thread");
+                    let source_inbox = queries::fetch_inbox(
+                        &cx,
+                        &pool,
+                        source_id,
+                        sender.id.unwrap(),
+                        false,
+                        None,
+                        10,
+                    )
+                    .await
+                    .into_result()
+                    .unwrap();
+                    assert_eq!(source_inbox.len(), 1);
+                    assert_eq!(source_inbox[0].message.body_md, "Reply from target");
+                    queries::set_agent_contact_policy(
+                        &cx,
+                        &pool,
+                        receiver.id.unwrap(),
+                        "block_all",
+                    )
+                    .await
+                    .into_result()
+                    .expect("block target");
+                    assert!(
+                        send(
+                            Some(target.slug.clone()),
+                            vec![receiver.name.clone()],
+                            "blocked-after-approval"
+                        )
+                        .await
+                        .is_err(),
+                        "approved same-name contact cannot bypass block_all"
+                    );
+                    assert!(
+                        queries::fetch_inbox(
+                            &cx,
+                            &pool,
+                            source_id,
+                            observer.id.unwrap(),
+                            false,
+                            None,
+                            10
+                        )
+                        .await
+                        .into_result()
+                        .unwrap()
+                        .is_empty()
+                    );
+                    // The unrelated source project cannot reply to the target's
+                    // original message by guessing its global ID.
+                    assert!(
+                        reply_message(
+                            &ctx,
+                            source.human_key.clone(),
+                            message_id,
+                            observer.name.clone(),
+                            "Out of scope".into(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            observer.registration_token.clone(),
+                            None,
+                        )
+                        .await
+                        .is_err()
+                    );
+
+                    let conn =
+                        mcp_agent_mail_db::DbConn::open_file(database_path.to_str().unwrap())
+                            .unwrap();
+                    queries::set_agent_contact_policy(
+                        &cx,
+                        &pool,
+                        receiver.id.unwrap(),
+                        "contacts_only",
+                    )
+                    .await
+                    .into_result()
+                    .expect("restore target policy");
+                    conn.execute_sync("UPDATE agent_links SET expires_ts = 0", &[])
+                        .expect("expire approval");
+                    assert!(
+                        send(
+                            Some(target.slug.clone()),
+                            vec![receiver.name.clone()],
+                            "expired-approval"
+                        )
+                        .await
+                        .is_err(),
+                        "expired contacts must not authorize delivery"
+                    );
+                    let rows = conn
+                        .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                        .unwrap();
+                    assert_eq!(
+                        rows[0].get_named::<i64>("n").unwrap(),
+                        2,
+                        "exactly one send and reply are durable"
+                    );
+                    assert!(mcp_agent_mail_storage::archive_backlog_flush_blocking(
+                        std::time::Duration::from_secs(15)
+                    ));
+                    mcp_agent_mail_storage::wbq_flush();
+                    mcp_agent_mail_storage::flush_async_commits();
+                });
+            },
+        );
+    }
+
+    #[test]
     fn fetch_inbox_live_read_receipts_preserve_peek_and_ack_state() {
         let temp = tempfile::tempdir().expect("inbox receipt tempdir");
         let database_path = temp.path().join("storage.sqlite3");
@@ -5118,6 +5604,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None, // to_project
                     )
                     .await
                     .expect("send_message should return at the storage commit");
@@ -5321,6 +5808,7 @@ mod tests {
                         None,
                         None,
                         None, // idempotency_key
+                        None, // to_project
                     )
                     .await
                     .expect("multi-recipient send after replacement");
