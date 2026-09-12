@@ -10,16 +10,16 @@ external package dependencies.
 | Client | Adapter | Launch |
 | --- | --- | --- |
 | Oh My Pi / OMP | Native extension, idle-gated `sendMessage` | `omp` |
-| Codex | Managed App Server plus native remote TUI | `codex-mail` |
+| Codex | SessionStart queue listener on ordinary `codex`; managed App Server remains available | `codex` / `codex-mail` |
 | Claude Code | Local MCP Channel plus native TUI | `claude-mail` |
 | Kimi Code | Managed Web/API session | `kimi-mail` |
 | Grok Build | Managed ACP session (`grok agent stdio`) | `grok-mail` |
 | OpenCode | Managed headless server session (`opencode serve`) | `opencode-mail` |
 
-A configured MCP connection alone does not automatically wake a client. These
-integrations do not take over arbitrary already-running sessions; the Grok and
-OpenCode adapters own a managed session (ACP or headless server) rather than
-attaching to a live native TUI.
+A configured MCP connection alone does not automatically wake a client. Ordinary
+`codex` sessions attach after the installer writes a SessionStart hook and the
+hook is trusted in `/hooks`. Grok and OpenCode still own a managed session
+rather than attaching to a live native TUI.
 
 ## Install
 
@@ -43,7 +43,8 @@ node integrations/agent-mail-wake/install.mjs --clients omp,codex
 
 The installer creates launchers under `~/.local/bin`, copies runtime sources into
 `~/.local/share/agent-mail/wake` (using `XDG_DATA_HOME` when set), installs an OMP
-entry point and/or registers the Claude Channel, and adds missing `mcp_agent_mail`
+entry point and/or registers the Claude Channel, adds a Codex SessionStart/
+SessionEnd hook to `~/.codex/config.toml`, and adds missing `mcp_agent_mail`
 entries to the selected clients. Existing Agent Mail entries and unrelated
 configuration are preserved. Originals are backed up before replacement.
 Ensure the launcher directory is on your `PATH`.
@@ -80,8 +81,10 @@ agent-mail-wake resume LISTENER_ID
 
 Claude's custom Channel uses its development-channel startup flag and requires the
 client's local-channel confirmation. Plain `claude` keeps the added Channel MCP
-server passive. Kimi prints its Web UI URL and uses the existing `server.token`;
-its adapter does not attach to an unrelated live Kimi TUI.
+server passive. Ordinary `codex` attaches through the installed SessionStart hook
+and `codex queue`; trust the hook in `/hooks` before it can run. `codex-mail`
+remains the managed App Server path. Kimi prints its Web UI URL and uses the
+existing `server.token`; its adapter does not attach to an unrelated live Kimi TUI.
 
 Grok runs headless: `grok-mail` owns a `grok agent --always-approve -m MODEL stdio`
 process and prompts its ACP session per batch (`--session ID` reuses a stored
@@ -95,11 +98,12 @@ Default polling is 3 seconds, with at most 5 events per batch and a pause after 
 automatic deliveries. The polling itself does not invoke a model. Configure with
 `AGENT_MAIL_WAKE_INTERVAL_MS` and `AGENT_MAIL_WAKE_MAX_TURNS`.
 Deliveries are injected into a running turn, not deferred until the session goes
-idle: OMP uses `deliverAs: "aside"` (next step boundary), Codex uses the App
-Server's `turn/steer`, Kimi submits to the prompt queue and immediately steers it
-into the active turn (`prompts:steer`), OpenCode posts with `delivery: "steer"`,
-and Claude receives channel notifications natively. Only error-state sessions (or
-a brief non-steerable review/compact turn on Codex) still defer delivery.
+idle: OMP uses `deliverAs: "aside"` (next step boundary), a hooked Codex session
+uses `codex queue`, `codex-mail` uses the App Server's `turn/steer`, Kimi submits
+to the prompt queue and immediately steers it into the active turn (`prompts:steer`),
+OpenCode posts with `delivery: "steer"`, and Claude receives channel notifications
+natively. Only error-state sessions (or a brief non-steerable review/compact turn
+on a managed Codex App Server) still defer delivery.
 See the Chinese guide for full session-resume commands and lifecycle details.
 
 ## Persistence and delivery limits
@@ -133,7 +137,8 @@ source-only import of the original local integration.
 | `common.mjs` | Mail protocol, identities, batching, durable cursor and pause controls |
 | `omp.mjs` | OMP extension lifecycle and incoming-message delivery |
 | `claude-channel.mjs` | Claude's stdio MCP Channel and control tools |
-| `rpc.mjs` | Codex App Server, Kimi Server API, Grok ACP, and OpenCode adapters |
+| `codex-hook.mjs` | Codex SessionStart/SessionEnd hook: attach or stop a queue listener |
+| `rpc.mjs` | Codex App Server, Codex queue, Kimi Server API, Grok ACP, and OpenCode adapters |
 | `cli.mjs` | Shared launcher, session binding, status and lifecycle commands |
 | `install.mjs` | Portable installer for sources, launchers and client config |
 | `test/` | Behavioral watcher/adapter tests and real filesystem installation tests |

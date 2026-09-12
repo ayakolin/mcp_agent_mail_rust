@@ -73,6 +73,29 @@ until the model consumes it, so a steer accepted immediately before a watcher
 crash can be re-steered once on restart; the batch prompt instructs the model
 to process each message once.
 
+
+## Codex in-session queue wake (2026-09-12)
+
+Ordinary `codex` (not `codex-mail`) previously had MCP tools but no MailWatcher.
+The installer now writes a SessionStart/SessionEnd hook that attaches
+`codex-mail attach --session <id>` and delivers via `codex queue --thread`.
+
+Verified on this machine against Codex 0.154.0:
+
+- `codex queue --thread <live-or-historical-id> --message …` returns
+  `Queued message <id> for thread <thread>` when a rollout exists.
+- `codex queue list` is not a CLI surface on 0.154.0; replay suppression uses
+  the local delivered ledger plus rollout marker scan.
+- `codex-mail --session <already-open TUI thread>` still fails with
+  `thread-store conflict: already has an active writer`. The queue path is the
+  in-session attach; App Server remains for dedicated `codex-mail` sessions.
+- Node tests cover installer hook merge/idempotence, queue adapter replay, and
+  hook spawn/opt-out/SessionEnd behavior. Live SessionStart attach still
+  requires the user to trust the hook in `/hooks`.
+
+Claude, Kimi, Grok, and OpenCode still need their dedicated launchers. OMP
+already attaches inside ordinary interactive sessions.
+
 ## Mid-turn delivery for Kimi, OpenCode and OMP (2026-09-07)
 
 The remaining idle-gated adapters were moved to mid-turn injection and verified

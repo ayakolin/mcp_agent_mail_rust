@@ -11,10 +11,10 @@ Agent Mail 原本提供邮箱、收发信和持久化；这里新增的监听器
 | 客户端 | 新增内容 | 启动方式 |
 | --- | --- | --- |
 | OMP / Oh My Pi | 原生扩展；自动注册身份；空闲时通过 `sendMessage` 触发回复 | `omp` |
-| Codex | App Server 会话启动器；通过 `turn/start` 投递 | `codex-mail` |
+| Codex | 普通 `codex` 由 SessionStart 钩子挂上 `codex queue` 监听器；`codex-mail` 仍管理独立 App Server | `codex` / `codex-mail` |
 | Claude Code | 本地 MCP Channel；将收件事件推送到原生终端 | `claude-mail` |
 | Kimi Code | Web/API 会话启动器；提交幂等提示并绑定已配置的默认模型 | `kimi-mail` |
-| Grok Build | 本 fork 尚无自动唤醒适配 | — |
+| Grok Build | ACP 无头会话启动器 | `grok-mail` |
 
 新增源码、安装程序和测试集中在 **[integrations/agent-mail-wake/](integrations/agent-mail-wake/)**。
 服务端 Rust 代码、上游发布流程和原有协议保持上游版本。
@@ -36,7 +36,8 @@ node integrations/agent-mail-wake/install.mjs
 默认服务地址为 `http://127.0.0.1:8765/mcp/`。
 现有 MCP 服务配置和身份认证设置会保留。
 
-然后在同一项目目录的不同终端分别启动 `omp`、`codex-mail`、`claude-mail` 或 `kimi-mail`。
+然后在同一项目目录分别启动 `omp`、普通 `codex`（安装并信任 SessionStart 钩子后）、
+`codex-mail`、`claude-mail` 或 `kimi-mail`。
 Kimi 使用启动器显示的 Web 页面。运行 `agent-mail-wake list` 查看自动注册的邮箱名称，
 让 Agent 给目标邮箱发送消息即可。无需再为同一会话注册第二个身份。
 

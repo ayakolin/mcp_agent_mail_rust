@@ -8,7 +8,7 @@ import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { MailClient, MailWatcher, STATE_ROOT, DATA_ROOT, listStates, readJson, saveJson, projectPath, identityInstructions, sleep, errorText } from './common.mjs';
-import { CodexRPC, CodexAdapter, KimiAdapter, GrokACP, OpenCodeAdapter } from './rpc.mjs';
+import { CodexRPC, CodexAdapter, CodexQueueAdapter, KimiAdapter, GrokACP, OpenCodeAdapter } from './rpc.mjs';
 
 const children = new Set(); let watcher, rpc, stopping = false;
 function child(command, args, options = {}) {
@@ -184,7 +184,34 @@ async function opencodeMain(options) {
   watcher.start();
 }
 function usage() {
-  console.log(`Agent Mail Wake\n\nagent-mail-wake list\nagent-mail-wake pause|resume <listener-id>\nagent-mail-wake doctor\ncodex-mail [--project DIR] [--session ID] [--headless] [-- native flags]\nclaude-mail [--project DIR] [--session ID] [-- native flags]\nkimi-mail [--project DIR] [--server URL --session ID]\ngrok-mail [--project DIR] [--session ID] [--model ID]\nopencode-mail [--project DIR] [--session ID] [--model provider/model]\n\nOMP: automatically enabled in new interactive sessions; /mail-wake status|pause|resume\nGrok Build: managed ACP session (grok agent stdio); approvals run always-approve.`);
+  console.log(`Agent Mail Wake\n\nagent-mail-wake list\nagent-mail-wake pause|resume <listener-id>\nagent-mail-wake doctor\ncodex-mail [--project DIR] [--session ID] [--headless] [-- native flags]\ncodex-mail attach --session ID [--project DIR]\nclaude-mail [--project DIR] [--session ID] [-- native flags]\nkimi-mail [--project DIR] [--server URL --session ID]\ngrok-mail [--project DIR] [--session ID] [--model ID]\nopencode-mail [--project DIR] [--session ID] [--model provider/model]\n\nOMP: automatically enabled in new interactive sessions; /mail-wake status|pause|resume\nCodex: a SessionStart hook attaches a queue listener to ordinary \`codex\` sessions after the hook is trusted; \`codex-mail\` still owns a managed App Server.\nClaude: start \`claude-mail\` to enable the Channel listener. Plain \`claude\` keeps the Channel MCP passive.\nGrok Build: managed ACP session (grok agent stdio); approvals run always-approve.`);
+}
+export async function attachCodexSession({ session, project }) {
+  if (!session) throw new Error('codex attach requires --session');
+  const cwd = projectPath(project);
+  const seen = new Set();
+  let persist = () => {};
+  const adapter = new CodexQueueAdapter(session, cwd, { seen, persist: () => persist() });
+  watcher = new MailWatcher({ host: 'codex', session, project: cwd,
+    canDeliver: () => adapter.canDeliver(), deliver: (text, batch) => adapter.deliver(text, batch), onStatus: report });
+  const bindingFile = path.join(DATA_ROOT, 'bindings', `${watcher.id}.json`);
+  for (const id of readJson(bindingFile, {}).delivered || []) seen.add(id);
+  persist = () => saveJson(bindingFile, {
+    host: 'codex', delivery: 'queue', session, project: cwd,
+    agent: watcher.state?.agent, delivered: [...seen].slice(-64),
+  });
+  try {
+    await watcher.init();
+  } catch (error) {
+    if (/already running/.test(errorText(error))) {
+      process.stderr.write(`[Agent Mail] Codex session ${session} already has a listener\n`);
+      watcher = undefined;
+      return;
+    }
+    throw error;
+  }
+  persist();
+  process.stderr.write(`[Agent Mail] attached Codex session ${session} mailbox=${watcher.state.agent} id=${watcher.id}\n${identityInstructions(watcher.state)}\n`);
 }
 export async function main(args = process.argv.slice(2)) {
   const command = args.shift();
@@ -200,8 +227,12 @@ export async function main(args = process.argv.slice(2)) {
   }
   if (command === 'doctor') {
     const client = new MailClient(); await client.call('health_check');
-    console.log('Agent Mail: healthy\nAdapters: OMP extension, Codex App Server, Claude channel, Kimi Server API, Grok ACP agent, OpenCode headless server\n');
+    console.log('Agent Mail: healthy\nAdapters: OMP extension, Codex App Server, Codex SessionStart queue, Claude channel, Kimi Server API, Grok ACP agent, OpenCode headless server\n');
     return console.log(JSON.stringify(listStates(), null, 2));
+  }
+  if (command === 'codex' && args[0] === 'attach') {
+    const options = parse(args.slice(1)); if (options.help) return usage();
+    return attachCodexSession(options);
   }
   const options = parse(args); if (options.help) return usage();
   if (command === 'codex') return codexMain(options);

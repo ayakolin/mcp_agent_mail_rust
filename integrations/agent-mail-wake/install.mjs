@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 
 const SOURCE = path.dirname(fileURLToPath(import.meta.url));
 const CLIENTS = ['omp', 'codex', 'claude', 'kimi', 'grok', 'opencode'];
-const FILES = ['common.mjs', 'rpc.mjs', 'omp.mjs', 'claude-channel.mjs', 'cli.mjs',
+const FILES = ['common.mjs', 'rpc.mjs', 'omp.mjs', 'claude-channel.mjs', 'cli.mjs', 'codex-hook.mjs',
   'package.json', 'install.mjs', 'README.md', 'README.zh-CN.md'];
 const ENDPOINT = 'http://127.0.0.1:8765/mcp/';
 export const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
@@ -46,6 +46,32 @@ function mailEntry(data, entry) {
   if (!data.mcpServers || Array.isArray(data.mcpServers) || typeof data.mcpServers !== 'object') throw new Error('mcpServers must be an object');
   // Preserve existing credentials, server choices, and disabled-server decisions.
   data.mcpServers.mcp_agent_mail ??= entry;
+}
+export function mergeCodexHooks(before, command) {
+  const block = `# agent-mail-wake managed hooks
+[[hooks.SessionStart]]
+matcher = "startup|resume"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = ${JSON.stringify(command)}
+async = true
+timeout = 30
+statusMessage = "Agent Mail auto-wake"
+
+[[hooks.SessionEnd]]
+
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = ${JSON.stringify(command)}
+timeout = 3
+# end agent-mail-wake hook block
+`;
+  let text = before || '';
+  text = text.replace(/\n*# agent-mail-wake managed SessionStart hook[\s\S]*?statusMessage = "Agent Mail auto-wake"\n?/, '\n');
+  text = text.replace(/\n*# agent-mail-wake managed hooks[\s\S]*?# end agent-mail-wake (?:hook block|managed hooks)\n?/, '\n');
+  text = text.replace(/\s+$/, '');
+  return text ? `${text}\n\n${block}` : block;
 }
 
 export function installationPlan(options = {}) {
@@ -102,8 +128,9 @@ export function installationPlan(options = {}) {
     const dir = !customHome && process.env.CODEX_HOME ? process.env.CODEX_HOME : path.join(home, '.codex');
     const file = path.join(dir, 'config.toml'), before = contents(file);
     const table = /^\s*\[\s*mcp_servers\s*\.\s*(?:mcp_agent_mail|"mcp_agent_mail"|'mcp_agent_mail')\s*(?:\.|\])/m;
-    const after = before && table.test(before) ? before
+    let after = before && table.test(before) ? before
       : `${before || ''}${before?.endsWith('\n') ? '' : '\n'}\n[mcp_servers.mcp_agent_mail]\nurl = ${JSON.stringify(url)}\n${token ? `http_headers = { Authorization = ${JSON.stringify(`Bearer ${token}`)} }\n` : ''}`;
+    after = mergeCodexHooks(after, `${process.execPath} ${path.join(prefix, 'codex-hook.mjs')}`);
     changes.push({ file, before, after, mode: 0o600 });
   }
   if (clients.includes('claude')) {

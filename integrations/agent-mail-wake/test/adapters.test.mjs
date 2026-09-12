@@ -1,6 +1,9 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CodexAdapter, KimiAdapter } from '../rpc.mjs';
+import { CodexAdapter, CodexQueueAdapter, sessionHistoryHas, KimiAdapter } from '../rpc.mjs';
 
 test('Codex steers mail into an active turn instead of waiting for idle', async () => {
   const turn = { id: 'turn-1', status: 'inProgress', items: [] };
@@ -72,6 +75,42 @@ test('Codex refuses delivery while the thread is in an error state', async () =>
   const adapter = new CodexAdapter(rpc, 'thread');
   assert.equal(await adapter.canDeliver(), false);
   await assert.rejects(adapter.deliver('text', { id: 'batch' }), /systemError/);
+});
+
+test('Codex queue adapter queues once and reconciles by marker or ledger', async () => {
+  const calls = [];
+  const runner = async (command, args) => { calls.push({ command, args }); return { code: 0, stdout: 'Queued message x', stderr: '' }; };
+  const seen = new Set();
+  const persisted = [];
+  const adapter = new CodexQueueAdapter('thread-1', '/tmp', {
+    runner, seen, persist: () => persisted.push([...seen]), history: () => false,
+  });
+  assert.deepEqual(await adapter.deliver('[Agent Mail delivery b1]\nhello', { id: 'b1' }), { queued: true });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args, ['queue', '--thread', 'thread-1', '--message', '[Agent Mail delivery b1]\nhello']);
+  assert.deepEqual(await adapter.deliver('[Agent Mail delivery b1]\nhello', { id: 'b1' }), { alreadyAccepted: true });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(persisted, [['b1']]);
+});
+
+test('Codex queue adapter treats history hits as already accepted', async () => {
+  let queued = 0;
+  const adapter = new CodexQueueAdapter('thread-1', '/tmp', {
+    runner: async () => { queued++; return { code: 0, stdout: '', stderr: '' }; },
+    history: (_id, marker) => marker.includes('b2'),
+  });
+  assert.deepEqual(await adapter.deliver('[Agent Mail delivery b2]\nhello', { id: 'b2' }), { alreadyAccepted: true });
+  assert.equal(queued, 0);
+});
+
+test('sessionHistoryHas scans rollout files for the delivery marker', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-history-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const nested = path.join(dir, '2026', '09', '12');
+  fs.mkdirSync(nested, { recursive: true });
+  fs.writeFileSync(path.join(nested, 'rollout-01abc.jsonl'), 'noise\n[Agent Mail delivery batch-9]\n');
+  assert.equal(sessionHistoryHas('01abc', '[Agent Mail delivery batch-9]', dir), true);
+  assert.equal(sessionHistoryHas('01abc', '[Agent Mail delivery missing]', dir), false);
 });
 
 test('Kimi submits with a stable prompt ID and steers the queue into the active turn', async () => {

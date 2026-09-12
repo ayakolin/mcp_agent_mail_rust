@@ -1,6 +1,10 @@
 import { EventEmitter } from 'node:events';
 import { createInterface } from 'node:readline';
 import { localUrl } from './common.mjs';
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 export class CodexRPC extends EventEmitter {
   constructor(url) { super(); this.url = localUrl(url); this.pending = new Map(); this.counter = 0; }
@@ -90,6 +94,55 @@ export class CodexAdapter {
       throw new Error(`Codex thread is ${status || 'unavailable'}; delivery remains pending`);
     }
     throw new Error('Codex turn state kept changing; delivery remains pending');
+  }
+}
+
+function spawnResult(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], ...options });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
+  });
+}
+
+function queueOutput(result) {
+  return `${result.stdout || ''}\n${result.stderr || ''}`.trim();
+}
+
+export function sessionHistoryHas(session, marker, root = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions')) {
+  if (!session || !fs.existsSync(root)) return false;
+  for (const file of fs.globSync(`**/*${session}*.jsonl`, { cwd: root })) {
+    try { if (fs.readFileSync(path.join(root, file), 'utf8').includes(marker)) return true; } catch { /* ignore unreadable rollouts */ }
+  }
+  return false;
+}
+
+export class CodexQueueAdapter {
+  constructor(session, cwd, { runner = spawnResult, seen, persist, history } = {}) {
+    this.session = session; this.cwd = cwd; this.runner = runner;
+    this.seen = seen || new Set(); this.persist = persist || (() => {});
+    this.history = history || ((id, marker) => sessionHistoryHas(id, marker));
+  }
+  async canDeliver() { return true; }
+  async deliver(text, batch) {
+    const marker = `[Agent Mail delivery ${batch.id}]`;
+    if (this.seen.has(batch.id) || this.history(this.session, marker)) return { alreadyAccepted: true };
+    const queued = await this.runner('codex', ['queue', '--thread', this.session, '--message', text], { cwd: this.cwd });
+    if (queued.code === 0) {
+      this.seen.add(batch.id);
+      this.persist();
+      return { queued: true };
+    }
+    const detail = queueOutput(queued) || `codex queue exited ${queued.code}`;
+    if (/already|duplicate|exists/i.test(detail)) {
+      this.seen.add(batch.id);
+      this.persist();
+      return { alreadyAccepted: true };
+    }
+    throw new Error(detail);
   }
 }
 

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { installationPlan, applyInstallation } from '../install.mjs';
+import { installationPlan, applyInstallation, mergeCodexHooks } from '../install.mjs';
 
 function sandbox(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-mail-wake-install-'));
@@ -22,6 +22,7 @@ test('dry run describes a complete installation without creating a home director
   const plan = installationPlan({ home });
   const result = applyInstallation(plan, { dryRun: true });
   assert.ok(result.changed.some(file => file.endsWith('codex-mail')));
+  assert.ok(result.changed.some(file => file.endsWith('codex-hook.mjs')));
   assert.ok(result.changed.some(file => file.endsWith('index.ts')));
   assert.equal(fs.existsSync(home), false);
 });
@@ -41,7 +42,10 @@ test('install preserves existing configuration, backs up originals and runs quot
   assert.deepEqual(read(claudeFile).mcpServers.existing, original.mcpServers.existing);
   assert.equal(read(claudeFile).userPreference, 'keep');
   assert.equal(read(claudeFile).mcpServers.agent_mail_wake.env.AGENT_MAIL_URL, 'http://127.0.0.1:9123/mcp/');
-  assert.ok(fs.readFileSync(codexFile, 'utf8').startsWith(toml));
+  const installedCodex = fs.readFileSync(codexFile, 'utf8');
+  assert.ok(installedCodex.startsWith(toml));
+  assert.match(installedCodex, /agent-mail-wake managed hooks/);
+  assert.match(installedCodex, /\[\[hooks\.SessionStart\]\]/);
   assert.deepEqual(read(ompFile).disabledServers, ['existing']);
   const manifest = read(path.join(result.backup, 'manifest.json'));
   const savedClaude = manifest.find(entry => entry.file === claudeFile);
@@ -79,7 +83,11 @@ test('existing Agent Mail credentials and quoted TOML tables remain intact', t =
   const kimi = { mcpServers: { mcp_agent_mail: { url: 'http://127.0.0.1:9100/mcp/', bearerTokenEnvVar: 'EXISTING_TOKEN', enabled: false } } };
   write(kimiFile, kimi);
   applyInstallation(installationPlan({ home, clients: ['codex', 'kimi'] }));
-  assert.equal(fs.readFileSync(file, 'utf8'), original);
+  const installed = fs.readFileSync(file, 'utf8');
+  assert.ok(installed.startsWith(original));
+  assert.match(installed, /bearer_token_env_var = "EXISTING_TOKEN"/);
+  assert.match(installed, /agent-mail-wake managed hooks/);
+  assert.equal(installed, mergeCodexHooks(original, `${process.execPath} ${path.join(home, '.local', 'share', 'agent-mail', 'wake', 'codex-hook.mjs')}`));
   assert.deepEqual(read(kimiFile), kimi);
 });
 
@@ -102,6 +110,19 @@ test('grok, opencode and codex entries embed the discovered bearer token once', 
     assert.match(launcher.stdout, /Agent Mail Wake/);
   }
   assert.deepEqual(applyInstallation(installationPlan({ home, clients: ['grok', 'opencode', 'codex'] })).changed, []);
+});
+
+test('codex hook install is idempotent and keeps existing MCP tables', t => {
+  const { home } = sandbox(t);
+  const file = path.join(home, '.codex', 'config.toml');
+  write(file, 'model = "keep"\n');
+  applyInstallation(installationPlan({ home, clients: ['codex'] }));
+  const first = fs.readFileSync(file, 'utf8');
+  assert.match(first, /\[\[hooks\.SessionStart\]\]/);
+  assert.match(first, /\[\[hooks\.SessionEnd\]\]/);
+  assert.equal(first.split('agent-mail-wake managed hooks').length - 1, 1);
+  applyInstallation(installationPlan({ home, clients: ['codex'] }));
+  assert.equal(fs.readFileSync(file, 'utf8'), first);
 });
 
 test('unrelated launchers and concurrent config edits are not overwritten', t => {

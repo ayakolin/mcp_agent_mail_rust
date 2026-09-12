@@ -42,7 +42,7 @@ node integrations/agent-mail-wake/install.mjs --clients omp,codex,claude
 | 客户端 | 安装位置 |
 | --- | --- |
 | OMP | `~/.omp/agent/extensions/agent-mail-wake/index.ts` 和 `~/.omp/agent/mcp.json` |
-| Codex | `~/.codex/config.toml` 中缺失的 Agent Mail 连接，以及 `codex-mail` |
+| Codex | `~/.codex/config.toml` 中缺失的 Agent Mail 连接、SessionStart 钩子，以及 `codex-mail` |
 | Claude Code | `~/.claude.json` 中的 Agent Mail 连接和 `agent_mail_wake` Channel，以及 `claude-mail` |
 | Kimi Code | `~/.kimi-code/mcp.json` 中缺失的连接，以及 `kimi-mail` |
 | Grok Build | `~/.grok/config.toml` 中缺失的 Agent Mail 连接，以及 `grok-mail` |
@@ -73,7 +73,7 @@ node integrations/agent-mail-wake/install.mjs --clients omp,codex,claude
 | 客户端 | 命令 | 界面 |
 | --- | --- | --- |
 | OMP | `omp` | 原生终端；扩展自动加载 |
-| Codex | `codex-mail` | 原生 Codex 终端，连接启动器管理的 App Server |
+| Codex | `codex` 或 `codex-mail` | 普通 `codex` 由 SessionStart 钩子挂上 `codex queue` 监听器；`codex-mail` 仍管理独立 App Server |
 | Claude Code | `claude-mail` | 原生 Claude 终端，启用本地 Channel |
 | Kimi Code | `kimi-mail` | 打开输出的 Web UI 地址 |
 | Grok Build | `grok-mail` | 无原生界面；启动器托管 ACP 会话并回显模型回复 |
@@ -97,6 +97,10 @@ Claude 首次使用自定义 Channel 的启动入口时，会要求确认这是�
 这个要求由 Claude 自己执行。启动器仅启用 `server:agent_mail_wake`，
 不启用跳过工具权限检查的选项。直接运行普通 `claude` 时，Channel MCP 保持被动。
 
+普通 `codex` 会在 SessionStart 时挂上 `codex queue` 监听器。新安装或变更后的钩子
+需要在 Codex 里用 `/hooks` 审查并信任后才会运行；未信任时行为与安装前相同。
+`AGENT_MAIL_WAKE_ENABLED=0` 可关闭本次会话的自动挂接。
+
 Kimi 使用 `~/.kimi-code/server.token` 中的本地认证令牌。浏览器要求认证时，使用该文件中的值。
 新建 API 会话会显式绑定现有默认模型，以处理测试版本中 API 新会话没有自动选择模型的行为。
 Kimi 适配器管理 Web/API 会话，不会同时接管另一个正在运行的 Kimi TUI。
@@ -105,10 +109,10 @@ Kimi 适配器管理 Web/API 会话，不会同时接管另一个正在运行的
 
 - 每 3 秒检查收件事件，每批最多合并 5 条；检查本身不调用模型。
 - 邮件直接注入正在进行的回合，而不是等会话空闲：OMP 用 `deliverAs: "aside"`
-  在下一个步骤边界注入，Codex 用 App Server 的 `turn/steer`，Kimi 先提交到提示队列
-  再立即用 `prompts:steer` 转入活动回合，OpenCode 用 `delivery: "steer"` 提交，
-  Claude 由 Channels 原生机制投递。仅当会话处于错误状态（或 Codex 正处于不可转向的
-  review/compact 回合）时才会延迟投递。
+  在下一个步骤边界注入，挂了钩子的普通 Codex 用 `codex queue`，`codex-mail`
+  用 App Server 的 `turn/steer`，Kimi 先提交到提示队列再立即用 `prompts:steer`
+  转入活动回合，OpenCode 用 `delivery: "steer"` 提交，Claude 由 Channels 原生机制投递。
+  仅当会话处于错误状态（或托管 App Server 正处于不可转向的 review/compact 回合）时才会延迟投递。
 - 持久保存已处理游标和待投递批次，使用 delivery cursor，不使用 message_id 作为游标。
 - 网络失败保留待处理批次；游标缺口会暂停，不会静默跳过历史。
 - 连续 8 批自动唤醒后暂停；显式恢复会清零计数。OMP 正常用户输入会重置尚未暂停会话的计数。
@@ -154,7 +158,8 @@ Agent Mail 主服务独立运行，不受启动器退出影响。
 
 ## 投递保证与限制
 
-Codex 查询会话历史（转向投递的批次还会在生成的用户消息上携带 `clientUserMessageId` 批次 ID）、
+Codex 的 `codex-mail` 路径查询会话历史（转向投递的批次还会在生成的用户消息上携带 `clientUserMessageId` 批次 ID）；
+普通 `codex` 的 queue 监听器用本地绑定账簿和 rollout 中的投递标记去重。
 Kimi 使用稳定的 `prompt_id`、Grok 在启动器本地绑定账簿中记录已受理
 批次 ID、OpenCode 扫描会话历史中的投递标记、OMP 查询自定义消息记录来减少重试重复。
 这些措施不保证 Agent 执行工具的 exactly-once 语义。
