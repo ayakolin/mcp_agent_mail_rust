@@ -71,6 +71,24 @@ test('auto conversation limit retains pending mail until explicit resume', async
   assert.equal(watcher.state.paused, true); assert.equal(watcher.state.cursor, 8);
   watcher.control(false); await watcher.tick(); assert.equal(count, 2); assert.equal(watcher.state.cursor, 29);
 });
+test('limit 0 disables auto-pause on automatic deliveries', async t => {
+  const f = fixture(t); let count = 0;
+  const watcher = new MailWatcher({ ...f.options, limit: 0, deliver: async () => count++ });
+  await watcher.init({ start: false }); t.after(() => watcher.stop());
+  f.add(1, 8); await watcher.tick(); f.add(2, 29); await watcher.tick();
+  assert.equal(watcher.state.paused, false); assert.equal(count, 2); assert.equal(watcher.state.cursor, 29);
+});
+
+test('default MailWatcher has limit 0 and unpauses previous limit-paused session on init', async t => {
+  const f = fixture(t);
+  const watcher = new MailWatcher({ ...f.options, deliver: async () => {} });
+  assert.equal(watcher.limit, 0);
+  fs.mkdirSync(path.dirname(watcher.file), { recursive: true });
+  fs.writeFileSync(watcher.file, JSON.stringify({ paused: true, error: 'Paused after 8 automatic deliveries; resume to continue' }));
+  await watcher.init({ start: false }); t.after(() => watcher.stop());
+  assert.equal(watcher.state.paused, false);
+  assert.equal(watcher.state.error, undefined);
+});
 
 test('a cursor gap pauses instead of dropping unread history', async t => {
   const f = fixture(t), original = f.client.call;

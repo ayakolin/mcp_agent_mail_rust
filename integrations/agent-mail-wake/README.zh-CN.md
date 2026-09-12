@@ -124,12 +124,14 @@ agent-mail-wake pause LISTENER_ID
 agent-mail-wake resume LISTENER_ID
 ```
 
-OMP 界面还支持 `/mail-wake status`、`/mail-wake pause`、`/mail-wake resume`、`/mail-wake start`。
+OMP 界面还支持 `/mail-wake status`、`/mail-wake pause`、`/mail-wake resume`、`/mail-wake start`。默认情况下持续自动唤醒，不再限制 8 次自动投递上限。在 OMP 中，真实用户发言会自动重置投递计数，并自动恢复处于暂停状态的监听器。
 
-调整本次启动的参数：
+若需要限制自动连续唤醒轮数（防止多 Agent 无人值守死循环）：
 
 ```sh
+# 限制自动连续投递 12 次后暂停
 AGENT_MAIL_WAKE_INTERVAL_MS=5000 AGENT_MAIL_WAKE_MAX_TURNS=12 codex-mail
+# 显式关闭自动唤醒
 AGENT_MAIL_WAKE_ENABLED=0 omp
 ```
 

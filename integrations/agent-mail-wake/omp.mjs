@@ -1,4 +1,4 @@
-import { MailWatcher, identityInstructions, errorText, projectPath } from './common.mjs';
+import { MailWatcher, identityInstructions, errorText, projectPath, readJson } from './common.mjs';
 
 export default function agentMailWake(pi) {
   let watcher, generation = 0, keepEpoch = 0, initPromise;
@@ -9,6 +9,10 @@ export default function agentMailWake(pi) {
     // here is what drops auto-wake when a thread restarts in-process.
     if (watcher && watcher.session === session && !watcher.stopped) {
       keepEpoch++;
+      const state = watcher.state = readJson(watcher.file, watcher.state);
+      if (state.paused && state.error?.includes('automatic deliveries')) {
+        watcher.control(false);
+      }
       return;
     }
     const current = ++generation;
@@ -58,9 +62,26 @@ export default function agentMailWake(pi) {
     await existing?.stop();
     if (watcher === existing) watcher = undefined;
   });
+  const onUserInput = () => {
+    if (!watcher) return;
+    const state = watcher.state = readJson(watcher.file, watcher.state);
+    if (state.paused && state.error?.includes('automatic deliveries')) {
+      watcher.control(false);
+    } else if (!state.paused && (state.wakeups || 0) > 0) {
+      state.wakeups = 0;
+      watcher.save();
+      watcher.onStatus(watcher.status());
+    }
+  };
+  pi.on('message_start', event => {
+    const msg = event?.message;
+    if (msg?.role === 'user' && !msg?.synthetic && msg?.attribution !== 'agent') {
+      onUserInput();
+    }
+  });
   pi.on('input', event => {
-    if (event.source === 'interactive' && watcher && !watcher.state.paused) {
-      watcher.state.wakeups = 0; watcher.save();
+    if (event?.source === 'interactive') {
+      onUserInput();
     }
   });
   pi.registerCommand('mail-wake', {

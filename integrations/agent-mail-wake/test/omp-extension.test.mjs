@@ -45,7 +45,6 @@ function stubMailServer(messages) {
 }
 
 test('OMP extension delivers mail mid-run via deliverAs aside without an idle gate', async t => {
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const stub = await stubMailServer([{ id: 91, cursor: 10, body: 'mid-run mail body' }]);
   t.after(() => stub.server.close());
   process.env.AGENT_MAIL_URL = `http://127.0.0.1:${stub.port}/mcp/`;
@@ -86,4 +85,55 @@ test('OMP extension delivers mail mid-run via deliverAs aside without an idle ga
   assert.equal(mail.options.deliverAs, 'aside');
   assert.ok(mail.message.content.includes('mid-run mail body'));
   assert.ok(mail.message.details.batchId);
+});
+
+test('OMP extension resets wakeups and unpauses on real user message_start', async t => {
+  const stub = await stubMailServer([]);
+  t.after(() => stub.server.close());
+  process.env.AGENT_MAIL_URL = `http://127.0.0.1:${stub.port}/mcp/`;
+
+  const sent = [], handlers = new Map(), statuses = [];
+  let registeredCmd, statusText = '';
+  const pi = {
+    on: (event, fn) => handlers.set(event, fn),
+    registerCommand: (name, cmd) => { if (name === 'mail-wake') registeredCmd = cmd; },
+    sendMessage: (message, options) => sent.push({ message, options }),
+  };
+  const ctx = {
+    hasUI: true,
+    ui: { notify: txt => { statusText = txt; }, setStatus: (_, s) => statuses.push(s) },
+    sessionManager: { getSessionId: () => 'omp-session-user-input', getEntries: () => [] },
+    cwd: dir,
+    model: { id: 'test-model' },
+  };
+  const { default: agentMailWake } = await import('../omp.mjs');
+  agentMailWake(pi);
+  await handlers.get('session_start')(undefined, ctx);
+
+  await registeredCmd.handler('status', ctx);
+  const state = JSON.parse(statusText);
+  assert.equal(state.paused, false);
+
+  // Simulate 8 wakeups and pause
+  const file = path.join(process.env.AGENT_MAIL_WAKE_STATE_DIR, `${state.id}.json`);
+  const current = JSON.parse(fs.readFileSync(file, 'utf8'));
+  current.wakeups = 8;
+  current.paused = true;
+  current.error = 'Paused after 8 automatic deliveries; resume to continue';
+  fs.writeFileSync(file, JSON.stringify(current, null, 2));
+
+  // Synthetic or agent message must NOT unpause
+  await handlers.get('message_start')({ message: { role: 'user', synthetic: true } });
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).paused, true);
+  await handlers.get('message_start')({ message: { role: 'user', attribution: 'agent' } });
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).paused, true);
+
+  // Real interactive user message MUST unpause and reset wakeups
+  await handlers.get('message_start')({ message: { role: 'user', content: 'hello' } });
+  const unpaused = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(unpaused.paused, false);
+  assert.equal(unpaused.wakeups, 0);
+  assert.equal(unpaused.error, undefined);
+
+  await handlers.get('session_shutdown')();
 });

@@ -121,7 +121,7 @@ export function batchPrompt(state, batch) {
 export class MailWatcher {
   constructor({ host, session, project, model = 'configured-model', endpoint, headers,
     stateRoot = STATE_ROOT, interval = Number(process.env.AGENT_MAIL_WAKE_INTERVAL_MS || 3000),
-    limit = Number(process.env.AGENT_MAIL_WAKE_MAX_TURNS || 8), canDeliver = async () => true,
+    limit = Number(process.env.AGENT_MAIL_WAKE_MAX_TURNS || 0), canDeliver = async () => true,
     deliver, onStatus = () => {}, client }) {
     if (!host || !session || !deliver) throw new Error('host, session and deliver are required');
     this.client = client || new MailClient(endpoint, headers);
@@ -129,7 +129,7 @@ export class MailWatcher {
     this.id = hash(`${this.client.endpoint}|${host}|${session}|${this.project}`);
     this.file = path.join(stateRoot, `${this.id}.json`); this.lockFile = path.join(stateRoot, `${this.id}.lock`);
     if (!Number.isInteger(interval) || interval < 250) throw new Error('Poll interval must be an integer >= 250 ms');
-    if (!Number.isInteger(limit) || limit < 1) throw new Error('Wake limit must be a positive integer');
+    if (!Number.isInteger(limit) || limit < 0) throw new Error('Wake limit must be an integer >= 0');
     this.interval = interval; this.limit = limit; this.canDeliver = canDeliver; this.deliver = deliver; this.onStatus = onStatus;
     this.running = false; this.stopped = false; this.lockOwner = randomUUID();
   }
@@ -171,12 +171,16 @@ export class MailWatcher {
       this.state.pid = process.pid; this.state.updatedAt = new Date().toISOString();
       this.save(); this.onStatus(this.status());
       if (start) this.start();
+      if (this.limit === 0 && this.state.paused && this.state.error?.includes('automatic deliveries')) {
+        this.control(false);
+      }
       return this;
     } catch (error) { this.release(); throw error; }
   }
   start() {
     if (this.timer || this.stopped) return;
     this.timer = setInterval(() => { void this.tick(); }, this.interval);
+    this.timer.unref?.();
   }
   release() {
     const lock = readJson(this.lockFile);
@@ -199,7 +203,7 @@ export class MailWatcher {
     try {
       this.state = readJson(this.file, this.state);
       if (this.state.paused || !(await this.canDeliver()) || this.stopped) return;
-      if ((this.state.wakeups || 0) >= this.limit) {
+      if (this.limit > 0 && (this.state.wakeups || 0) >= this.limit) {
         this.state.paused = true; this.state.error = `Paused after ${this.limit} automatic deliveries; resume to continue`;
         this.save(); this.onStatus(this.status()); return;
       }

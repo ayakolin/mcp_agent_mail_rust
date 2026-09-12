@@ -94,9 +94,12 @@ OpenCode runs its own headless server: `opencode-mail` starts `opencode serve`,
 creates a session, and POSTs each batch to `/session/ID/message`, which returns
 when the turn completes (`--session ID` reuses a stored session).
 
-Default polling is 3 seconds, with at most 5 events per batch and a pause after 8
-automatic deliveries. The polling itself does not invoke a model. Configure with
-`AGENT_MAIL_WAKE_INTERVAL_MS` and `AGENT_MAIL_WAKE_MAX_TURNS`.
+Default polling is 3 seconds, with at most 5 events per batch. By default, auto-wake
+runs continuously without a turn limit. If an explicit delivery pause is desired to
+guard against runaway autonomous loops, configure a threshold with `AGENT_MAIL_WAKE_MAX_TURNS`.
+In OMP, user interaction resets any configured delivery counter and automatically resumes
+listeners that paused at the limit. Configure with `AGENT_MAIL_WAKE_INTERVAL_MS` and
+`AGENT_MAIL_WAKE_MAX_TURNS`.
 Deliveries are injected into a running turn, not deferred until the session goes
 idle: OMP uses `deliverAs: "aside"` (next step boundary), a hooked Codex session
 uses `codex queue`, `codex-mail` uses the App Server's `turn/steer`, Kimi submits
