@@ -92,6 +92,11 @@ Verified on this machine against Codex 0.154.0:
 - Node tests cover installer hook merge/idempotence, queue adapter replay, and
   hook spawn/opt-out/SessionEnd behavior. Live SessionStart attach still
   requires the user to trust the hook in `/hooks`.
+- `codex-mail` forwards native subcommands (`resume`, `queue`, `fork`, `exec`, etc.)
+  to the real underlying Codex binary, and collects native flags like `--yolo`
+  without throwing. When aliased (`alias codex=codex-mail`), `codex resume`
+  invokes native resume, fires the SessionStart hook, and attaches auto-wake.
+  Resuming or attaching also unpauses sessions that previously hit the turn limit.
 
 Claude, Kimi, Grok, and OpenCode still need their dedicated launchers. OMP
 already attaches inside ordinary interactive sessions.

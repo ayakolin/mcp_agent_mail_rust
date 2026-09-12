@@ -100,6 +100,7 @@ Claude 首次使用自定义 Channel 的启动入口时，会要求确认这是�
 普通 `codex` 会在 SessionStart 时挂上 `codex queue` 监听器。新安装或变更后的钩子
 需要在 Codex 里用 `/hooks` 审查并信任后才会运行；未信任时行为与安装前相同。
 `AGENT_MAIL_WAKE_ENABLED=0` 可关闭本次会话的自动挂接。
+`codex-mail` 会将 `resume`、`queue` 等原生子命令与 `--yolo` 等原生参数透明透传到底层 Codex；若设置了 `alias codex=codex-mail`，`codex resume` 会正常启动原生恢复并触发 SessionStart 自动挂接。重新连接或恢复会话时还会自动重置暂停状态。
 
 Kimi 使用 `~/.kimi-code/server.token` 中的本地认证令牌。浏览器要求认证时，使用该文件中的值。
 新建 API 会话会显式绑定现有默认模型，以处理测试版本中 API 新会话没有自动选择模型的行为。

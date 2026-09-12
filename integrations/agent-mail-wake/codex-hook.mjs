@@ -13,8 +13,12 @@ export function isSessionEnd(event) {
   return event.hook_event_name === 'SessionEnd';
 }
 
+export function sessionId(event) {
+  return event?.session_id || event?.thread_id || event?.id || '';
+}
+
 export function shouldAttach(event, env = process.env) {
-  return env.AGENT_MAIL_WAKE_ENABLED !== '0' && Boolean(event.session_id) &&
+  return env.AGENT_MAIL_WAKE_ENABLED !== '0' && Boolean(sessionId(event)) &&
     event.source !== 'compact' && !isSessionEnd(event);
 }
 
@@ -43,8 +47,9 @@ function readStdin() {
 
 export async function handleHook(raw, env = process.env, spawner = spawn) {
   const event = parseHookEvent(raw);
+  const id = sessionId(event);
   if (isSessionEnd(event)) {
-    stopQueueListeners(event.session_id);
+    stopQueueListeners(id);
     return { stdout: '{}\n', spawned: false };
   }
   if (!shouldAttach(event, env)) return { stdout: '{}\n', spawned: false };
@@ -54,7 +59,7 @@ export async function handleHook(raw, env = process.env, spawner = spawn) {
   const log = fs.openSync(path.join(logDir, `codex-hook-${Date.now()}.log`), 'a', 0o600);
   const child = spawner(process.execPath, [
     path.join(ROOT, 'cli.mjs'), 'codex', 'attach',
-    '--session', event.session_id,
+    '--session', id,
     '--project', event.cwd || process.cwd(),
   ], {
     detached: true,

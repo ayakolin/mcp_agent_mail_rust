@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { createInterface } from 'node:readline';
-import { localUrl } from './common.mjs';
+import { localUrl, findCodexBinary } from './common.mjs';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -130,7 +130,7 @@ export class CodexQueueAdapter {
   async deliver(text, batch) {
     const marker = `[Agent Mail delivery ${batch.id}]`;
     if (this.seen.has(batch.id) || this.history(this.session, marker)) return { alreadyAccepted: true };
-    const queued = await this.runner('codex', ['queue', '--thread', this.session, '--message', text], { cwd: this.cwd });
+    const queued = await this.runner(findCodexBinary(), ['queue', '--thread', this.session, '--message', text], { cwd: this.cwd });
     if (queued.code === 0) {
       this.seen.add(batch.id);
       this.persist();

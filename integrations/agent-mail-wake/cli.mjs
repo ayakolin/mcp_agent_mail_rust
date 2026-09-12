@@ -7,8 +7,13 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { MailClient, MailWatcher, STATE_ROOT, DATA_ROOT, listStates, readJson, saveJson, projectPath, identityInstructions, sleep, errorText } from './common.mjs';
+import { MailClient, MailWatcher, STATE_ROOT, DATA_ROOT, listStates, readJson, saveJson, projectPath, identityInstructions, sleep, errorText, findCodexBinary } from './common.mjs';
 import { CodexRPC, CodexAdapter, CodexQueueAdapter, KimiAdapter, GrokACP, OpenCodeAdapter } from './rpc.mjs';
+
+const CODEX_FORWARD_COMMANDS = new Set([
+  'resume', 'queue', 'exec', 'review', 'apply', 'fork', 'archive', 'unarchive',
+  'login', 'logout', 'mcp', 'plugin', 'doctor', 'features', 'completion', 'update',
+]);
 
 const children = new Set(); let watcher, rpc, stopping = false;
 function child(command, args, options = {}) {
@@ -28,12 +33,14 @@ process.on('SIGTERM', () => { void shutdown().then(() => process.exit(0)); });
 function parse(args) {
   const options = { extra: [] };
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--') { options.extra = args.slice(i + 1); break; }
+    if (args[i] === '--') { options.extra.push(...args.slice(i + 1)); break; }
     if (['--headless', '--help'].includes(args[i])) options[args[i].slice(2)] = true;
     else if (['--project', '--session', '--server', '--token-file', '--model'].includes(args[i])) {
       if (!args[i + 1]) throw new Error(`Missing value for ${args[i]}`);
       options[args[i].slice(2)] = args[++i];
-    } else throw new Error(`Unknown argument ${args[i]}; pass native CLI flags after --`);
+    } else {
+      options.extra.push(args[i]);
+    }
   }
   return options;
 }
@@ -62,7 +69,7 @@ async function codexMain(options) {
   if (!server) {
     server = `ws://127.0.0.1:${await freePort()}`;
     const log = logFile('codex-server');
-    proc = child('codex', ['app-server', '--listen', server], { cwd: project, stdio: ['ignore', log, log] }); fs.closeSync(log);
+    proc = child(findCodexBinary(), ['app-server', '--listen', server], { cwd: project, stdio: ['ignore', log, log] }); fs.closeSync(log);
   }
   rpc = await waitFor(async () => { const connection = new CodexRPC(server); try { return await connection.connect(); } catch (e) { connection.close(); throw e; } }, 'Codex app server', proc);
   const result = await rpc.request(options.session ? 'thread/resume' : 'thread/start', {
@@ -89,7 +96,8 @@ async function codexMain(options) {
     process.stderr.write(`Attach: codex resume --remote ${server} ${session}\n`);
     watcher.start();
   } else {
-    const tui = child('codex', ['resume', '--remote', server, session, ...options.extra], { cwd: project, stdio: 'inherit' });
+    const tui = child(findCodexBinary(), ['resume', '--remote', server, session, ...options.extra], { cwd: project, stdio: 'inherit' });
+    if (watcher.state.paused) watcher.control(false);
     watcher.start(); await once(tui, 'exit'); await shutdown();
   }
 }
@@ -210,6 +218,7 @@ export async function attachCodexSession({ session, project }) {
     }
     throw error;
   }
+  if (watcher?.state?.paused) watcher.control(false);
   persist();
   process.stderr.write(`[Agent Mail] attached Codex session ${session} mailbox=${watcher.state.agent} id=${watcher.id}\n${identityInstructions(watcher.state)}\n`);
 }
@@ -233,6 +242,11 @@ export async function main(args = process.argv.slice(2)) {
   if (command === 'codex' && args[0] === 'attach') {
     const options = parse(args.slice(1)); if (options.help) return usage();
     return attachCodexSession(options);
+  }
+  if (command === 'codex' && CODEX_FORWARD_COMMANDS.has(args[0])) {
+    const binary = findCodexBinary();
+    const proc = child(binary, args, { stdio: 'inherit', cwd: process.cwd() });
+    return once(proc, 'exit').then(([code]) => { process.exitCode = code ?? 0; });
   }
   const options = parse(args); if (options.help) return usage();
   if (command === 'codex') return codexMain(options);

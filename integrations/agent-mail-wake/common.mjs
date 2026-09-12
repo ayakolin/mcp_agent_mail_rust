@@ -33,6 +33,20 @@ export function projectPath(value = process.env.AGENT_MAIL_PROJECT || process.cw
   if (!fs.statSync(result).isDirectory()) throw new Error('Project must be a directory');
   return result;
 }
+export function findCodexBinary() {
+  if (process.env.CODEX_PATH && fs.existsSync(process.env.CODEX_PATH)) return process.env.CODEX_PATH;
+  for (const candidate of ['/usr/sbin/codex', '/usr/bin/codex', '/usr/local/bin/codex']) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  const pathDirs = (process.env.PATH || '').split(path.delimiter);
+  for (const dir of pathDirs) {
+    const file = path.join(dir, 'codex');
+    try {
+      if (fs.existsSync(file) && !fs.readFileSync(file, 'utf8').includes('agent-mail-wake')) return file;
+    } catch {}
+  }
+  return 'codex';
+}
 export function localUrl(value) {
   const url = new URL(value);
   if (!['http:', 'ws:'].includes(url.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) {
