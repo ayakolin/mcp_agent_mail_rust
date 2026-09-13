@@ -95,6 +95,44 @@ timeout = 3${stateBlock}
   return text ? `${text}\n\n${block}` : block;
 }
 
+export function mergeClaudeHooks(settings, command) {
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+    settings.hooks = {};
+  }
+  const managedHook = { type: 'command', command };
+  const filterOut = (hooksArray) => {
+    return (hooksArray || []).map(group => {
+      if (!Array.isArray(group.hooks)) return group;
+      return {
+        ...group,
+        hooks: group.hooks.filter(h => !h.command?.includes('claude-channel.mjs')),
+      };
+    }).filter(group => Array.isArray(group.hooks) && group.hooks.length > 0);
+  };
+  for (const event of ['SessionStart', 'PostToolUse', 'Stop', 'SessionEnd']) {
+    if (settings.hooks[event]) {
+      settings.hooks[event] = filterOut(settings.hooks[event]);
+    }
+  }
+  settings.hooks.SessionStart = [
+    ...(settings.hooks.SessionStart || []),
+    { matcher: 'startup|resume|clear', hooks: [managedHook] },
+  ];
+  settings.hooks.PostToolUse = [
+    ...(settings.hooks.PostToolUse || []),
+    { hooks: [managedHook] },
+  ];
+  settings.hooks.Stop = [
+    ...(settings.hooks.Stop || []),
+    { hooks: [managedHook] },
+  ];
+  settings.hooks.SessionEnd = [
+    ...(settings.hooks.SessionEnd || []),
+    { hooks: [managedHook] },
+  ];
+  return settings;
+}
+
 export function installationPlan(options = {}) {
   const home = path.resolve(options.home || os.homedir());
   const customHome = !!options.home;
@@ -155,6 +193,10 @@ export function installationPlan(options = {}) {
     changes.push({ file, before, after, mode: 0o600 });
   }
   if (clients.includes('claude')) {
+    const claudeDir = !customHome && process.env.CLAUDE_CONFIG_DIR ? process.env.CLAUDE_CONFIG_DIR : path.join(home, '.claude');
+    const settingsFile = path.join(claudeDir, 'settings.json');
+    const hookCommand = `${process.execPath} ${path.join(prefix, 'claude-channel.mjs')} hook`;
+    changes.push(changedJson(settingsFile, data => mergeClaudeHooks(data, hookCommand)));
     const file = !customHome && process.env.CLAUDE_CONFIG_DIR ? path.join(process.env.CLAUDE_CONFIG_DIR, '.claude.json') : path.join(home, '.claude.json');
     changes.push(changedJson(file, data => {
       mailEntry(data, { type: 'http', url, ...(Object.keys(authHeaders).length ? { headers: authHeaders } : {}) });

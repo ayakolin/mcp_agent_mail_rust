@@ -132,7 +132,7 @@ export function isCodexTurnBusy(file, now = Date.now()) {
   const state = readJson(file, {});
   return Boolean(state?.turnActive && isRecentTimestamp(state?.lastToolAt, CODEX_STEER_WINDOW_MS, now));
 }
-
+export const isTurnBusy = isCodexTurnBusy;
 export function canSteerClaim(pending, now = Date.now()) {
   if (!pending) return true;
   if (pending.claimedBy === 'queue' || pending.claimedBy === 'steer') {
@@ -176,17 +176,20 @@ export async function withClaimLock(file, fn, { timeoutMs = 2000, now = Date.now
   throw new Error(`Timed out waiting for claim lock: ${lockFile}`);
 }
 
-export function findCodexListener(session, roots = {}) {
+export function findSessionListener(session, { host = null, stateRoot = STATE_ROOT, dataRoot = DATA_ROOT } = {}) {
   if (!session) return null;
-  const stateRoot = roots.stateRoot || STATE_ROOT;
-  const dataRoot = roots.dataRoot || DATA_ROOT;
   for (const state of listStates(stateRoot)) {
-    if (state.host !== 'codex' || state.session !== session) continue;
+    if (host && state.host !== host) continue;
+    if (state.session !== session) continue;
     const file = path.join(stateRoot, `${state.id}.json`);
     const bindingFile = path.join(dataRoot, 'bindings', `${state.id}.json`);
     return { id: state.id, file, bindingFile, state };
   }
   return null;
+}
+
+export function findCodexListener(session, roots = {}) {
+  return findSessionListener(session, { host: 'codex', ...roots });
 }
 
 export function stampCodexTurn(file, { active = true, now = new Date() } = {}) {

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { handleHook, shouldAttach, parseHookEvent, sessionId, isFreshListener, stopQueueListeners } from '../codex-hook.mjs';
+import { handleClaudeHook } from '../claude-channel.mjs';
 import { findCodexBinary } from '../common.mjs';
 
 test('SessionStart startup and resume attach; compact and opt-out do not', async () => {
@@ -251,4 +252,43 @@ test('Stop hook with no mail clears turnActive and returns empty JSON', async t 
   const updated = JSON.parse(fs.readFileSync(listenerFile, 'utf8'));
   assert.equal(updated.cursor, 12);
   assert.equal(updated.turnActive, undefined);
+});
+
+test('handleClaudeHook steers mail into PostToolUse and Stop', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-hook-'));
+  const stateRoot = path.join(home, 'state');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(stateRoot, { recursive: true });
+  const listenerFile = path.join(stateRoot, 'listener-claude.json');
+  fs.writeFileSync(listenerFile, JSON.stringify({
+    id: 'listener-claude', host: 'claude-code', session: 'claude-ses-1', project: '/tmp/proj', agent: 'AgentClaude', cursor: 100,
+  }));
+  const events = [{ cursor: 105, message_id: 201, from: 'PeerD' }];
+  const messages = new Map([[201, { id: 201, from: 'PeerD', subject: 'claude steer', body_md: 'steer content' }]]);
+  const stubClient = {
+    call: async () => ({ events, next_cursor: 105 }),
+    message: async (id) => messages.get(id),
+  };
+  // PostToolUse with mail
+  const postResult = await handleClaudeHook(JSON.stringify({
+    hook_event_name: 'PostToolUse', session_id: 'claude-ses-1', tool_name: 'Bash',
+  }), { AGENT_MAIL_WAKE_HOME: home }, { client: stubClient });
+  const postParsed = JSON.parse(postResult.stdout);
+  assert.equal(postParsed.hookSpecificOutput?.hookEventName, 'PostToolUse');
+  assert.match(postParsed.hookSpecificOutput?.additionalContext, /claude steer/);
+  assert.match(postParsed.hookSpecificOutput?.additionalContext, /steer content/);
+  assert.equal(JSON.parse(fs.readFileSync(listenerFile, 'utf8')).cursor, 105);
+
+  // Stop with no mail resets turnActive
+  const stopResult = await handleClaudeHook(JSON.stringify({
+    hook_event_name: 'Stop', session_id: 'claude-ses-1',
+  }), { AGENT_MAIL_WAKE_HOME: home }, { client: { call: async () => ({ events: [], next_cursor: 105 }) } });
+  assert.equal(stopResult.stdout, '{}\n');
+  assert.equal(JSON.parse(fs.readFileSync(listenerFile, 'utf8')).turnActive, undefined);
+
+  // SessionStart provides auto-wake instructions
+  const startResult = await handleClaudeHook(JSON.stringify({
+    hook_event_name: 'SessionStart', session_id: 'claude-ses-1',
+  }), { AGENT_MAIL_WAKE_HOME: home });
+  assert.match(JSON.parse(startResult.stdout).hookSpecificOutput?.additionalContext, /auto-wake is enabled for this Claude session/);
 });

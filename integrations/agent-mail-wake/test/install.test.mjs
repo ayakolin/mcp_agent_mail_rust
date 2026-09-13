@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { installationPlan, applyInstallation, mergeCodexHooks } from '../install.mjs';
+import { installationPlan, applyInstallation, mergeCodexHooks, mergeClaudeHooks } from '../install.mjs';
 
 function sandbox(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-mail-wake-install-'));
@@ -147,4 +147,23 @@ test('unrelated launchers and concurrent config edits are not overwritten', t =>
   assert.throws(() => applyInstallation(plan), /Concurrent modification/);
   assert.equal(read(file).theme, 'changed concurrently');
   assert.equal(fs.existsSync(path.join(second.home, '.local', 'bin', 'codex-mail')), false);
+});
+
+test('claude hook install is idempotent and merges hooks into settings.json preserving existing settings', t => {
+  const { home } = sandbox(t);
+  const file = path.join(home, '.claude', 'settings.json');
+  const original = { model: 'fable', hooks: { ExistingHook: [{ hooks: [{ type: 'command', command: 'echo existing' }] }] } };
+  write(file, original);
+  applyInstallation(installationPlan({ home, clients: ['claude'] }));
+  const installed = read(file);
+  assert.equal(installed.model, 'fable');
+  assert.equal(installed.hooks.ExistingHook.length, 1);
+  assert.equal(installed.hooks.SessionStart.length, 1);
+  assert.equal(installed.hooks.PostToolUse.length, 1);
+  assert.equal(installed.hooks.Stop.length, 1);
+  assert.equal(installed.hooks.SessionEnd.length, 1);
+  assert.match(installed.hooks.PostToolUse[0].hooks[0].command, /claude-channel\.mjs hook/);
+  const second = applyInstallation(installationPlan({ home, clients: ['claude'] }));
+  assert.deepEqual(second.changed, []);
+  assert.deepEqual(read(file), installed);
 });
