@@ -130,3 +130,125 @@ test('stopQueueListeners skips a fresh listener and stops a stale one', async t 
   fs.rmSync(path.join(stateRoot, 'listener-fresh.json'));
   assert.deepEqual(stopQueueListeners('s-restart', Date.now(), { dataRoot: home, stateRoot }), [child.pid]);
 });
+
+test('PostToolUse hook stamps active turn and injects steer additionalContext', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-steer-'));
+  const stateRoot = path.join(home, 'state');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(stateRoot, { recursive: true });
+  const listenerFile = path.join(stateRoot, 'listener-1.json');
+  fs.writeFileSync(listenerFile, JSON.stringify({
+    id: 'listener-1', host: 'codex', session: 's-steer', project: '/tmp/proj', agent: 'AgentA', cursor: 10,
+  }));
+  const events = [{ cursor: 15, message_id: 101, from: 'PeerB' }];
+  const messages = new Map([[101, { id: 101, from: 'PeerB', subject: 'urgent steer', body_md: 'please stop task' }]]);
+  const stubClient = {
+    call: async (name, args) => {
+      if (name === 'fetch_inbox_events') return { events, next_cursor: 15 };
+      throw new Error(`unexpected call ${name}`);
+    },
+    message: async (id) => messages.get(id),
+  };
+  const event = {
+    hook_event_name: 'PostToolUse',
+    session_id: 's-steer',
+    tool_name: 'Bash',
+    cwd: '/tmp/proj',
+  };
+  const result = await handleHook(JSON.stringify(event), { AGENT_MAIL_WAKE_HOME: home }, () => {
+    throw new Error('must not spawn listener');
+  }, { client: stubClient });
+  assert.equal(result.spawned, false);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.hookSpecificOutput?.hookEventName, 'PostToolUse');
+  assert.match(parsed.hookSpecificOutput?.additionalContext, /urgent steer/);
+  assert.match(parsed.hookSpecificOutput?.additionalContext, /please stop task/);
+  const updatedState = JSON.parse(fs.readFileSync(listenerFile, 'utf8'));
+  assert.equal(updatedState.cursor, 15);
+  assert.equal(updatedState.turnActive, true);
+  assert.ok(updatedState.lastToolAt);
+});
+
+test('PostToolUse hook with no pending mail returns empty JSON and keeps turn active', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-empty-'));
+  const stateRoot = path.join(home, 'state');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(stateRoot, { recursive: true });
+  const listenerFile = path.join(stateRoot, 'listener-2.json');
+  fs.writeFileSync(listenerFile, JSON.stringify({
+    id: 'listener-2', host: 'codex', session: 's-empty', project: '/tmp/proj', agent: 'AgentA', cursor: 20,
+  }));
+  const stubClient = {
+    call: async () => ({ events: [], next_cursor: 20 }),
+    message: async () => null,
+  };
+  const result = await handleHook(JSON.stringify({
+    hook_event_name: 'PostToolUse', session_id: 's-empty', tool_name: 'ReadFile',
+  }), { AGENT_MAIL_WAKE_HOME: home }, () => {
+    throw new Error('must not spawn');
+  }, { client: stubClient });
+  assert.equal(result.spawned, false);
+  assert.equal(result.stdout, '{}\n');
+  const updated = JSON.parse(fs.readFileSync(listenerFile, 'utf8'));
+  assert.equal(updated.cursor, 20);
+  assert.equal(updated.turnActive, true);
+  assert.ok(updated.lastToolAt);
+});
+
+test('Stop hook with pending mail blocks turn and injects steer reason, clearing turnActive', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-stop-steer-'));
+  const stateRoot = path.join(home, 'state');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(stateRoot, { recursive: true });
+  const listenerFile = path.join(stateRoot, 'listener-3.json');
+  fs.writeFileSync(listenerFile, JSON.stringify({
+    id: 'listener-3', host: 'codex', session: 's-stop', project: '/tmp/proj', agent: 'AgentA', cursor: 5, turnActive: true,
+  }));
+  const events = [{ cursor: 8, message_id: 102, from: 'PeerC' }];
+  const messages = new Map([[102, { id: 102, from: 'PeerC', subject: 'late mail', body_md: 'continue working' }]]);
+  const stubClient = {
+    call: async (name) => {
+      if (name === 'fetch_inbox_events') return { events, next_cursor: 8 };
+      throw new Error(name);
+    },
+    message: async (id) => messages.get(id),
+  };
+  const result = await handleHook(JSON.stringify({
+    hook_event_name: 'Stop', session_id: 's-stop', cwd: '/tmp/proj',
+  }), { AGENT_MAIL_WAKE_HOME: home }, () => {
+    throw new Error('must not spawn');
+  }, { client: stubClient });
+  assert.equal(result.spawned, false);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.decision, 'block');
+  assert.match(parsed.reason, /late mail/);
+  assert.match(parsed.reason, /continue working/);
+  const updated = JSON.parse(fs.readFileSync(listenerFile, 'utf8'));
+  assert.equal(updated.cursor, 8);
+  assert.equal(updated.turnActive, undefined);
+});
+
+test('Stop hook with no mail clears turnActive and returns empty JSON', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-stop-empty-'));
+  const stateRoot = path.join(home, 'state');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(stateRoot, { recursive: true });
+  const listenerFile = path.join(stateRoot, 'listener-4.json');
+  fs.writeFileSync(listenerFile, JSON.stringify({
+    id: 'listener-4', host: 'codex', session: 's-stop-empty', project: '/tmp/proj', agent: 'AgentA', cursor: 12, turnActive: true,
+  }));
+  const stubClient = {
+    call: async () => ({ events: [], next_cursor: 12 }),
+    message: async () => null,
+  };
+  const result = await handleHook(JSON.stringify({
+    hook_event_name: 'Stop', session_id: 's-stop-empty', cwd: '/tmp/proj',
+  }), { AGENT_MAIL_WAKE_HOME: home }, () => {
+    throw new Error('must not spawn');
+  }, { client: stubClient });
+  assert.equal(result.spawned, false);
+  assert.equal(result.stdout, '{}\n');
+  const updated = JSON.parse(fs.readFileSync(listenerFile, 'utf8'));
+  assert.equal(updated.cursor, 12);
+  assert.equal(updated.turnActive, undefined);
+});

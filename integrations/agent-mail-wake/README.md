@@ -10,7 +10,7 @@ external package dependencies.
 | Client | Adapter | Launch |
 | --- | --- | --- |
 | Oh My Pi / OMP | Native extension, idle-gated `sendMessage` | `omp` |
-| Codex | SessionStart queue listener on ordinary `codex`; managed App Server remains available | `codex` / `codex-mail` |
+| Codex | PostToolUse/Stop mid-turn steer + SessionStart queue listener on ordinary `codex`; managed App Server remains available | `codex` / `codex-mail` |
 | Claude Code | Local MCP Channel plus native TUI | `claude-mail` |
 | Kimi Code | Managed Web/API session | `kimi-mail` |
 | Grok Build | Managed ACP session (`grok agent stdio`) | `grok-mail` |
@@ -102,8 +102,8 @@ listeners that paused at the limit. Configure with `AGENT_MAIL_WAKE_INTERVAL_MS`
 `AGENT_MAIL_WAKE_MAX_TURNS`.
 Deliveries are injected into a running turn, not deferred until the session goes
 idle: OMP uses `deliverAs: "aside"` (next step boundary), a hooked Codex session
-uses `codex queue`, `codex-mail` uses the App Server's `turn/steer`, Kimi submits
-to the prompt queue and immediately steers it into the active turn (`prompts:steer`),
+steers mid-turn via `PostToolUse` additionalContext (or `Stop` hook block) and falls back
+to `codex queue` when idle, `codex-mail` uses the App Server's `turn/steer`, Kimi submits
 OpenCode posts with `delivery: "steer"`, and Claude receives channel notifications
 natively. Only error-state sessions (or a brief non-steerable review/compact turn
 on a managed Codex App Server) still defer delivery.
@@ -140,7 +140,7 @@ source-only import of the original local integration.
 | `common.mjs` | Mail protocol, identities, batching, durable cursor and pause controls |
 | `omp.mjs` | OMP extension lifecycle and incoming-message delivery |
 | `claude-channel.mjs` | Claude's stdio MCP Channel and control tools |
-| `codex-hook.mjs` | Codex SessionStart/SessionEnd hook: attach or stop a queue listener |
+| `codex-hook.mjs` | Codex SessionStart/SessionEnd/PostToolUse/Stop hook: attach or stop a queue listener, and steer mail mid-turn into active turns |
 | `rpc.mjs` | Codex App Server, Codex queue, Kimi Server API, Grok ACP, and OpenCode adapters |
 | `cli.mjs` | Shared launcher, session binding, status and lifecycle commands |
 | `install.mjs` | Portable installer for sources, launchers and client config |

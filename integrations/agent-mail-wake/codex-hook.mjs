@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ROOT, DATA_ROOT, STATE_ROOT, listStates, readJson } from './common.mjs';
+import { ROOT, DATA_ROOT, STATE_ROOT, listStates, readJson, MailClient, batchPrompt, findCodexListener, stampCodexTurn, claimSteerBatch, commitSteerBatch } from './common.mjs';
 
 export function parseHookEvent(raw) {
   try { return JSON.parse(raw || '{}'); } catch { return {}; }
@@ -13,13 +13,21 @@ export function isSessionEnd(event) {
   return event.hook_event_name === 'SessionEnd';
 }
 
+export function isPostToolUse(event) {
+  return event.hook_event_name === 'PostToolUse';
+}
+
+export function isStop(event) {
+  return event.hook_event_name === 'Stop';
+}
+
 export function sessionId(event) {
   return event?.session_id || event?.thread_id || event?.id || '';
 }
 
 export function shouldAttach(event, env = process.env) {
   return env.AGENT_MAIL_WAKE_ENABLED !== '0' && Boolean(sessionId(event)) &&
-    event.source !== 'compact' && !isSessionEnd(event);
+    event.source !== 'compact' && !isSessionEnd(event) && !isPostToolUse(event) && !isStop(event);
 }
 
 const FRESH_ATTACH_MS = 15_000;
@@ -57,7 +65,66 @@ function readStdin() {
   });
 }
 
-export async function handleHook(raw, env = process.env, spawner = spawn) {
+export async function handlePostToolUse(event, env = process.env, extras = {}) {
+  if (env.AGENT_MAIL_WAKE_ENABLED === '0') return {};
+  const id = sessionId(event);
+  if (!id) return {};
+  const dataRoot = env.AGENT_MAIL_WAKE_HOME || DATA_ROOT;
+  const stateRoot = env.AGENT_MAIL_WAKE_STATE_DIR || path.join(dataRoot, 'state');
+  const listener = findCodexListener(id, { stateRoot, dataRoot });
+  if (!listener?.file) return {};
+  try {
+    stampCodexTurn(listener.file, { active: true });
+    const client = extras.client || new MailClient(env.AGENT_MAIL_URL, {}, { timeoutMs: 5000 });
+    const claimed = await claimSteerBatch(listener.file, client, { timeoutMs: 1500 });
+    if (!claimed?.batch) return {};
+    if (!claimed.batch.messages?.length) {
+      await commitSteerBatch(listener.file, claimed.batch);
+      return {};
+    }
+    const prompt = batchPrompt(claimed.state, claimed.batch);
+    await commitSteerBatch(listener.file, claimed.batch);
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PostToolUse',
+        additionalContext: prompt,
+      },
+    };
+  } catch {
+    return {};
+  }
+}
+
+export async function handleStop(event, env = process.env, extras = {}) {
+  if (env.AGENT_MAIL_WAKE_ENABLED === '0') return {};
+  const id = sessionId(event);
+  if (!id) return {};
+  const dataRoot = env.AGENT_MAIL_WAKE_HOME || DATA_ROOT;
+  const stateRoot = env.AGENT_MAIL_WAKE_STATE_DIR || path.join(dataRoot, 'state');
+  const listener = findCodexListener(id, { stateRoot, dataRoot });
+  if (!listener?.file) return {};
+  try {
+    const client = extras.client || new MailClient(env.AGENT_MAIL_URL, {}, { timeoutMs: 5000 });
+    const claimed = await claimSteerBatch(listener.file, client, { timeoutMs: 1500 });
+    if (!claimed?.batch?.messages?.length) {
+      if (claimed?.batch) await commitSteerBatch(listener.file, claimed.batch);
+      stampCodexTurn(listener.file, { active: false });
+      return {};
+    }
+    const prompt = batchPrompt(claimed.state, claimed.batch);
+    await commitSteerBatch(listener.file, claimed.batch);
+    stampCodexTurn(listener.file, { active: false });
+    return {
+      decision: 'block',
+      reason: prompt,
+    };
+  } catch {
+    stampCodexTurn(listener.file, { active: false });
+    return {};
+  }
+}
+
+export async function handleHook(raw, env = process.env, spawner = spawn, extras = {}) {
   const event = parseHookEvent(raw);
   const id = sessionId(event);
   if (isSessionEnd(event)) {
@@ -65,6 +132,14 @@ export async function handleHook(raw, env = process.env, spawner = spawn) {
     const stateRoot = env.AGENT_MAIL_WAKE_STATE_DIR || path.join(dataRoot, 'state');
     stopQueueListeners(id, Date.now(), { dataRoot, stateRoot });
     return { stdout: '{}\n', spawned: false };
+  }
+  if (isPostToolUse(event)) {
+    const output = await handlePostToolUse(event, env, extras);
+    return { stdout: JSON.stringify(output) + '\n', spawned: false };
+  }
+  if (isStop(event)) {
+    const output = await handleStop(event, env, extras);
+    return { stdout: JSON.stringify(output) + '\n', spawned: false };
   }
   if (!shouldAttach(event, env)) return { stdout: '{}\n', spawned: false };
   const dataRoot = env.AGENT_MAIL_WAKE_HOME || DATA_ROOT;
@@ -87,7 +162,7 @@ export async function handleHook(raw, env = process.env, spawner = spawn) {
     stdout: JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'SessionStart',
-        additionalContext: 'Agent Mail auto-wake is enabled for this Codex session. Incoming peer mail is queued into this thread; use the listener mailbox identity, not a second mailbox.',
+        additionalContext: 'Agent Mail auto-wake is enabled for this Codex session. Incoming peer mail is steered into active turns at tool boundaries, or queued when idle; use the listener mailbox identity, not a second mailbox.',
       },
     }) + '\n',
     spawned: true,

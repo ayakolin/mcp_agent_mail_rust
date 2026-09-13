@@ -110,7 +110,8 @@ Kimi 适配器管理 Web/API 会话，不会同时接管另一个正在运行的
 
 - 每 3 秒检查收件事件，每批最多合并 5 条；检查本身不调用模型。
 - 邮件直接注入正在进行的回合，而不是等会话空闲：OMP 用 `deliverAs: "aside"`
-  在下一个步骤边界注入，挂了钩子的普通 Codex 用 `codex queue`，`codex-mail`
+  在下一个步骤边界注入，挂了钩子的普通 Codex 在工具调用后通过 `PostToolUse` 的 `additionalContext`
+  （或回合末 `Stop` 决策）直接向活动回合 steer，会话空闲时通过 `codex queue` 唤醒；`codex-mail`
   用 App Server 的 `turn/steer`，Kimi 先提交到提示队列再立即用 `prompts:steer`
   转入活动回合，OpenCode 用 `delivery: "steer"` 提交，Claude 由 Channels 原生机制投递。
   仅当会话处于错误状态（或托管 App Server 正处于不可转向的 review/compact 回合）时才会延迟投递。

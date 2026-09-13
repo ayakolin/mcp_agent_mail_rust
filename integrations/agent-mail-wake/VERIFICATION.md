@@ -104,6 +104,29 @@ Verified on this machine against Codex 0.154.0:
 Claude, Kimi, Grok, and OpenCode still need their dedicated launchers. OMP
 already attaches inside ordinary interactive sessions.
 
+## Codex mid-turn steer via PostToolUse and Stop hooks (2026-09-13)
+
+Ordinary `codex` sessions previously delivered mail only after an active turn
+completed (`codex queue` runs at turn boundaries). The hook integration now adds
+`PostToolUse` and `Stop` hooks to steer mail directly into the active turn:
+
+- `PostToolUse` executes after every tool invocation. It marks `turnActive = true`
+  and stamps `lastToolAt`. When mail is waiting in the session's mailbox, it claims
+  the pending batch, commits it (advancing the delivery cursor), and injects the
+  batch prompt via `hookSpecificOutput.additionalContext`. Codex's hook runtime
+  injects this additional context into the running turn immediately.
+- `Stop` executes when a turn attempts to complete. If mail arrived after the last tool
+  call, it claims the batch, commits it, and emits `{"decision": "block", "reason": <prompt>}`,
+  forcing the model to continue the conversation with the incoming mail as feedback.
+  It also clears `turnActive` so the session becomes unblocked.
+- The queue listener (`CodexQueueAdapter`) coordinates with the steer hooks via
+  `isCodexTurnBusy`: while `turnActive` is true and `lastToolAt` is within the
+  `CODEX_STEER_WINDOW_MS` (12 seconds), the queue listener defers delivery so the
+  steer hook can inject mid-turn without racing. A shared `.claim` lock prevents
+  duplicate batch creation and delivery races.
+- If no mail arrives during an active turn or the turn finishes without steer,
+  the queue listener wakes Codex as soon as it goes idle.
+
 ## Mid-turn delivery for Kimi, OpenCode and OMP (2026-09-07)
 
 The remaining idle-gated adapters were moved to mid-turn injection and verified

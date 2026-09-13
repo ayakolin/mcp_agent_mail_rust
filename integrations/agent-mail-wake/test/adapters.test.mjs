@@ -4,6 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CodexAdapter, CodexQueueAdapter, sessionHistoryHas, KimiAdapter } from '../rpc.mjs';
+import { isCodexTurnBusy, CODEX_STEER_WINDOW_MS } from '../common.mjs';
 
 test('Codex steers mail into an active turn instead of waiting for idle', async () => {
   const turn = { id: 'turn-1', status: 'inProgress', items: [] };
@@ -101,6 +102,22 @@ test('Codex queue adapter treats history hits as already accepted', async () => 
   });
   assert.deepEqual(await adapter.deliver('[Agent Mail delivery b2]\nhello', { id: 'b2' }), { alreadyAccepted: true });
   assert.equal(queued, 0);
+});
+
+test('isCodexTurnBusy reports busy only while turn is active and lastToolAt is recent', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-busy-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'state.json');
+  const now = Date.now();
+  fs.writeFileSync(file, JSON.stringify({ turnActive: true, lastToolAt: new Date(now - 1000).toISOString() }));
+  assert.equal(isCodexTurnBusy(file, now), true);
+  fs.writeFileSync(file, JSON.stringify({ turnActive: true, lastToolAt: new Date(now - CODEX_STEER_WINDOW_MS - 1000).toISOString() }));
+  assert.equal(isCodexTurnBusy(file, now), false);
+  fs.writeFileSync(file, JSON.stringify({ turnActive: false, lastToolAt: new Date(now).toISOString() }));
+  assert.equal(isCodexTurnBusy(file, now), false);
+  fs.writeFileSync(file, JSON.stringify({ lastToolAt: new Date(now).toISOString() }));
+  assert.equal(isCodexTurnBusy(file, now), false);
+  assert.equal(isCodexTurnBusy(null, now), false);
 });
 
 test('sessionHistoryHas scans rollout files for the delivery marker', t => {

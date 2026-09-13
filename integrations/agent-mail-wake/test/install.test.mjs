@@ -47,6 +47,8 @@ test('install preserves existing configuration, backs up originals and runs quot
   assert.match(installedCodex, /agent-mail-wake managed hooks/);
   assert.match(installedCodex, /\[\[hooks\.SessionStart\]\]/);
   assert.match(installedCodex, /matcher = "startup\|resume\|clear"/);
+  assert.match(installedCodex, /\[\[hooks\.PostToolUse\]\]/);
+  assert.match(installedCodex, /\[\[hooks\.Stop\]\]/);
   assert.deepEqual(read(ompFile).disabledServers, ['existing']);
   const manifest = read(path.join(result.backup, 'manifest.json'));
   const savedClaude = manifest.find(entry => entry.file === claudeFile);
@@ -126,6 +128,8 @@ test('codex hook install is idempotent and keeps existing MCP tables', t => {
   const first = fs.readFileSync(file, 'utf8');
   assert.match(first, /\[\[hooks\.SessionStart\]\]/);
   assert.match(first, /\[\[hooks\.SessionEnd\]\]/);
+  assert.match(first, /\[\[hooks\.PostToolUse\]\]/);
+  assert.match(first, /\[\[hooks\.Stop\]\]/);
   assert.equal(first.split('agent-mail-wake managed hooks').length - 1, 1);
   applyInstallation(installationPlan({ home, clients: ['codex'] }));
   assert.equal(fs.readFileSync(file, 'utf8'), first);

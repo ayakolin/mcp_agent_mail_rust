@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { MailClient, MailWatcher, STATE_ROOT, DATA_ROOT, listStates, readJson, saveJson, projectPath, identityInstructions, sleep, errorText, findCodexBinary } from './common.mjs';
+import { MailClient, MailWatcher, STATE_ROOT, DATA_ROOT, listStates, readJson, saveJson, projectPath, identityInstructions, sleep, errorText, findCodexBinary, isCodexTurnBusy } from './common.mjs';
 import { CodexRPC, CodexAdapter, CodexQueueAdapter, KimiAdapter, GrokACP, OpenCodeAdapter } from './rpc.mjs';
 
 const CODEX_FORWARD_COMMANDS = new Set([
@@ -208,7 +208,7 @@ export async function attachCodexSession({ session, project }) {
   let persist = () => {};
   const adapter = new CodexQueueAdapter(session, cwd, { seen, persist: () => persist() });
   watcher = new MailWatcher({ host: 'codex', session, project: cwd,
-    canDeliver: () => adapter.canDeliver(), deliver: (text, batch) => adapter.deliver(text, batch), onStatus: report });
+    canDeliver: () => adapter.canDeliver() && !isCodexTurnBusy(watcher?.file), deliver: (text, batch) => adapter.deliver(text, batch), onStatus: report });
   const bindingFile = path.join(DATA_ROOT, 'bindings', `${watcher.id}.json`);
   for (const id of readJson(bindingFile, {}).delivered || []) seen.add(id);
   persist = () => saveJson(bindingFile, {

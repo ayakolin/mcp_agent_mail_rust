@@ -48,6 +48,11 @@ function mailEntry(data, entry) {
   data.mcpServers.mcp_agent_mail ??= entry;
 }
 export function mergeCodexHooks(before, command) {
+  let stateBlock = '';
+  const stateMatch = (before || '').match(/(\n*\[hooks\.state\][\s\S]*?)(?=\n*# end agent-mail-wake|$)/);
+  if (stateMatch) {
+    stateBlock = `\n${stateMatch[1].trim()}\n`;
+  }
   const block = `# agent-mail-wake managed hooks
 [[hooks.SessionStart]]
 matcher = "startup|resume|clear"
@@ -59,12 +64,28 @@ async = true
 timeout = 30
 statusMessage = "Agent Mail auto-wake"
 
+[[hooks.PostToolUse]]
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = ${JSON.stringify(command)}
+timeout = 10
+statusMessage = "Agent Mail steer"
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = ${JSON.stringify(command)}
+timeout = 10
+statusMessage = "Agent Mail check"
+
 [[hooks.SessionEnd]]
 
 [[hooks.SessionEnd.hooks]]
 type = "command"
 command = ${JSON.stringify(command)}
-timeout = 3
+timeout = 3${stateBlock}
 # end agent-mail-wake hook block
 `;
   let text = before || '';
