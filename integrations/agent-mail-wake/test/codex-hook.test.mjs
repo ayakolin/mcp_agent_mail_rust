@@ -75,7 +75,7 @@ test('parseHookEvent tolerates empty and invalid stdin', () => {
 
 test('cli.mjs codex forwards native subcommands and parses native flags into extra', async () => {
   const { spawnSync } = await import('node:child_process');
-  const cliPath = path.resolve('integrations/agent-mail-wake/cli.mjs');
+  const cliPath = new URL('../cli.mjs', import.meta.url).pathname;
   // Running codex queue --help through cli.mjs forwards to native codex instead of throwing
   const queueHelp = spawnSync(process.execPath, [cliPath, 'codex', 'queue', '--help'], { encoding: 'utf8' });
   assert.equal(queueHelp.status, 0, queueHelp.stderr);

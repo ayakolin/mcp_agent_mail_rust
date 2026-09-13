@@ -179,8 +179,13 @@ export class MailWatcher {
   }
   start() {
     if (this.timer || this.stopped) return;
+    // The interval must stay referenced: standalone listener processes (codex
+    // SessionStart attach, codex-mail/kimi-mail/grok-mail/opencode-mail
+    // launchers) hold nothing else in the event loop, and an unref'd timer
+    // lets them exit silently right after init. Host processes (OMP extension,
+    // claude channel) stay alive through their own handles and call stop() on
+    // shutdown, so the referenced timer changes nothing for them.
     this.timer = setInterval(() => { void this.tick(); }, this.interval);
-    this.timer.unref?.();
   }
   release() {
     const lock = readJson(this.lockFile);
@@ -211,7 +216,13 @@ export class MailWatcher {
       if (!batch) {
         const page = await this.client.call('fetch_inbox_events', { project_key: this.project,
           agent_name: this.state.agent, after: this.state.cursor, limit: 5 });
-        if (!page.events.length) return;
+        if (!page.events.length) {
+          // A successful empty poll means the endpoint is reachable again;
+          // clear a stale error from an earlier transient failure so `doctor`
+          // and status lines stop reporting an outage that has recovered.
+          if (this.state.error) { delete this.state.error; this.save(); this.onStatus(this.status()); }
+          return;
+        }
         const messages = [];
         for (const event of page.events) {
           if (event.from !== this.state.agent) messages.push(await this.client.message(event.message_id, this.project));

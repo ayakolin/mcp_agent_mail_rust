@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { MailWatcher, readJson } from '../common.mjs';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { fileURLToPath } from 'node:url';
+import { MailWatcher, readJson, sleep } from '../common.mjs';
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mail-wake-test-'));
@@ -99,4 +102,62 @@ test('a cursor gap pauses instead of dropping unread history', async t => {
   const watcher = new MailWatcher({ ...f.options, deliver: async () => assert.fail('must not deliver') });
   await watcher.init({ start: false }); t.after(() => watcher.stop()); await watcher.tick();
   assert.equal(watcher.state.paused, true); assert.equal(watcher.state.cursor, 0);
+});
+
+test('started watcher keeps a standalone process alive', async t => {
+  // Regression for the unref'd poll interval: standalone listener processes
+  // (codex SessionStart attach, codex-mail/kimi-mail/grok-mail/opencode-mail)
+  // hold nothing else in the event loop, so an unref'd timer let them exit
+  // right after init. Run a watcher in a bare child process and observe it
+  // stay alive past several poll intervals.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mail-wake-alive-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const script = path.join(dir, 'listener.mjs');
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  fs.writeFileSync(script, `
+import { MailWatcher } from ${JSON.stringify(path.join(root, 'common.mjs'))};
+const client = { endpoint: 'http://127.0.0.1:8765/mcp/', call: async () => ({ events: [], next_cursor: 0 }),
+  message: async () => ({}) };
+const watcher = new MailWatcher({ host: 'test', session: 'standalone', project: ${JSON.stringify(dir)},
+  interval: 250, stateRoot: ${JSON.stringify(path.join(dir, 'state'))}, client,
+  deliver: async () => {} });
+await watcher.init();
+process.stdout.write('READY ' + watcher.id + '\\n');
+`);
+  const proc = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'inherit'] });
+  t.after(() => { proc.kill('SIGTERM'); });
+  let ready = '';
+  proc.stdout.on('data', chunk => { ready += chunk; });
+  await new Promise((resolve, reject) => {
+    proc.stdout.on('data', function onReady(chunk) {
+      if (ready.includes('READY')) { proc.stdout.off('data', onReady); resolve(); }
+    });
+    proc.on('exit', code => reject(new Error(`listener exited early with ${code}`)));
+    setTimeout(resolve, 5000);
+  });
+  // The child must still be running after 15 poll intervals.
+  await sleep(3750);
+  assert.equal(proc.exitCode, null);
+  assert.equal(proc.signalCode, null);
+  proc.kill('SIGTERM');
+  await once(proc, 'exit');
+});
+
+test('a successful empty poll clears a stale error from an earlier transient failure', async t => {
+  const f = fixture(t);
+  const watcher = new MailWatcher({ ...f.options, deliver: async () => assert.fail('must not deliver') });
+  await watcher.init({ start: false }); t.after(() => watcher.stop());
+  // Simulate a transient outage (e.g. the mail service restarting): the poll
+  // throws and the error is recorded in state.
+  const original = f.client.call;
+  f.client.call = async (name, args) => {
+    if (name === 'fetch_inbox_events') throw new Error('fetch failed');
+    return original(name, args);
+  };
+  await watcher.tick();
+  assert.equal(watcher.state.error, 'fetch failed');
+  // Service is back: an empty successful poll must clear the stale error.
+  f.client.call = original;
+  await watcher.tick();
+  assert.equal(watcher.state.error, undefined);
 });
