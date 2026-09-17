@@ -192,6 +192,49 @@ export function findCodexListener(session, roots = {}) {
   return findSessionListener(session, { host: 'codex', ...roots });
 }
 
+export async function ensureHookListener(session, {
+  host, cwd, env = process.env, client, stateRoot, dataRoot, timeoutMs = 5000,
+} = {}) {
+  if (!session || !host || env.AGENT_MAIL_WAKE_ENABLED === '0') return null;
+  const data = dataRoot || env.AGENT_MAIL_WAKE_HOME || DATA_ROOT;
+  const states = stateRoot || env.AGENT_MAIL_WAKE_STATE_DIR || path.join(data, 'state');
+  const existing = findSessionListener(session, { host, stateRoot: states, dataRoot: data })
+    || findSessionListener(session, { stateRoot: states, dataRoot: data });
+  if (existing?.file) {
+    const current = readJson(existing.file, {});
+    if (current?.agent) return { ...existing, state: current };
+  }
+  const project = projectPath(cwd || env.AGENT_MAIL_PROJECT || process.cwd());
+  const mail = client || new MailClient(env.AGENT_MAIL_URL, {}, { timeoutMs });
+  const id = hash(`${mail.endpoint}|${host}|${session}|${project}`);
+  const file = path.join(states, `${id}.json`);
+  const bindingFile = path.join(data, 'bindings', `${id}.json`);
+  return await withClaimLock(file, async () => {
+    const previous = readJson(file, {});
+    if (previous.agent && previous.session === session) {
+      return { id: previous.id || id, file, bindingFile, state: previous };
+    }
+    await mail.call('ensure_project', { human_key: project });
+    const agent = await mail.call('register_agent', {
+      project_key: project, program: host, model: 'configured-model',
+      ...(previous.agent ? { name: previous.agent } : {}),
+      task_description: `Auto-wake session ${session}`,
+    });
+    if (previous.agent && previous.agent !== agent.name) {
+      throw new Error('Registered mailbox changed; refusing to reuse another mailbox’s cursor');
+    }
+    const state = {
+      ...previous, id, host, session, project, endpoint: mail.endpoint,
+      cursor: previous.cursor ?? 0, wakeups: previous.wakeups ?? 0,
+      paused: previous.paused ?? false, agent: agent.name,
+      updatedAt: new Date().toISOString(),
+    };
+    saveJson(file, state);
+    saveJson(bindingFile, { ...readJson(bindingFile, {}), host, session, project, agent: agent.name, delivery: 'hook' });
+    return { id, file, bindingFile, state };
+  }, { timeoutMs });
+}
+
 export function stampCodexTurn(file, { active = true, now = new Date() } = {}) {
   if (!file || !fs.existsSync(file)) return null;
   const state = readJson(file, {});

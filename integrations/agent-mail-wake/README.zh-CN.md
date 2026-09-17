@@ -42,8 +42,8 @@ node integrations/agent-mail-wake/install.mjs --clients omp,codex,claude
 | 客户端 | 安装位置 |
 | --- | --- |
 | OMP | `~/.omp/agent/extensions/agent-mail-wake/index.ts` 和 `~/.omp/agent/mcp.json` |
-| Codex | `~/.codex/config.toml` 中缺失的 Agent Mail 连接、SessionStart 钩子，以及 `codex-mail` |
-| Claude Code | `~/.claude.json` 中的 Agent Mail 连接和 `agent_mail_wake` Channel，以及 `claude-mail` |
+| Codex | `~/.codex/config.toml` 中缺失的 Agent Mail 连接、SessionStart/PostToolUse/Stop 钩子，以及 `codex-mail` |
+| Claude Code | `~/.claude/settings.json` 中的 PreToolUse/SessionStart/PostToolUse/Stop 钩子、`~/.claude.json` 中的 Agent Mail 连接和 `agent_mail_wake` Channel，以及 `claude-mail` |
 | Kimi Code | `~/.kimi-code/mcp.json` 中缺失的连接，以及 `kimi-mail` |
 | Grok Build | `~/.grok/config.toml` 中缺失的 Agent Mail 连接，以及 `grok-mail` |
 | OpenCode | `~/.opencode/opencode.json` 中缺失的 Agent Mail 连接，以及 `opencode-mail` |
@@ -95,9 +95,11 @@ agent-mail-wake doctor
 
 Claude 首次使用自定义 Channel 的启动入口时，会要求确认这是本地开发的 Channel。
 这个要求由 Claude 自己执行。启动器仅启用 `server:agent_mail_wake`，
-不启用跳过工具权限检查的选项。直接运行普通 `claude` 时，Channel MCP 保持被动。
+不启用跳过工具权限检查的选项。直接运行普通 `claude` 时，Channel MCP 保持被动，
+但 SessionStart/PostToolUse/Stop 钩子仍会按 `session_id` 注册邮箱，并把新邮件注入当前回合。
 
-普通 `codex` 会在 SessionStart（`startup`、`resume`、`/clear`）时挂上 `codex queue` 监听器。新安装或变更后的钩子
+普通 `codex` 会在 SessionStart（`startup`、`resume`、`/clear`）时挂上 `codex queue` 监听器，
+并在 PostToolUse/Stop 边界把邮件注入活动回合。新安装或变更后的钩子
 需要在 Codex 里用 `/hooks` 审查并信任后才会运行；未信任时行为与安装前相同。
 `AGENT_MAIL_WAKE_ENABLED=0` 可关闭本次会话的自动挂接。
 `codex-mail` 会将 `resume`、`queue` 等原生子命令与 `--yolo` 等原生参数透明透传到底层 Codex；若设置了 `alias codex=codex-mail`，`codex resume` 会正常启动原生恢复并触发 SessionStart 自动挂接。重新连接或恢复会话时还会自动重置暂停状态。

@@ -158,7 +158,9 @@ test('claude hook install is idempotent and merges hooks into settings.json pres
   const installed = read(file);
   assert.equal(installed.model, 'fable');
   assert.equal(installed.hooks.ExistingHook.length, 1);
+  assert.equal(installed.hooks.PreToolUse.length, 1);
   assert.equal(installed.hooks.SessionStart.length, 1);
+  assert.equal(installed.hooks.SessionStart[0].matcher, undefined);
   assert.equal(installed.hooks.PostToolUse.length, 1);
   assert.equal(installed.hooks.Stop.length, 1);
   assert.equal(installed.hooks.SessionEnd.length, 1);

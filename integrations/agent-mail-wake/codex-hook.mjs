@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ROOT, DATA_ROOT, STATE_ROOT, listStates, readJson, MailClient, batchPrompt, findCodexListener, stampCodexTurn, claimSteerBatch, commitSteerBatch } from './common.mjs';
+import { ROOT, DATA_ROOT, STATE_ROOT, listStates, readJson, MailClient, batchPrompt, identityInstructions, findCodexListener, ensureHookListener, stampCodexTurn, claimSteerBatch, commitSteerBatch } from './common.mjs';
 
 export function parseHookEvent(raw) {
   try { return JSON.parse(raw || '{}'); } catch { return {}; }
@@ -71,11 +71,13 @@ export async function handlePostToolUse(event, env = process.env, extras = {}) {
   if (!id) return {};
   const dataRoot = env.AGENT_MAIL_WAKE_HOME || DATA_ROOT;
   const stateRoot = env.AGENT_MAIL_WAKE_STATE_DIR || path.join(dataRoot, 'state');
-  const listener = findCodexListener(id, { stateRoot, dataRoot });
-  if (!listener?.file) return {};
   try {
-    stampCodexTurn(listener.file, { active: true });
     const client = extras.client || new MailClient(env.AGENT_MAIL_URL, {}, { timeoutMs: 5000 });
+    const listener = await ensureHookListener(id, {
+      host: 'codex', cwd: event.cwd, env, client, stateRoot, dataRoot,
+    }) || findCodexListener(id, { stateRoot, dataRoot });
+    if (!listener?.file) return {};
+    stampCodexTurn(listener.file, { active: true });
     const claimed = await claimSteerBatch(listener.file, client, { timeoutMs: 1500 });
     if (!claimed?.batch) return {};
     if (!claimed.batch.messages?.length) {
@@ -101,10 +103,12 @@ export async function handleStop(event, env = process.env, extras = {}) {
   if (!id) return {};
   const dataRoot = env.AGENT_MAIL_WAKE_HOME || DATA_ROOT;
   const stateRoot = env.AGENT_MAIL_WAKE_STATE_DIR || path.join(dataRoot, 'state');
-  const listener = findCodexListener(id, { stateRoot, dataRoot });
-  if (!listener?.file) return {};
   try {
     const client = extras.client || new MailClient(env.AGENT_MAIL_URL, {}, { timeoutMs: 5000 });
+    const listener = await ensureHookListener(id, {
+      host: 'codex', cwd: event.cwd, env, client, stateRoot, dataRoot,
+    }) || findCodexListener(id, { stateRoot, dataRoot });
+    if (!listener?.file) return {};
     const claimed = await claimSteerBatch(listener.file, client, { timeoutMs: 1500 });
     if (!claimed?.batch?.messages?.length) {
       if (claimed?.batch) await commitSteerBatch(listener.file, claimed.batch);
@@ -119,7 +123,8 @@ export async function handleStop(event, env = process.env, extras = {}) {
       reason: prompt,
     };
   } catch {
-    stampCodexTurn(listener.file, { active: false });
+    const listener = findCodexListener(id, { stateRoot, dataRoot });
+    if (listener?.file) stampCodexTurn(listener.file, { active: false });
     return {};
   }
 }
@@ -143,6 +148,15 @@ export async function handleHook(raw, env = process.env, spawner = spawn, extras
   }
   if (!shouldAttach(event, env)) return { stdout: '{}\n', spawned: false };
   const dataRoot = env.AGENT_MAIL_WAKE_HOME || DATA_ROOT;
+  const stateRoot = env.AGENT_MAIL_WAKE_STATE_DIR || path.join(dataRoot, 'state');
+  let identity = 'Incoming peer mail is steered into active turns at tool boundaries, or queued when idle; use the listener mailbox identity, not a second mailbox.';
+  try {
+    const client = extras.client || new MailClient(env.AGENT_MAIL_URL, {}, { timeoutMs: 5000 });
+    const listener = await ensureHookListener(id, {
+      host: 'codex', cwd: event.cwd, env, client, stateRoot, dataRoot,
+    });
+    if (listener?.state?.agent) identity = identityInstructions(listener.state);
+  } catch {}
   const logDir = path.join(dataRoot, 'logs');
   fs.mkdirSync(logDir, { recursive: true, mode: 0o700 });
   const log = fs.openSync(path.join(logDir, `codex-hook-${Date.now()}.log`), 'a', 0o600);
@@ -162,7 +176,7 @@ export async function handleHook(raw, env = process.env, spawner = spawn, extras
     stdout: JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'SessionStart',
-        additionalContext: 'Agent Mail auto-wake is enabled for this Codex session. Incoming peer mail is steered into active turns at tool boundaries, or queued when idle; use the listener mailbox identity, not a second mailbox.',
+        additionalContext: `Agent Mail auto-wake is enabled for this Codex session. ${identity}`,
       },
     }) + '\n',
     spawned: true,

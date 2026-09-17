@@ -100,6 +100,13 @@ export function mergeClaudeHooks(settings, command) {
     settings.hooks = {};
   }
   const managedHook = { type: 'command', command };
+  const stopHook = {
+    type: 'command',
+    command,
+    asyncRewake: true,
+    rewakeSummary: 'Agent Mail',
+    rewakeMessage: 'Incoming Agent Mail received:\n',
+  };
   const filterOut = (hooksArray) => {
     return (hooksArray || []).map(group => {
       if (!Array.isArray(group.hooks)) return group;
@@ -109,14 +116,18 @@ export function mergeClaudeHooks(settings, command) {
       };
     }).filter(group => Array.isArray(group.hooks) && group.hooks.length > 0);
   };
-  for (const event of ['SessionStart', 'PostToolUse', 'Stop', 'SessionEnd']) {
+  for (const event of ['PreToolUse', 'SessionStart', 'PostToolUse', 'Stop', 'SessionEnd']) {
     if (settings.hooks[event]) {
       settings.hooks[event] = filterOut(settings.hooks[event]);
     }
   }
+  settings.hooks.PreToolUse = [
+    ...(settings.hooks.PreToolUse || []),
+    { hooks: [managedHook] },
+  ];
   settings.hooks.SessionStart = [
     ...(settings.hooks.SessionStart || []),
-    { matcher: 'startup|resume|clear', hooks: [managedHook] },
+    { hooks: [managedHook] },
   ];
   settings.hooks.PostToolUse = [
     ...(settings.hooks.PostToolUse || []),
@@ -124,7 +135,7 @@ export function mergeClaudeHooks(settings, command) {
   ];
   settings.hooks.Stop = [
     ...(settings.hooks.Stop || []),
-    { hooks: [managedHook] },
+    { hooks: [stopHook] },
   ];
   settings.hooks.SessionEnd = [
     ...(settings.hooks.SessionEnd || []),

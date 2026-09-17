@@ -3,7 +3,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { MailWatcher, MailClient, identityInstructions, errorText, projectPath, DATA_ROOT, STATE_ROOT, batchPrompt, findSessionListener, stampCodexTurn, claimSteerBatch, commitSteerBatch, isTurnBusy } from './common.mjs';
+import { MailWatcher, MailClient, identityInstructions, errorText, projectPath, DATA_ROOT, STATE_ROOT, batchPrompt, findSessionListener, ensureHookListener, stampCodexTurn, claimSteerBatch, commitSteerBatch, isTurnBusy, sleep, saveJson, readJson } from './common.mjs';
 
 let watcher, initialized = false, closing = false;
 const enabled = process.env.AGENT_MAIL_WAKE_CLAUDE_ENABLED === '1';
@@ -51,6 +51,41 @@ async function handle(message) {
 export function parseHookEvent(raw) {
   try { return JSON.parse(raw || '{}'); } catch { return {}; }
 }
+export function extractRegisteredAgentName(event) {
+  const tool = event?.tool_name || '';
+  if (!/(?:^|_)register_agent$|(?:^|_)create_agent_identity$|(?:^|_)macro_start_session$/.test(tool)) {
+    return null;
+  }
+  let res = event.tool_response ?? event.tool_result;
+  if (!res) return null;
+  if (typeof res === 'string') {
+    try { res = JSON.parse(res); } catch {}
+  }
+  function scan(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    if (obj.name && typeof obj.name === 'string') return obj.name;
+    if (obj.agent_name && typeof obj.agent_name === 'string') return obj.agent_name;
+    if (obj.agent?.name && typeof obj.agent.name === 'string') return obj.agent.name;
+    if (typeof obj.text === 'string') {
+      try {
+        const parsed = JSON.parse(obj.text);
+        const name = scan(parsed);
+        if (name) return name;
+      } catch {}
+    }
+    const items = Array.isArray(obj) ? obj : Array.isArray(obj.content) ? obj.content : null;
+    if (items) {
+      for (const item of items) {
+        const name = scan(item);
+        if (name) return name;
+      }
+    }
+    return null;
+  }
+  return scan(res);
+}
+
+
 
 export function sessionId(event) {
   return event?.session_id || event?.thread_id || event?.id || '';
@@ -64,13 +99,47 @@ export async function handleClaudeHook(raw, env = process.env, extras = {}) {
   }
   const dataRoot = env.AGENT_MAIL_WAKE_HOME || DATA_ROOT;
   const stateRoot = env.AGENT_MAIL_WAKE_STATE_DIR || path.join(dataRoot, 'state');
+  const client = extras.client || new MailClient(env.AGENT_MAIL_URL, {}, { timeoutMs: 5000 });
+  const resolveListener = () => ensureHookListener(id, {
+    host: 'claude-code', cwd: event.cwd, env, client, stateRoot, dataRoot,
+  }).then(listener => listener || findSessionListener(id, { host: 'claude-code', stateRoot, dataRoot })
+    || findSessionListener(id, { stateRoot, dataRoot }));
 
+  if (event.hook_event_name === 'PreToolUse') {
+    const tool = event?.tool_name || '';
+    if (/(?:^|_)register_agent$|(?:^|_)create_agent_identity$/.test(tool)) {
+      try {
+        const listener = await resolveListener();
+        if (listener?.state?.agent) {
+          return {
+            stdout: JSON.stringify({
+              hookSpecificOutput: {
+                hookEventName: 'PreToolUse',
+                permissionDecision: 'deny',
+                permissionDecisionReason: `Registration blocked: You are ALREADY registered in this session as agent_name="${listener.state.agent}" for project_key="${listener.state.project}". Do NOT register another mailbox. When sending messages, directly call send_message with sender_name="${listener.state.agent}".`,
+              },
+            }) + '\n',
+          };
+        }
+      } catch {}
+    }
+    return { stdout: '{}\n' };
+  }
   if (event.hook_event_name === 'SessionStart') {
+    let identity = 'Incoming peer mail is steered into active turns at tool boundaries; use the listener mailbox identity, not a second mailbox.';
+    let assignedAgent = '';
+    try {
+      const listener = await resolveListener();
+      if (listener?.state?.agent) {
+        identity = identityInstructions(listener.state);
+        assignedAgent = listener.state.agent;
+      }
+    } catch {}
     return {
       stdout: JSON.stringify({
         hookSpecificOutput: {
           hookEventName: 'SessionStart',
-          additionalContext: 'Agent Mail auto-wake is enabled for this Claude session. Incoming peer mail is steered into active turns at tool boundaries; use the listener mailbox identity, not a second mailbox.',
+          additionalContext: `Agent Mail auto-wake is enabled for this Claude session. ${identity} You are ALREADY registered in this project. When sending messages, directly set sender_name="${assignedAgent || 'assigned identity'}". Do NOT call register_agent or create_agent_identity.`,
         },
       }) + '\n',
     };
@@ -79,12 +148,24 @@ export async function handleClaudeHook(raw, env = process.env, extras = {}) {
     return { stdout: '{}\n' };
   }
   if (event.hook_event_name === 'PostToolUse') {
-    const listener = findSessionListener(id, { host: 'claude-code', stateRoot, dataRoot })
-      || findSessionListener(id, { stateRoot, dataRoot });
-    if (!listener?.file) return { stdout: '{}\n' };
     try {
+      const listener = await resolveListener();
+      if (!listener?.file) return { stdout: '{}\n' };
       stampCodexTurn(listener.file, { active: true });
-      const client = extras.client || new MailClient(env.AGENT_MAIL_URL, {}, { timeoutMs: 5000 });
+      const newAgent = extractRegisteredAgentName(event);
+      if (newAgent && listener.state && listener.state.agent !== newAgent) {
+        listener.state.agent = newAgent;
+        listener.state.cursor = 0;
+        saveJson(listener.file, listener.state);
+        const bindingFile = path.join(dataRoot, 'bindings', `${listener.state.session}.json`);
+        const binding = readJson(bindingFile, {});
+        saveJson(bindingFile, { ...binding, agent: newAgent });
+        if (watcher?.state && watcher.state.agent !== newAgent) {
+          watcher.state.agent = newAgent;
+          watcher.state.cursor = 0;
+          watcher.save();
+        }
+      }
       const claimed = await claimSteerBatch(listener.file, client, { timeoutMs: 1500 });
       if (!claimed?.batch) return { stdout: '{}\n' };
       if (!claimed.batch.messages?.length) {
@@ -106,28 +187,54 @@ export async function handleClaudeHook(raw, env = process.env, extras = {}) {
     }
   }
   if (event.hook_event_name === 'Stop') {
-    const listener = findSessionListener(id, { host: 'claude-code', stateRoot, dataRoot })
-      || findSessionListener(id, { stateRoot, dataRoot });
-    if (!listener?.file) return { stdout: '{}\n' };
     try {
-      const client = extras.client || new MailClient(env.AGENT_MAIL_URL, {}, { timeoutMs: 5000 });
+      const listener = await resolveListener();
+      if (!listener?.file) return { stdout: '{}\n' };
+      stampCodexTurn(listener.file, { active: false });
       const claimed = await claimSteerBatch(listener.file, client, { timeoutMs: 1500 });
-      if (!claimed?.batch?.messages?.length) {
-        if (claimed?.batch) await commitSteerBatch(listener.file, claimed.batch);
+      if (claimed?.batch?.messages?.length) {
+        const prompt = batchPrompt(claimed.state, claimed.batch);
+        await commitSteerBatch(listener.file, claimed.batch);
         stampCodexTurn(listener.file, { active: false });
-        return { stdout: '{}\n' };
+        return {
+          stdout: JSON.stringify({
+            decision: 'block',
+            reason: prompt,
+          }) + '\n',
+          exitCode: 2,
+          prompt,
+        };
       }
-      const prompt = batchPrompt(claimed.state, claimed.batch);
-      await commitSteerBatch(listener.file, claimed.batch);
-      stampCodexTurn(listener.file, { active: false });
-      return {
-        stdout: JSON.stringify({
-          decision: 'block',
-          reason: prompt,
-        }) + '\n',
-      };
+      if (claimed?.batch) await commitSteerBatch(listener.file, claimed.batch);
+
+      if (extras.wait || (process.argv.includes('hook') && !event.stop_hook_active && !extras.nowait)) {
+        process.stdout.write(JSON.stringify({ async: true, asyncRewake: true }) + '\n');
+        const pollIntervalMs = 2500;
+        const maxWaitMs = Number(env.AGENT_MAIL_WAKE_STOP_TIMEOUT_MS) || 600000;
+        const start = Date.now();
+        while (Date.now() - start < maxWaitMs) {
+          await sleep(pollIntervalMs);
+          if (isTurnBusy(listener.file)) {
+            process.exit(0);
+          }
+          try {
+            const rechecked = await claimSteerBatch(listener.file, client, { timeoutMs: 1500 });
+            if (rechecked?.batch?.messages?.length) {
+              const prompt = batchPrompt(rechecked.state, rechecked.batch);
+              await commitSteerBatch(listener.file, rechecked.batch);
+              process.stderr.write(prompt + '\n');
+              process.exit(2);
+            }
+            if (rechecked?.batch) await commitSteerBatch(listener.file, rechecked.batch);
+          } catch {}
+        }
+        process.exit(0);
+      }
+      return { stdout: '{}\n' };
     } catch {
-      stampCodexTurn(listener.file, { active: false });
+      const listener = findSessionListener(id, { host: 'claude-code', stateRoot, dataRoot })
+        || findSessionListener(id, { stateRoot, dataRoot });
+      if (listener?.file) stampCodexTurn(listener.file, { active: false });
       return { stdout: '{}\n' };
     }
   }
@@ -145,7 +252,13 @@ function readStdin() {
 
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv.includes('hook')) {
+    process.on('SIGTERM', () => process.exit(0));
+    process.on('SIGINT', () => process.exit(0));
     const result = await handleClaudeHook(await readStdin());
+    if (result.exitCode !== undefined && result.exitCode !== 0) {
+      if (result.prompt) process.stderr.write(result.prompt + '\n');
+      process.exit(result.exitCode);
+    }
     process.stdout.write(result.stdout);
   } else {
     const input = readline.createInterface({ input: process.stdin });

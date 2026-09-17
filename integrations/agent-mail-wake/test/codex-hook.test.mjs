@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { handleHook, shouldAttach, parseHookEvent, sessionId, isFreshListener, stopQueueListeners } from '../codex-hook.mjs';
-import { handleClaudeHook } from '../claude-channel.mjs';
+import { handleClaudeHook, extractRegisteredAgentName } from '../claude-channel.mjs';
 import { findCodexBinary } from '../common.mjs';
 
 test('SessionStart startup and resume attach; compact and opt-out do not', async () => {
@@ -45,16 +45,17 @@ test('SessionStart hook detaches a queue listener process', async t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-home-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const result = await handleHook(JSON.stringify({
-    session_id: '01abc', cwd: '/tmp/project', source: 'startup', hook_event_name: 'SessionStart',
+    session_id: '01abc', cwd: home, source: 'startup', hook_event_name: 'SessionStart',
   }), { AGENT_MAIL_WAKE_HOME: home }, (command, args, options) => {
     spawned.push({ command, args, options });
     return { pid: 4242, unref() {} };
-  });
+  }, { client: { endpoint: 'http://127.0.0.1:8765/mcp/', call: async (name) => name === 'register_agent' ? { name: 'HookCodex' } : {} } });
   assert.equal(result.spawned, true);
   assert.equal(spawned.length, 1);
   assert.ok(spawned[0].args.includes('attach'));
   assert.ok(spawned[0].args.includes('01abc'));
   assert.match(result.stdout, /Agent Mail auto-wake is enabled/);
+  assert.match(result.stdout, /HookCodex/);
 });
 
 test('SessionEnd and compact emit empty JSON and do not spawn', async () => {
@@ -92,11 +93,11 @@ test('SessionStart clear attaches a queue listener', async t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-clear-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const result = await handleHook(JSON.stringify({
-    session_id: '01clear', cwd: '/tmp/project', source: 'clear', hook_event_name: 'SessionStart',
+    session_id: '01clear', cwd: home, source: 'clear', hook_event_name: 'SessionStart',
   }), { AGENT_MAIL_WAKE_HOME: home }, (command, args) => {
     spawned.push({ command, args });
     return { pid: 4343, unref() {} };
-  });
+  }, { client: { endpoint: 'http://127.0.0.1:8765/mcp/', call: async () => ({ name: 'ClearCodex' }) } });
   assert.equal(result.spawned, true);
   assert.ok(spawned[0].args.includes('01clear'));
 });
@@ -286,9 +287,158 @@ test('handleClaudeHook steers mail into PostToolUse and Stop', async t => {
   assert.equal(stopResult.stdout, '{}\n');
   assert.equal(JSON.parse(fs.readFileSync(listenerFile, 'utf8')).turnActive, undefined);
 
-  // SessionStart provides auto-wake instructions
   const startResult = await handleClaudeHook(JSON.stringify({
-    hook_event_name: 'SessionStart', session_id: 'claude-ses-1',
-  }), { AGENT_MAIL_WAKE_HOME: home });
+    hook_event_name: 'SessionStart', session_id: 'claude-ses-1', cwd: home,
+  }), { AGENT_MAIL_WAKE_HOME: home }, { client: stubClient });
   assert.match(JSON.parse(startResult.stdout).hookSpecificOutput?.additionalContext, /auto-wake is enabled for this Claude session/);
+});
+
+test('PostToolUse lazily registers a mailbox when no listener exists', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-lazy-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const calls = [];
+  const events = [{ cursor: 3, message_id: 301, from: 'PeerE' }];
+  const messages = new Map([[301, { id: 301, from: 'PeerE', subject: 'lazy steer', body_md: 'default session mail' }]]);
+  const stubClient = {
+    endpoint: 'http://127.0.0.1:8765/mcp/',
+    call: async (name, args) => {
+      calls.push(name);
+      if (name === 'ensure_project') return {};
+      if (name === 'register_agent') return { name: 'LazyCodex' };
+      if (name === 'fetch_inbox_events') return { events, next_cursor: 3 };
+      throw new Error(name);
+    },
+    message: async (id) => messages.get(id),
+  };
+  const result = await handleHook(JSON.stringify({
+    hook_event_name: 'PostToolUse', session_id: 's-lazy', tool_name: 'Bash', cwd: home,
+  }), { AGENT_MAIL_WAKE_HOME: home }, () => {
+    throw new Error('must not spawn listener');
+  }, { client: stubClient });
+  const parsed = JSON.parse(result.stdout);
+  assert.ok(calls.includes('ensure_project'));
+  assert.ok(calls.includes('register_agent'));
+  assert.equal(parsed.hookSpecificOutput?.hookEventName, 'PostToolUse');
+  assert.match(parsed.hookSpecificOutput?.additionalContext, /lazy steer/);
+  assert.match(parsed.hookSpecificOutput?.additionalContext, /LazyCodex/);
+});
+
+test('handleClaudeHook SessionStart and PostToolUse create a mailbox on ordinary claude', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-hook-lazy-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const events = [{ cursor: 9, message_id: 401, from: 'PeerF' }];
+  const messages = new Map([[401, { id: 401, from: 'PeerF', subject: 'plain claude', body_md: 'steer now' }]]);
+  const stubClient = {
+    endpoint: 'http://127.0.0.1:8765/mcp/',
+    call: async (name) => {
+      if (name === 'ensure_project') return {};
+      if (name === 'register_agent') return { name: 'PlainClaude' };
+      if (name === 'fetch_inbox_events') return { events, next_cursor: 9 };
+      throw new Error(name);
+    },
+    message: async (id) => messages.get(id),
+  };
+  const start = await handleClaudeHook(JSON.stringify({
+    hook_event_name: 'SessionStart', session_id: 'claude-plain-1', cwd: home, source: 'startup',
+  }), { AGENT_MAIL_WAKE_HOME: home }, { client: stubClient });
+  assert.match(JSON.parse(start.stdout).hookSpecificOutput?.additionalContext, /PlainClaude/);
+  const post = await handleClaudeHook(JSON.stringify({
+    hook_event_name: 'PostToolUse', session_id: 'claude-plain-1', tool_name: 'Bash', cwd: home,
+  }), { AGENT_MAIL_WAKE_HOME: home }, { client: stubClient });
+  assert.match(JSON.parse(post.stdout).hookSpecificOutput?.additionalContext, /plain claude/);
+});
+
+test('extractRegisteredAgentName extracts names from register_agent and macro responses', () => {
+  assert.equal(extractRegisteredAgentName({
+    tool_name: 'mcp__mcp_agent_mail__register_agent',
+    tool_response: { name: 'BronzePond' },
+  }), 'BronzePond');
+  assert.equal(extractRegisteredAgentName({
+    tool_name: 'register_agent',
+    tool_response: '{"agent_name": "SilverFox"}',
+  }), 'SilverFox');
+  assert.equal(extractRegisteredAgentName({
+    tool_name: 'mcp__agent_mail__macro_start_session',
+    tool_response: { content: [{ type: 'text', text: '{"agent":{"name":"GoldHawk"}}' }] },
+  }), 'GoldHawk');
+  assert.equal(extractRegisteredAgentName({
+    tool_name: 'mcp__mcp_agent_mail__register_agent',
+    tool_response: [{ type: 'text', text: '{"id":147,"name":"RubyPelican"}' }],
+  }), 'RubyPelican');
+  assert.equal(extractRegisteredAgentName({
+    tool_name: 'Bash',
+    tool_response: { name: 'Ignored' },
+  }), null);
+});
+
+test('handleClaudeHook PostToolUse synchronizes newly registered agent identity', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-hook-sync-'));
+  const stateRoot = path.join(home, 'state');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(stateRoot, { recursive: true });
+  const listenerFile = path.join(stateRoot, 'listener-sync.json');
+  fs.writeFileSync(listenerFile, JSON.stringify({
+    id: 'listener-sync', host: 'claude-code', session: 'claude-sync-1', project: '/tmp/proj', agent: 'OldIdentity', cursor: 42,
+  }));
+  const stubClient = {
+    endpoint: 'http://127.0.0.1:8765/mcp/',
+    call: async (name, args) => {
+      if (name === 'fetch_inbox_events') {
+        assert.equal(args.agent_name, 'NewIdentity');
+        assert.equal(args.after, 0);
+        return { events: [], next_cursor: 0 };
+      }
+      throw new Error(name);
+    },
+  };
+  const post = await handleClaudeHook(JSON.stringify({
+    hook_event_name: 'PostToolUse', session_id: 'claude-sync-1', tool_name: 'mcp__mcp_agent_mail__register_agent',
+    tool_response: { name: 'NewIdentity' },
+  }), { AGENT_MAIL_WAKE_HOME: home }, { client: stubClient });
+  assert.equal(post.stdout, '{}\n');
+  const updated = JSON.parse(fs.readFileSync(listenerFile, 'utf8'));
+  assert.equal(updated.agent, 'NewIdentity');
+  assert.equal(updated.cursor, 0);
+});
+
+test('handleClaudeHook PreToolUse blocks redundant register_agent call', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-hook-pre-'));
+  const stateRoot = path.join(home, 'state');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(stateRoot, { recursive: true });
+  const listenerFile = path.join(stateRoot, 'listener-pre.json');
+  fs.writeFileSync(listenerFile, JSON.stringify({
+    id: 'listener-pre', host: 'claude-code', session: 'claude-pre-1', project: '/tmp/proj', agent: 'AssignedAgent', cursor: 0,
+  }));
+  const pre = await handleClaudeHook(JSON.stringify({
+    hook_event_name: 'PreToolUse', session_id: 'claude-pre-1', tool_name: 'mcp__mcp_agent_mail__register_agent',
+    cwd: home,
+  }), { AGENT_MAIL_WAKE_HOME: home }, { client: { call: async () => ({}) } });
+  const parsed = JSON.parse(pre.stdout);
+  assert.equal(parsed.hookSpecificOutput?.hookEventName, 'PreToolUse');
+  assert.equal(parsed.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.match(parsed.hookSpecificOutput?.permissionDecisionReason, /AssignedAgent/);
+});
+
+test('handleClaudeHook Stop hook returns exitCode 2 with pending mail prompt', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-hook-stop-mail-'));
+  const stateRoot = path.join(home, 'state');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(stateRoot, { recursive: true });
+  const listenerFile = path.join(stateRoot, 'listener-stop.json');
+  fs.writeFileSync(listenerFile, JSON.stringify({
+    id: 'listener-stop', host: 'claude-code', session: 'claude-stop-1', project: '/tmp/proj', agent: 'TargetClaude', cursor: 10,
+  }));
+  const events = [{ cursor: 15, message_id: 501, from: 'PeerG' }];
+  const messages = new Map([[501, { id: 501, from: 'PeerG', subject: 'wake now', body_md: 'urgent message' }]]);
+  const stubClient = {
+    call: async () => ({ events, next_cursor: 15 }),
+    message: async (id) => messages.get(id),
+  };
+  const stopResult = await handleClaudeHook(JSON.stringify({
+    hook_event_name: 'Stop', session_id: 'claude-stop-1',
+  }), { AGENT_MAIL_WAKE_HOME: home }, { client: stubClient });
+  assert.equal(stopResult.exitCode, 2);
+  assert.match(stopResult.prompt, /wake now/);
+  assert.match(JSON.parse(stopResult.stdout).reason, /wake now/);
 });

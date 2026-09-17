@@ -101,8 +101,10 @@ Verified on this machine against Codex 0.154.0:
   `clear`. SessionEnd skips a listener whose `updatedAt` was refreshed within
   15 seconds (covers SessionStart(clear) racing a late SessionEnd).
 
-Claude, Kimi, Grok, and OpenCode still need their dedicated launchers. OMP
-already attaches inside ordinary interactive sessions.
+OMP already attaches inside ordinary interactive sessions. Ordinary `codex` and
+`claude` now register a mailbox from the installed hooks without a dedicated
+launcher. Claude Channel still stays passive unless you start `claude-mail`;
+Kimi, Grok, and OpenCode still need their dedicated launchers.
 
 ## Codex and Claude mid-turn steer via PostToolUse and Stop hooks (2026-09-13)
 
@@ -111,6 +113,10 @@ completed (`codex queue` runs at turn boundaries, while Claude MCP channels enqu
 The hook integration now configures `PostToolUse` and `Stop` hooks in `config.toml` (Codex) and
 `~/.claude/settings.json` (Claude Code) to steer mail directly into active turns:
 
+- SessionStart / PostToolUse / Stop register a durable mailbox for the current
+  `session_id` when no listener exists yet. That is the default-mode path:
+  ordinary `codex` and `claude` no longer require a prior `codex-mail` /
+  `claude-mail` attach before steer can fire.
 - `PostToolUse` executes after every tool invocation. It marks `turnActive = true`
   and stamps `lastToolAt`. When mail is waiting in the session's mailbox, it claims
   the pending batch, commits it (advancing the delivery cursor), and injects the

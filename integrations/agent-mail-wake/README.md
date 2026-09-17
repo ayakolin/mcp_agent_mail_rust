@@ -43,8 +43,10 @@ node integrations/agent-mail-wake/install.mjs --clients omp,codex
 
 The installer creates launchers under `~/.local/bin`, copies runtime sources into
 `~/.local/share/agent-mail/wake` (using `XDG_DATA_HOME` when set), installs an OMP
-entry point and/or registers the Claude Channel, adds a Codex SessionStart/
-SessionEnd hook to `~/.codex/config.toml`, and adds missing `mcp_agent_mail`
+ entry point and/or registers the Claude Channel, adds Codex SessionStart/
+ PostToolUse/Stop/SessionEnd hooks to `~/.codex/config.toml`, writes the matching
+Claude PreToolUse/SessionStart/PostToolUse/Stop/SessionEnd hooks into
+`~/.claude/settings.json`, and adds missing `mcp_agent_mail`
 entries to the selected clients. Existing Agent Mail entries and unrelated
 configuration are preserved. Originals are backed up before replacement.
 Ensure the launcher directory is on your `PATH`.
@@ -80,11 +82,13 @@ agent-mail-wake resume LISTENER_ID
 ```
 
 Claude's custom Channel uses its development-channel startup flag and requires the
-client's local-channel confirmation. Plain `claude` keeps the added Channel MCP
-server passive. Ordinary `codex` attaches through the installed SessionStart hook
-(`startup`, `resume`, and `/clear`) and `codex queue`; trust the hook in `/hooks`
-before it can run. `codex-mail` remains the managed App Server path. Kimi prints
-its Web UI URL and uses the existing `server.token`; its adapter does not attach to an unrelated live Kimi TUI.
+client's local-channel confirmation. Ordinary `claude` still registers a mailbox from
+the SessionStart/PostToolUse/Stop hooks and steers mail into the current turn; the
+Channel MCP stays passive unless you start `claude-mail`. Ordinary `codex` attaches
+through the installed SessionStart hook (`startup`, `resume`, and `/clear`) and
+`codex queue`; trust the hook in `/hooks` before it can run. `codex-mail` remains
+the managed App Server path. Kimi prints its Web UI URL and uses the existing
+`server.token`; its adapter does not attach to an unrelated live Kimi TUI.
 
 Grok runs headless: `grok-mail` owns a `grok agent --always-approve -m MODEL stdio`
 process and prompts its ACP session per batch (`--session ID` reuses a stored
