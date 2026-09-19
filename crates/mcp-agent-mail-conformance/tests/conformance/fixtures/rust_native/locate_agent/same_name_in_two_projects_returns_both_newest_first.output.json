@@ -1,0 +1,30 @@
+[
+  {
+    "project_slug": null,
+    "project_key": null,
+    "agent_id": null,
+    "name": "HarborGull",
+    "program": "claude-code",
+    "model": "opus-4.1",
+    "task_description": "Rust-native fixture register_agent setup",
+    "inception_ts": null,
+    "last_active_ts": null,
+    "retired_at": null,
+    "deregistered_at": null,
+    "status": "active"
+  },
+  {
+    "project_slug": null,
+    "project_key": null,
+    "agent_id": null,
+    "name": "HarborGull",
+    "program": "codex-cli",
+    "model": "gpt-5",
+    "task_description": "Rust-native fixture register_agent setup",
+    "inception_ts": null,
+    "last_active_ts": null,
+    "retired_at": null,
+    "deregistered_at": null,
+    "status": "active"
+  }
+]

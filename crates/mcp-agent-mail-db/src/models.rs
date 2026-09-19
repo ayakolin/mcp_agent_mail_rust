@@ -171,6 +171,26 @@ pub struct AtcPopulationAgentRow {
     pub last_active_ts: i64,
 }
 
+/// Cross-project projection of one agent registration plus its host project.
+///
+/// Used by `locate_agent` to answer "which project is this agent in?" with a
+/// single joined query (no per-project N+1 loop).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentProjectMatchRow {
+    pub project_id: i64,
+    pub project_slug: String,
+    pub project_human_key: String,
+    pub agent_id: i64,
+    pub name: String,
+    pub program: String,
+    pub model: String,
+    pub task_description: String,
+    pub inception_ts: i64,
+    pub last_active_ts: i64,
+    pub retired_at: Option<i64>,
+    pub deregistered_at: Option<i64>,
+}
+
 impl Default for AgentRow {
     fn default() -> Self {
         let now = now_micros();

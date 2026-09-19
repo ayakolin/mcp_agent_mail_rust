@@ -167,8 +167,8 @@ use mcp_agent_mail_tools::{
     FetchInboxEvents, FetchInboxProduct, FetchTopic, FileReservationPaths,
     FileReservationsResource, ForceReleaseFileReservation, GetMessageDeliveryReceipt, HealthCheck,
     IdentityProjectResource, InboxResource, InstallPrecommitGuard, ListAgents, ListContacts,
-    MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread, MacroStartSession,
-    MailboxResource, MailboxWithCommitsResource, MarkAllRead, MarkMessageRead,
+    LocateAgent, MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread,
+    MacroStartSession, MailboxResource, MailboxWithCommitsResource, MarkAllRead, MarkMessageRead,
     MessageDetailsResource, OutboxResource, ProductDetailsResource, ProductsLink,
     ProjectDetailsResource, ProjectsListQueryResource, ProjectsListResource, RegisterAgent,
     ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage,
@@ -723,6 +723,13 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         DeregisterAgent,
     );
     let server = add_tool(server, config, "whois", clusters::IDENTITY, Whois);
+    let server = add_tool(
+        server,
+        config,
+        "locate_agent",
+        clusters::IDENTITY,
+        LocateAgent,
+    );
     let server = add_tool(
         server,
         config,

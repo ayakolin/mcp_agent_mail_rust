@@ -308,6 +308,15 @@ pub const TOOL_META_MAP: &[(&str, ToolMeta)] = &[
         },
     ),
     (
+        // Cross-project "which project is this agent in?" discovery (read-only
+        // join over agents/projects); sibling lookup of whois/list_agents.
+        "locate_agent",
+        ToolMeta {
+            capabilities: &["audit", "identity"],
+            complexity: "low",
+        },
+    ),
+    (
         "resolve_pane_identity",
         ToolMeta {
             capabilities: &["identity"],

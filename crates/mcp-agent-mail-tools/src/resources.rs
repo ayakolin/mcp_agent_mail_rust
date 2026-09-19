@@ -1176,6 +1176,17 @@ fn build_tool_directory() -> ToolDirectory {
                     complexity: "medium".to_string(),
                 },
                 ToolDirectoryEntry {
+                    name: "locate_agent".to_string(),
+                    summary: "Locate the projects an agent is registered in by name alone (cross-project discovery, no project_key needed).".to_string(),
+                    use_when: "You know an agent's name but not which project hosts it, and whois/list_agents both demand a project_key.".to_string(),
+                    related: vec!["whois".to_string(), "list_agents".to_string()],
+                    expected_frequency: "Ad hoc during cross-project coordination or when routing a reply to an unfamiliar agent.".to_string(),
+                    required_capabilities: vec!["audit".to_string(), "identity".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Find the project".to_string(), sample: "locate_agent(agent_name='BlueLake')".to_string() }],
+                    capabilities: vec!["audit".to_string(), "identity".to_string()],
+                    complexity: "low".to_string(),
+                },
+                ToolDirectoryEntry {
                     name: "resolve_pane_identity".to_string(),
                     summary: "Resolve the agent name for a tmux pane from the canonical per-pane identity file.".to_string(),
                     use_when: "When a script needs to figure out its own identity without explicitly being passed arguments.".to_string(),

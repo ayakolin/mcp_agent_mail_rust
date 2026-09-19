@@ -3494,6 +3494,93 @@ pub async fn list_agents(
         .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
 }
 
+/// Safety cap on `locate_agent` results (same context-window rationale as
+/// [`LIST_AGENTS_DEFAULT_MAX`]; a shared mailbox rarely hosts one name in more
+/// than a handful of projects, so the cap only bounds pathological input).
+const LOCATE_AGENT_DEFAULT_MAX: usize = 50;
+
+/// Locate the projects an agent is registered in, by name alone.
+///
+/// # Parameters
+/// - `agent_name`: Agent name to look up (case-insensitive)
+/// - `limit`: Optional result cap (clamped to 1..=50)
+///
+/// # Returns
+/// Array of `{ project_slug, project_key, agent_id, name, program, model,
+/// task_description, inception_ts, last_active_ts, retired_at, deregistered_at,
+/// status }` entries — one per registration, most-recently-active first.
+/// An empty array means no project hosts that agent name.
+///
+/// # Conformance
+/// Rust-native.
+#[tool(
+    description = "Locate the projects an agent is registered in, by name alone (cross-project whois discovery).\n\nUse this when you know an agent's name but NOT which project it belongs to: whois and list_agents both require a project_key, this tool does not. Answers \"which project is <AgentName> in?\" in one lookup across the whole shared mailbox.\n\nParameters\n----------\nagent_name : str\n    Agent name to look up (case-insensitive; use the registered name, not a program or user name).\nlimit : Optional[int]\n    Maximum number of registrations to return (most-recently-active first). Defaults to 50; values above 50 are clamped to 50.\n\nReturns\n-------\nlist\n    One entry per registration: { project_slug, project_key (human key), agent_id, name, program, model, task_description, inception_ts, last_active_ts, retired_at, deregistered_at, status } where status is 'active' | 'retired' | 'deregistered'. Empty array when no project hosts the name. Feed a match's project_key into whois for the full profile plus recent archive commits."
+)]
+pub async fn locate_agent(
+    ctx: &McpContext,
+    agent_name: String,
+    limit: Option<u32>,
+) -> McpResult<String> {
+    let agent_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
+    if agent_name.trim().is_empty() {
+        return Err(legacy_tool_error(
+            "MISSING_AGENT_NAME",
+            "agent_name must be a non-empty agent name (adjective+noun format).",
+            false,
+            json!({}),
+        ));
+    }
+
+    let pool = get_coalescer_bypass_read_db_pool()?;
+
+    let effective_limit = limit
+        .map_or(LOCATE_AGENT_DEFAULT_MAX, |n| {
+            usize::try_from(n).unwrap_or(LOCATE_AGENT_DEFAULT_MAX)
+        })
+        .clamp(1, LOCATE_AGENT_DEFAULT_MAX);
+
+    let matches = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::find_agent_projects(
+            ctx.cx(),
+            &pool,
+            &agent_name,
+            effective_limit,
+        )
+        .await,
+    )?;
+
+    let entries: Vec<serde_json::Value> = matches
+        .into_iter()
+        .map(|m| {
+            let status = if m.deregistered_at.is_some() {
+                "deregistered"
+            } else if m.retired_at.is_some() {
+                "retired"
+            } else {
+                "active"
+            };
+            json!({
+                "project_slug": m.project_slug,
+                "project_key": m.project_human_key,
+                "agent_id": m.agent_id,
+                "name": m.name,
+                "program": m.program,
+                "model": m.model,
+                "task_description": m.task_description,
+                "inception_ts": micros_to_iso(m.inception_ts),
+                "last_active_ts": micros_to_iso(m.last_active_ts),
+                "retired_at": m.retired_at.map(micros_to_iso),
+                "deregistered_at": m.deregistered_at.map(micros_to_iso),
+                "status": status,
+            })
+        })
+        .collect();
+
+    serde_json::to_string(&entries)
+        .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5290,6 +5377,79 @@ body
                 .expect("resolve identity across project keys");
                 assert_eq!(resolved.0, "BlueLake");
                 assert_eq!(resolved.1, written_path);
+            },
+        );
+    }
+    #[test]
+    fn locate_agent_spans_projects_newest_first_with_lifecycle_status() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("locate-agent.sqlite3");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+             (1, 'alpha-proj', '/alpha-proj', 0), (2, 'beta-proj', '/beta-proj', 0)",
+        )
+        .expect("seed projects");
+        conn.execute_raw(
+            "INSERT INTO agents \
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+             VALUES \
+             (10, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'older', 1000, 1000), \
+             (11, 2, 'BlueLake', 'claude-code', 'opus-4.1', 'newer', 2000, 2000)",
+        )
+        .expect("seed agents");
+        conn.execute_raw(
+            "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (10, 3000)",
+        )
+        .expect("seed deregistration");
+        drop(conn);
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let ctx = McpContext::new(cx.clone(), 1);
+
+                    // Case-insensitive lookup resolves BOTH projects in one call.
+                    let raw = locate_agent(&ctx, "bluelake".to_string(), None)
+                        .await
+                        .expect("locate_agent");
+                    let entries: Vec<serde_json::Value> =
+                        serde_json::from_str(&raw).expect("parse locate_agent");
+                    assert_eq!(entries.len(), 2, "expected one row per project");
+
+                    // Newest-last-active first, with per-project identity + status.
+                    assert_eq!(entries[0]["project_slug"], "beta-proj");
+                    assert_eq!(entries[0]["project_key"], "/beta-proj");
+                    assert_eq!(entries[0]["program"], "claude-code");
+                    assert_eq!(entries[0]["status"], "active");
+                    assert!(entries[0]["deregistered_at"].is_null());
+                    assert_eq!(entries[1]["project_slug"], "alpha-proj");
+                    assert_eq!(entries[1]["status"], "deregistered");
+                    assert!(!entries[1]["deregistered_at"].is_null());
+                    assert!(entries[1]["last_active_ts"].as_str().is_some());
+
+                    // Unknown name is an empty result, not an error.
+                    let empty = locate_agent(&ctx, "NoSuchAgent".to_string(), None)
+                        .await
+                        .expect("locate_agent unknown");
+                    assert_eq!(empty, "[]");
+
+                    // A blank name is a usage error, not a full-table scan.
+                    assert!(locate_agent(&ctx, "   ".to_string(), None).await.is_err());
+                });
             },
         );
     }

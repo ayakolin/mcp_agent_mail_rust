@@ -2456,6 +2456,7 @@ fn rust_native_fixture_coverage_matches_classification() {
         "fetch_inbox_events",
         "get_message_delivery_receipt",
         "list_agents",
+        "locate_agent",
         "mark_all_read",
         "resolve_pane_identity",
     ]

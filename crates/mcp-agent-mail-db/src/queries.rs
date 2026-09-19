@@ -14,8 +14,8 @@ use crate::idempotency::{
     idempotency_retention_secs,
 };
 use crate::models::{
-    AgentLinkRow, AgentRow, AtcPopulationAgentRow, FileReservationRow, InboxStatsRow,
-    MessageRecipientRow, MessageRow, ProductRow, ProjectRow,
+    AgentLinkRow, AgentProjectMatchRow, AgentRow, AtcPopulationAgentRow, FileReservationRow,
+    InboxStatsRow, MessageRecipientRow, MessageRow, ProductRow, ProjectRow,
 };
 use crate::pool::DbPool;
 use crate::timestamps::now_micros;
@@ -6346,6 +6346,79 @@ pub async fn list_atc_population_snapshot(
                         name: get_string(row, 2),
                         program: get_string(row, 3),
                         last_active_ts: row.get(4).and_then(value_as_i64).unwrap_or_default(),
+                    })
+                    .collect(),
+            )
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Find every agent registration named `agent_name` across all projects.
+///
+/// Case-insensitive (the same `COLLATE NOCASE` routing `get_agent` applies)
+/// and answered by ONE joined query over `agents`/`projects` — deliberately
+/// avoiding the `list_projects` + per-project `list_agents` N+1 shape that
+/// GH#190 flagged on mailboxes with hundreds of projects. Rows come back
+/// most-recently-active first and are hard-capped by `limit`; the
+/// deregistration ledger is pulled in as a scalar subquery so callers can
+/// report lifecycle status without a second round-trip per match.
+pub async fn find_agent_projects(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_name: &str,
+    limit: usize,
+) -> Outcome<Vec<AgentProjectMatchRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let sql = "SELECT p.id, p.slug, p.human_key, a.id, a.name, a.program, a.model, \
+               a.task_description, a.inception_ts, a.last_active_ts, a.retired_at, \
+               (SELECT d.deregistered_at FROM agent_deregistrations d \
+                WHERE d.agent_id = a.id LIMIT 1) AS deregistered_at \
+               FROM agents AS a \
+               JOIN projects AS p ON p.id = a.project_id \
+               WHERE a.name = ? COLLATE NOCASE \
+               ORDER BY a.last_active_ts DESC, a.id DESC \
+               LIMIT ?";
+    let params = [Value::Text(agent_name.to_string()), Value::BigInt(limit)];
+
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let get_i64 = |row: &SqlRow, index: usize| {
+                row.get(index).and_then(value_as_i64).unwrap_or_default()
+            };
+            let get_opt_i64 = |row: &SqlRow, index: usize| row.get(index).and_then(value_as_i64);
+            let get_string = |row: &SqlRow, index: usize| {
+                row.get(index)
+                    .and_then(|value| match value {
+                        Value::Text(value) => Some(value.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            };
+            Outcome::Ok(
+                rows.iter()
+                    .map(|row| AgentProjectMatchRow {
+                        project_id: get_i64(row, 0),
+                        project_slug: get_string(row, 1),
+                        project_human_key: get_string(row, 2),
+                        agent_id: get_i64(row, 3),
+                        name: get_string(row, 4),
+                        program: get_string(row, 5),
+                        model: get_string(row, 6),
+                        task_description: get_string(row, 7),
+                        inception_ts: get_i64(row, 8),
+                        last_active_ts: get_i64(row, 9),
+                        retired_at: get_opt_i64(row, 10),
+                        deregistered_at: get_opt_i64(row, 11),
                     })
                     .collect(),
             )
