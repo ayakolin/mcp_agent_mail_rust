@@ -186,7 +186,7 @@ export async function handleClaudeHook(raw, env = process.env, extras = {}) {
       return { stdout: '{}\n' };
     }
   }
-  if (event.hook_event_name === 'Stop') {
+  if (event.hook_event_name === 'Stop' || event.hookEventName === 'stop') {
     try {
       const listener = await resolveListener();
       if (!listener?.file) return { stdout: '{}\n' };
@@ -206,30 +206,6 @@ export async function handleClaudeHook(raw, env = process.env, extras = {}) {
         };
       }
       if (claimed?.batch) await commitSteerBatch(listener.file, claimed.batch);
-
-      if (extras.wait || (process.argv.includes('hook') && !event.stop_hook_active && !extras.nowait)) {
-        process.stdout.write(JSON.stringify({ async: true, asyncRewake: true }) + '\n');
-        const pollIntervalMs = 2500;
-        const maxWaitMs = Number(env.AGENT_MAIL_WAKE_STOP_TIMEOUT_MS) || 600000;
-        const start = Date.now();
-        while (Date.now() - start < maxWaitMs) {
-          await sleep(pollIntervalMs);
-          if (isTurnBusy(listener.file)) {
-            process.exit(0);
-          }
-          try {
-            const rechecked = await claimSteerBatch(listener.file, client, { timeoutMs: 1500 });
-            if (rechecked?.batch?.messages?.length) {
-              const prompt = batchPrompt(rechecked.state, rechecked.batch);
-              await commitSteerBatch(listener.file, rechecked.batch);
-              process.stderr.write(prompt + '\n');
-              process.exit(2);
-            }
-            if (rechecked?.batch) await commitSteerBatch(listener.file, rechecked.batch);
-          } catch {}
-        }
-        process.exit(0);
-      }
       return { stdout: '{}\n' };
     } catch {
       const listener = findSessionListener(id, { host: 'claude-code', stateRoot, dataRoot })

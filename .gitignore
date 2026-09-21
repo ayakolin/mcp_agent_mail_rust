@@ -270,3 +270,8 @@ agy.mcp.json
 /.windsurf.mcp.json.*.replaced
 /windsurf.mcp.json.bak*
 .vscode/mcp.json
+/.vscode/mcp.json
+/.vscode/.mcp.json.*.tmp
+/.vscode/.mcp.json.*.bak
+/.vscode/.mcp.json.*.replaced
+/.vscode/mcp.json.bak*

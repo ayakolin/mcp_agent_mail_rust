@@ -292,6 +292,28 @@ test('handleClaudeHook steers mail into PostToolUse and Stop', async t => {
   }), { AGENT_MAIL_WAKE_HOME: home }, { client: stubClient });
   assert.match(JSON.parse(startResult.stdout).hookSpecificOutput?.additionalContext, /auto-wake is enabled for this Claude session/);
 });
+test('handleClaudeHook in Grok environment returns immediately without wait loop', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-hook-grok-'));
+  const stateRoot = path.join(home, 'state');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(stateRoot, { recursive: true });
+  const listenerFile = path.join(stateRoot, 'listener-grok.json');
+  fs.writeFileSync(listenerFile, JSON.stringify({
+    id: 'listener-grok', host: 'claude-code', session: 'grok-ses-1', project: home, agent: 'AgentGrok', cursor: 10, turnActive: true,
+  }));
+  const stubClient = {
+    endpoint: 'http://127.0.0.1:8765/mcp/',
+    call: async (name) => {
+      if (name === 'fetch_inbox_events') return { events: [], next_cursor: 10 };
+      return {};
+    },
+  };
+  const result = await handleClaudeHook(JSON.stringify({
+    hook_event_name: 'Stop', hookEventName: 'stop', session_id: 'grok-ses-1', cwd: home,
+  }), { AGENT_MAIL_WAKE_HOME: home, GROK_HOOK_EVENT: 'stop' }, { client: stubClient, wait: true });
+  assert.equal(result.stdout, '{}\n');
+  assert.equal(JSON.parse(fs.readFileSync(listenerFile, 'utf8')).turnActive, undefined);
+});
 
 test('PostToolUse lazily registers a mailbox when no listener exists', async t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-lazy-'));

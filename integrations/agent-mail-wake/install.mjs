@@ -100,13 +100,6 @@ export function mergeClaudeHooks(settings, command) {
     settings.hooks = {};
   }
   const managedHook = { type: 'command', command };
-  const stopHook = {
-    type: 'command',
-    command,
-    asyncRewake: true,
-    rewakeSummary: 'Agent Mail',
-    rewakeMessage: 'Incoming Agent Mail received:\n',
-  };
   const filterOut = (hooksArray) => {
     return (hooksArray || []).map(group => {
       if (!Array.isArray(group.hooks)) return group;
@@ -135,7 +128,7 @@ export function mergeClaudeHooks(settings, command) {
   ];
   settings.hooks.Stop = [
     ...(settings.hooks.Stop || []),
-    { hooks: [stopHook] },
+    { hooks: [managedHook] },
   ];
   settings.hooks.SessionEnd = [
     ...(settings.hooks.SessionEnd || []),
