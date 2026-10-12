@@ -1,3 +1,4 @@
+import { normalizeHookEvent, hookHost, sessionId as claudeSessionId } from '../claude-channel.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -23,6 +24,20 @@ test('sessionId resolves session_id, thread_id, or id', () => {
   assert.equal(sessionId({ id: 'i1' }), 'i1');
   assert.equal(sessionId({}), '');
   assert.equal(shouldAttach({ thread_id: 't1', source: 'resume' }), true);
+});
+
+test('Grok camelCase hook events map onto the Claude handler fields', () => {
+  assert.equal(claudeSessionId({ sessionId: 'g1' }), 'g1');
+  const event = normalizeHookEvent({
+    hookEventName: 'post_tool_use', sessionId: 'g1', workspaceRoot: '/work', toolName: 'Bash',
+  });
+  assert.equal(event.hook_event_name, 'PostToolUse');
+  assert.equal(event.session_id, 'g1');
+  assert.equal(event.cwd, '/work');
+  assert.equal(event.tool_name, 'Bash');
+  assert.equal(hookHost(event, {}), 'grok-build');
+  assert.equal(hookHost(normalizeHookEvent({ hook_event_name: 'Stop', session_id: 'c1' }), {}), 'claude-code');
+  assert.equal(hookHost(normalizeHookEvent({ hook_event_name: 'Stop', session_id: 'c1' }), {}), 'claude-code');
 });
 
 test('findCodexBinary finds real binary and respects CODEX_PATH', () => {
@@ -197,6 +212,35 @@ test('PostToolUse hook with no pending mail returns empty JSON and keeps turn ac
   assert.ok(updated.lastToolAt);
 });
 
+test('PostToolUse throttles mailbox checks while Stop always forces one', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-throttle-'));
+  const stateRoot = path.join(home, 'state');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(stateRoot, { recursive: true });
+  const listenerFile = path.join(stateRoot, 'listener-throttle.json');
+  fs.writeFileSync(listenerFile, JSON.stringify({
+    id: 'listener-throttle', host: 'codex', session: 's-throttle', project: '/tmp/proj', agent: 'AgentT', cursor: 30,
+  }));
+  let fetches = 0;
+  const stubClient = {
+    call: async () => { fetches += 1; return { events: [], next_cursor: 30 }; },
+    message: async () => null,
+  };
+  const env = { AGENT_MAIL_WAKE_HOME: home, AGENT_MAIL_WAKE_STEER_POLL_MS: '60000' };
+  const post = () => handleHook(JSON.stringify({
+    hook_event_name: 'PostToolUse', session_id: 's-throttle', tool_name: 'Bash',
+  }), env, () => { throw new Error('must not spawn'); }, { client: stubClient });
+  for (let i = 0; i < 5; i += 1) await post();
+  assert.equal(fetches, 1, 'a busy turn performs one bounded mailbox check, not one per tool call');
+  assert.equal(JSON.parse(fs.readFileSync(listenerFile, 'utf8')).turnActive, true);
+
+  await handleHook(JSON.stringify({ hook_event_name: 'Stop', session_id: 's-throttle' }), env,
+    () => { throw new Error('must not spawn'); }, { client: stubClient });
+  assert.equal(fetches, 2, 'the turn-end check ignores the throttle window');
+  await post();
+  assert.equal(fetches, 2, 'the forced check re-opens the throttle window');
+});
+
 test('Stop hook with pending mail blocks turn and injects steer reason, clearing turnActive', async t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-stop-steer-'));
   const stateRoot = path.join(home, 'state');
@@ -313,6 +357,35 @@ test('handleClaudeHook in Grok environment returns immediately without wait loop
   }), { AGENT_MAIL_WAKE_HOME: home, GROK_HOOK_EVENT: 'stop' }, { client: stubClient, wait: true });
   assert.equal(result.stdout, '{}\n');
   assert.equal(JSON.parse(fs.readFileSync(listenerFile, 'utf8')).turnActive, undefined);
+});
+test('handleClaudeHook accepts Grok camelCase Stop and registers a grok-build mailbox', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-native-hook-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const calls = [];
+  const events = [{ cursor: 4, message_id: 9, from: 'PeerG' }];
+  const messages = new Map([[9, { id: 9, from: 'PeerG', subject: 'native grok', body_md: 'steer now' }]]);
+  const stubClient = {
+    endpoint: 'http://127.0.0.1:8765/mcp/',
+    call: async (method, args) => {
+      calls.push(method);
+      if (method === 'ensure_project') return { slug: 'p' };
+      if (method === 'register_agent') return { name: 'NativeGrok' };
+      if (method === 'fetch_inbox_events') return { events, next_cursor: 4 };
+      throw new Error(method);
+    },
+    message: async (id) => messages.get(id),
+  };
+  const stop = await handleClaudeHook(JSON.stringify({
+    hookEventName: 'stop', sessionId: 'grok-native-1', workspaceRoot: home,
+  }), { AGENT_MAIL_WAKE_HOME: home }, { client: stubClient });
+  assert.equal(stop.exitCode, 2);
+  assert.match(stop.prompt, /PeerG/);
+  const states = fs.readdirSync(path.join(home, 'state')).filter(name => name.endsWith('.json'));
+  const state = JSON.parse(fs.readFileSync(path.join(home, 'state', states[0]), 'utf8'));
+  assert.equal(state.host, 'grok-build');
+  assert.equal(state.agent, 'NativeGrok');
+  assert.equal(state.session, 'grok-native-1');
+  assert.ok(calls.includes('register_agent'));
 });
 
 test('PostToolUse lazily registers a mailbox when no listener exists', async t => {

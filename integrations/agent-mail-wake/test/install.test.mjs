@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { installationPlan, applyInstallation, mergeCodexHooks, mergeClaudeHooks } from '../install.mjs';
+import { installationPlan, applyInstallation, mergeCodexHooks, mergeClaudeHooks, grokHookFile, ensureGrokCompat } from '../install.mjs';
 
 function sandbox(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-mail-wake-install-'));
@@ -72,6 +72,16 @@ test('Codex SessionStart matcher includes thread-restart clear', () => {
   assert.match(merged, /matcher = "startup\|resume\|clear"/);
 });
 
+test('Codex SessionStart hook runs synchronously so wake context reaches the first turn', () => {
+  const merged = mergeCodexHooks('', 'agent-mail-wake-hook');
+  const sessionStart = merged.slice(merged.indexOf('[[hooks.SessionStart]]'), merged.indexOf('[[hooks.PostToolUse]]'));
+  // An async SessionStart injects only into the *next* model request, which makes
+  // the model answer the first user message a second time.
+  assert.doesNotMatch(sessionStart, /async\s*=\s*true/);
+  assert.match(sessionStart, /type = "command"/);
+  assert.match(sessionStart, /command = "agent-mail-wake-hook"/);
+});
+
 test('client selection only installs selected host entry points', t => {
   const { home } = sandbox(t);
   const plan = installationPlan({ home, clients: ['kimi'] });
@@ -118,6 +128,21 @@ test('grok, opencode and codex entries embed the discovered bearer token once', 
     assert.match(launcher.stdout, /Agent Mail Wake/);
   }
   assert.deepEqual(applyInstallation(installationPlan({ home, clients: ['grok', 'opencode', 'codex'] })).changed, []);
+});
+test('grok install writes native hooks and stops importing Claude hooks', t => {
+  const { home } = sandbox(t);
+  const config = path.join(home, '.grok', 'config.toml');
+  write(config, '[models]\ndefault = "keep"\n\n[mcp_servers.mcp_agent_mail]\nurl = "http://127.0.0.1:8765/mcp/"\n');
+  applyInstallation(installationPlan({ home, clients: ['grok'] }));
+  const grok = fs.readFileSync(config, 'utf8');
+  assert.match(grok, /default = "keep"/);
+  assert.match(grok, /\[compat\.claude\]\nhooks = false/);
+  const hook = JSON.parse(fs.readFileSync(path.join(home, '.grok', 'hooks', 'agent-mail-wake.json'), 'utf8'));
+  assert.equal(hook.hooks.Stop[0].hooks[0].type, 'command');
+  assert.match(hook.hooks.SessionStart[0].hooks[0].command, /claude-channel\.mjs hook$/);
+  assert.deepEqual(applyInstallation(installationPlan({ home, clients: ['grok'] })).changed, []);
+  assert.match(ensureGrokCompat('[compat.claude]\nhooks = true\nmcps = true\n'), /hooks = false\nmcps = true/);
+  assert.match(grokHookFile('node hook'), /"PostToolUse"/);
 });
 
 test('codex hook install is idempotent and keeps existing MCP tables', t => {

@@ -45,7 +45,7 @@ node integrations/agent-mail-wake/install.mjs --clients omp,codex,claude
 | Codex | `~/.codex/config.toml` 中缺失的 Agent Mail 连接、SessionStart/PostToolUse/Stop 钩子，以及 `codex-mail` |
 | Claude Code | `~/.claude/settings.json` 中的 PreToolUse/SessionStart/PostToolUse/Stop 钩子、`~/.claude.json` 中的 Agent Mail 连接和 `agent_mail_wake` Channel，以及 `claude-mail` |
 | Kimi Code | `~/.kimi-code/mcp.json` 中缺失的连接，以及 `kimi-mail` |
-| Grok Build | `~/.grok/config.toml` 中缺失的 Agent Mail 连接，以及 `grok-mail` |
+| Grok Build | `~/.grok/config.toml` 中缺失的 Agent Mail 连接、原生 hooks，以及 `grok-mail` |
 | OpenCode | `~/.opencode/opencode.json` 中缺失的 Agent Mail 连接，以及 `opencode-mail` |
 
 可选参数：
@@ -76,7 +76,7 @@ node integrations/agent-mail-wake/install.mjs --clients omp,codex,claude
 | Codex | `codex` 或 `codex-mail` | 普通 `codex` 由 SessionStart 钩子挂上 `codex queue` 监听器；`codex-mail` 仍管理独立 App Server |
 | Claude Code | `claude-mail` | 原生 Claude 终端，启用本地 Channel |
 | Kimi Code | `kimi-mail` | 打开输出的 Web UI 地址 |
-| Grok Build | `grok-mail` | 无原生界面；启动器托管 ACP 会话并回显模型回复 |
+| Grok Build | `grok-mail` / `grok-mail --headless` | 默认打开原生 Grok 终端界面；`--headless` 启动无头 ACP 会话 |
 | OpenCode | `opencode-mail` | 无原生界面；启动器托管 `opencode serve` 会话并回显回复 |
 
 查看邮箱和监听状态：
@@ -108,9 +108,16 @@ Kimi 使用 `~/.kimi-code/server.token` 中的本地认证令牌。浏览器要�
 新建 API 会话会显式绑定现有默认模型，以处理测试版本中 API 新会话没有自动选择模型的行为。
 Kimi 适配器管理 Web/API 会话，不会同时接管另一个正在运行的 Kimi TUI。
 
+`grok-mail` 默认会启动一个新的全屏原生 Grok TUI；`grok-mail --tui` 和 `grok-mail tui` 是等价
+入口，并会透传 `--session`、`--model` 和 `--` 后的 Grok 原生参数。重新运行安装器后，原生
+Grok hooks 会在 `SessionStart`、`PostToolUse` 和 `Stop` 边界注册邮箱并检查新邮件。它无法接管
+已打开的 TUI，也不能在 TUI 空闲时从外部强制开启一轮对话；需要持续后台自动唤醒时，请使用
+`grok-mail --headless`。该模式运行 `grok agent --always-approve … stdio` 的托管 ACP 会话。
+
 ## 默认行为和控制
 
 - 每 3 秒检查收件事件，每批最多合并 5 条；检查本身不调用模型。
+- 挂 `PostToolUse`/`Stop` 钩子的会话不会每个工具调用都查一次邮箱：工具边界最多每 `AGENT_MAIL_WAKE_STEER_POLL_MS`（默认 2500 毫秒）检查一次，回合末的 `Stop` 检查始终强制执行，因此忙碌会话的注入延迟被限制在这个窗口内。托管的 Codex `SessionStart` 钩子必须是同步的：异步钩子只能注入"下一个"模型请求，会让模型把第一条用户消息回答两遍。
 - 邮件直接注入正在进行的回合，而不是等会话空闲：OMP 用 `deliverAs: "aside"`
   在下一个步骤边界注入，挂了钩子的普通 Codex 与 Claude Code 在工具调用后通过 `PostToolUse` 的 `additionalContext`
   （或回合末 `Stop` 决策）直接向活动回合 steer，会话空闲时分别通过 `codex queue` 与 MCP Channels 唤醒；`codex-mail`
@@ -170,7 +177,7 @@ Kimi 使用稳定的 `prompt_id`、Grok 在启动器本地绑定账簿中记录�
 批次 ID、OpenCode 扫描会话历史中的投递标记、OMP 查询自定义消息记录来减少重试重复。
 这些措施不保证 Agent 执行工具的 exactly-once 语义。
 Claude Channel 的成功表示通知已写入 MCP 通道；崩溃发生在这个边界时，唤醒可能重复或遗漏一次，
-但原邮件仍保存在 Agent Mail 中。必要时可主动查询 `fetch_inbox`。
+但原邮件仍保存在 Agent Mail 中。Agent 侧不要轮询收件箱：监听器会自动唤醒并注入。只有在确认某次投递确实丢失时，才一次性调用 `fetch_inbox` 补查。
 
 各客户端协议随版本演进，测试版本见[验证说明](VERIFICATION.md)。
 当前只支持本机回环连接；没有远程部署或任意现有窗口接管功能。

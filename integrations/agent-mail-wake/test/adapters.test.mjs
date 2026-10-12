@@ -5,6 +5,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CodexAdapter, CodexQueueAdapter, sessionHistoryHas, KimiAdapter } from '../rpc.mjs';
 import { isCodexTurnBusy, CODEX_STEER_WINDOW_MS } from '../common.mjs';
+import { grokLaunchMode, grokTuiArgs } from '../cli.mjs';
+
+test('Grok TUI launcher uses the native UI and forwards session, model, and Grok flags', () => {
+  assert.equal(grokLaunchMode({}), 'tui');
+  assert.equal(grokLaunchMode({ headless: true }), 'headless');
+  assert.throws(() => grokLaunchMode({ tui: true, headless: true }), /Choose either/);
+  assert.deepEqual(grokTuiArgs({ extra: [] }), ['--fullscreen']);
+  assert.deepEqual(
+    grokTuiArgs({ session: 'session-1', model: 'grok-4', extra: ['--no-alt-screen', '--no-plan'] }),
+    ['--fullscreen', '--resume', 'session-1', '--model', 'grok-4', '--no-alt-screen', '--no-plan'],
+  );
+});
 
 test('Codex steers mail into an active turn instead of waiting for idle', async () => {
   const turn = { id: 'turn-1', status: 'inProgress', items: [] };

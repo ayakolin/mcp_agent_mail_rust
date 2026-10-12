@@ -206,3 +206,38 @@ external `../frankensearch-rel-0332/frankensearch/Cargo.toml` path dependency.
 No Rust source or dependency lockfile was edited. The upstream `br` and `ubs`
 helper tools were not installed on this machine; the source, syntax, installer
 and Git diff checks above were used for the integration changes.
+
+## First-message double reply and per-tool inbox fetch fix (2026-10-12)
+
+Reproduced from live Codex 0.162.x rollouts on this machine, then corrected:
+
+- Rollout `01a12f23-...jsonl`: the user message "hi" completed a first reply
+  (`item_completed` at 08:04:01.055), the async managed `SessionStart` hook's
+  `additionalContext` landed at 08:04:01.406, and a second reply ("Ready when
+  you are.") followed at 08:04:13.692 in the same turn. Per Codex hook docs a
+  background hook cannot reach the request already in flight, so it always
+  answers the first message twice.
+- Fix: `mergeCodexHooks` writes the `SessionStart` handler without
+  `async = true`, inside the existing 30-second timeout. `mergeCodexHooks`
+  stays idempotent and preserves the operator `[hooks.state]` block and trust
+  hashes (checked on a rerun against the live `~/.codex/config.toml`).
+- Fetch storm: every `PostToolUse` boundary called `claimSteerBatch`, which
+  issued one `fetch_inbox_events` per tool call. `claimSteerBatch` now honours
+  a `lastSteerPollAt` floor (`AGENT_MAIL_WAKE_STEER_POLL_MS`, default 2500 ms)
+  unless the caller passes `force: true`; the turn-end `Stop` handlers in
+  `codex-hook.mjs` and `claude-channel.mjs` force the check so pending mail is
+  never delayed past the current turn.
+- Evidence: 6 consecutive `PostToolUse` hooks performed 1 mailbox fetch; the
+  following `Stop` performed a 2nd; with the throttle window freshly closed,
+  `PostToolUse` returned `{}` (0 fetches) while `Stop` still delivered the
+  queued batch. Regression tests: `test/codex-hook.test.mjs`
+  ("PostToolUse throttles mailbox checks while Stop always forces one") and
+  `test/install.test.mjs` ("Codex SessionStart hook runs synchronously...").
+- Runtime files were redeployed with `scripts/install_wake_hooks.sh`; all 7
+  shared modules in `~/.local/share/agent-mail/wake` are byte-identical to the
+  repository sources. The managed hooks must be re-trusted once via `/hooks`
+  because the `SessionStart` handler hash changed.
+- Agent-side polling instruction: `identityInstructions` now states that the
+  local listener wakes the session and that `fetch_inbox` /
+  `fetch_inbox_events` / `fetch_topic` must not be polled to look for mail.
+  `npm test` for this lane: 61 Node tests passed.

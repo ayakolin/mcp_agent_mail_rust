@@ -38,6 +38,18 @@ reviewed through 2026-09-12. These changes are not published release artifacts.
 
 ### Fixed
 
+- **Codex auto-wake no longer answers the first message twice.** The managed
+  `SessionStart` hook no longer runs `async = true`: Codex injects a background
+  hook's `additionalContext` only into the *next* model request, so the identity
+  block landed after the first reply and triggered a redundant second answer.
+  The hook now runs synchronously within its 30-second timeout.
+- **Hook-steered sessions stop fetching mail per tool call.** `PostToolUse`
+  re-checks the mailbox at most once per `AGENT_MAIL_WAKE_STEER_POLL_MS`
+  (default 2500 ms) instead of on every tool boundary, while the turn-end `Stop`
+  check always runs so mid-turn delivery latency stays inside that window. The
+  wake identity block now states that agents must not poll `fetch_inbox` /
+  `fetch_inbox_events` to look for mail; the listener wakes the session.
+
 - **Robot search refreshes a reconstructed mailbox's live lexical index.**
   Native live mailboxes use guarded read-only database connections for the
   refresh, while query results remain based on a private snapshot. If the

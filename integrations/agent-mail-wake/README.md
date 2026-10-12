@@ -13,13 +13,13 @@ external package dependencies.
 | Codex | PostToolUse/Stop mid-turn steer + SessionStart queue listener on ordinary `codex`; managed App Server remains available | `codex` / `codex-mail` |
 | Claude Code | PostToolUse/Stop mid-turn steer + local MCP Channel | `claude-mail` |
 | Kimi Code | Managed Web/API session | `kimi-mail` |
-| Grok Build | Managed ACP session (`grok agent stdio`) | `grok-mail` |
+| Grok Build | Native TUI by default with hooks at session/tool boundaries; managed ACP session on demand | `grok-mail` / `grok-mail --headless` |
 | OpenCode | Managed headless server session (`opencode serve`) | `opencode-mail` |
 
 A configured MCP connection alone does not automatically wake a client. Ordinary
 `codex` sessions attach after the installer writes a SessionStart hook and the
-hook is trusted in `/hooks`. Grok and OpenCode still own a managed session
-rather than attaching to a live native TUI.
+hook is trusted in `/hooks`. OpenCode owns a managed session, while `grok-mail`
+starts a new native TUI by default rather than attaching to an existing one.
 
 ## Install
 
@@ -90,20 +90,33 @@ through the installed SessionStart hook (`startup`, `resume`, and `/clear`) and
 the managed App Server path. Kimi prints its Web UI URL and uses the existing
 `server.token`; its adapter does not attach to an unrelated live Kimi TUI.
 
-Grok runs headless: `grok-mail` owns a `grok agent --always-approve -m MODEL stdio`
-process and prompts its ACP session per batch (`--session ID` reuses a stored
-session via `session/load`). It does not attach to a live Grok TUI.
+Grok starts a new fullscreen native TUI by default: run `grok-mail` (or the
+equivalent `grok-mail --tui` / `grok-mail tui`). After rerunning the installer, the
+native Grok hooks register its mailbox and check incoming mail at `SessionStart`,
+`PostToolUse`, and `Stop` boundaries. A native TUI cannot be attached or externally
+steered while idle. Use `grok-mail --headless` when a persistent background
+auto-wake listener is required; that mode owns a `grok agent --always-approve -m MODEL stdio`
+process and prompts its ACP session per batch (`--session ID` reuses a stored session
+via `session/load`).
 
 OpenCode runs its own headless server: `opencode-mail` starts `opencode serve`,
 creates a session, and POSTs each batch to `/session/ID/message`, which returns
 when the turn completes (`--session ID` reuses a stored session).
 
-Default polling is 3 seconds, with at most 5 events per batch. By default, auto-wake
+Default polling is 3 seconds, with at most 5 events per batch. Hook-steered sessions
+(Codex, Claude Code, Grok) do not poll that hard: `PostToolUse` checks the mailbox at most
+once per `AGENT_MAIL_WAKE_STEER_POLL_MS` (default 2500 ms) so a busy turn does not issue one
+fetch per tool call, and the turn-end `Stop` check is always forced, which bounds the
+mid-turn delivery delay to that window when the session stays busy.
+By default, auto-wake
 runs continuously without a turn limit. If an explicit delivery pause is desired to
 guard against runaway autonomous loops, configure a threshold with `AGENT_MAIL_WAKE_MAX_TURNS`.
 In OMP, user interaction resets any configured delivery counter and automatically resumes
 listeners that paused at the limit. Configure with `AGENT_MAIL_WAKE_INTERVAL_MS` and
 `AGENT_MAIL_WAKE_MAX_TURNS`.
+The managed Codex `SessionStart` hook runs synchronously on purpose: an async hook can only
+inject into the *next* model request, which makes the model answer the first user message
+twice. Agents must not poll `fetch_inbox` to find mail; the listener delivers and wakes.
 Deliveries are injected into a running turn, not deferred until the session goes
 idle: OMP uses `deliverAs: "aside"` (next step boundary), hooked Codex and Claude Code
 sessions steer mid-turn via `PostToolUse` additionalContext (or `Stop` hook block) and

@@ -60,7 +60,6 @@ matcher = "startup|resume|clear"
 [[hooks.SessionStart.hooks]]
 type = "command"
 command = ${JSON.stringify(command)}
-async = true
 timeout = 30
 statusMessage = "Agent Mail auto-wake"
 
@@ -135,6 +134,31 @@ export function mergeClaudeHooks(settings, command) {
     { hooks: [managedHook] },
   ];
   return settings;
+}
+export function grokHookFile(command) {
+  return JSON.stringify({
+    hooks: {
+      SessionStart: [{ hooks: [{ type: 'command', command, timeout: 30 }] }],
+      PostToolUse: [{ hooks: [{ type: 'command', command, timeout: 30 }] }],
+      Stop: [{ hooks: [{ type: 'command', command, timeout: 30 }] }],
+      SessionEnd: [{ hooks: [{ type: 'command', command, timeout: 10 }] }],
+    },
+  }, null, 2) + '\n';
+}
+
+// Grok imports ~/.claude/settings.json hooks by default. Those register a
+// claude-code mailbox, so a native Grok session must not inherit them.
+export function ensureGrokCompat(before) {
+  let text = before || '';
+  if (/^\s*\[\s*compat\s*\.\s*claude\s*\]/m.test(text)) {
+    text = text.replace(/^(\s*\[\s*compat\s*\.\s*claude\s*\][^\n]*\n)([\s\S]*?)(?=^\[|\s*$)/m, (block, header, body) => {
+      if (/^\s*hooks\s*=/m.test(body)) return header + body.replace(/^\s*hooks\s*=.*$/m, 'hooks = false');
+      return header + 'hooks = false\n' + body;
+    });
+  } else {
+    text = `${text.replace(/\s+$/, '')}${text.trim() ? '\n\n' : ''}[compat.claude]\nhooks = false\n`;
+  }
+  return text.endsWith('\n') ? text : `${text}\n`;
 }
 
 export function installationPlan(options = {}) {
@@ -220,9 +244,15 @@ export function installationPlan(options = {}) {
     const dir = !customHome && process.env.GROK_HOME ? process.env.GROK_HOME : path.join(home, '.grok');
     const file = path.join(dir, 'config.toml'), before = contents(file);
     const table = /^\s*\[\s*mcp_servers\s*\.\s*(?:mcp_agent_mail|"mcp_agent_mail"|'mcp_agent_mail')\s*(?:\.|\])/m;
-    const after = before && table.test(before) ? before
+    let after = before && table.test(before) ? before
       : `${before || ''}${before?.endsWith('\n') ? '' : '\n'}\n[mcp_servers.mcp_agent_mail]\nurl = ${JSON.stringify(url)}\n${token ? `\n[mcp_servers.mcp_agent_mail.headers]\nAuthorization = ${JSON.stringify(`Bearer ${token}`)}\n` : ''}`;
+    after = ensureGrokCompat(after);
     changes.push({ file, before, after, mode: 0o600 });
+    const hookCommand = `${process.execPath} ${path.join(prefix, 'claude-channel.mjs')} hook`;
+    const hookFile = path.join(dir, 'hooks', 'agent-mail-wake.json');
+    const hookBefore = contents(hookFile);
+    const hookAfter = grokHookFile(hookCommand);
+    changes.push({ file: hookFile, before: hookBefore, after: hookBefore === hookAfter ? hookBefore : hookAfter, mode: 0o600 });
   }
   if (clients.includes('opencode')) {
     const dir = !customHome && process.env.OPENCODE_CONFIG_DIR ? process.env.OPENCODE_CONFIG_DIR : path.join(home, '.opencode');

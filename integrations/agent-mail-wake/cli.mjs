@@ -34,7 +34,7 @@ function parse(args) {
   const options = { extra: [] };
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--') { options.extra.push(...args.slice(i + 1)); break; }
-    if (['--headless', '--help'].includes(args[i])) options[args[i].slice(2)] = true;
+    if (['--headless', '--help', '--tui'].includes(args[i])) options[args[i].slice(2)] = true;
     else if (['--project', '--session', '--server', '--token-file', '--model'].includes(args[i])) {
       if (!args[i + 1]) throw new Error(`Missing value for ${args[i]}`);
       options[args[i].slice(2)] = args[++i];
@@ -139,6 +139,23 @@ async function claudeMain(options) {
   const proc = child('claude', args, { env, cwd: project, stdio: 'inherit' });
   const [code] = await once(proc, 'exit'); process.exitCode = code || 0;
 }
+export function grokTuiArgs(options) {
+  return [
+    '--fullscreen',
+    ...(options.session ? ['--resume', options.session] : []),
+    ...(options.model ? ['--model', options.model] : []),
+    ...options.extra,
+  ];
+}
+export function grokLaunchMode(options) {
+  if (options.headless && options.tui) throw new Error('Choose either --tui or --headless for grok-mail');
+  return options.headless ? 'headless' : 'tui';
+}
+async function grokTuiMain(options) {
+  const project = projectPath(options.project);
+  const proc = child('grok', grokTuiArgs(options), { cwd: project, stdio: 'inherit' });
+  const [code] = await once(proc, 'exit'); process.exitCode = code || 0;
+}
 async function grokMain(options) {
   const project = projectPath(options.project);
   const sessionKey = options.session || randomUUID();
@@ -192,7 +209,7 @@ async function opencodeMain(options) {
   watcher.start();
 }
 function usage() {
-  console.log(`Agent Mail Wake\n\nagent-mail-wake list\nagent-mail-wake pause|resume <listener-id>\nagent-mail-wake doctor\ncodex-mail [--project DIR] [--session ID] [--headless] [-- native flags]\ncodex-mail attach --session ID [--project DIR]\nclaude-mail [--project DIR] [--session ID] [-- native flags]\nkimi-mail [--project DIR] [--server URL --session ID]\ngrok-mail [--project DIR] [--session ID] [--model ID]\nopencode-mail [--project DIR] [--session ID] [--model provider/model]\n\nOMP: automatically enabled in new interactive sessions; /mail-wake status|pause|resume\nCodex: SessionStart/PostToolUse/Stop hooks attach a mailbox and steer mail into ordinary \`codex\` sessions after the hook is trusted; \`codex-mail\` still owns a managed App Server.\nClaude: SessionStart/PostToolUse/Stop hooks register a mailbox and steer mail into ordinary \`claude\` turns. Start \`claude-mail\` only if you also want the Channel listener.\nGrok Build: managed ACP session (grok agent stdio); approvals run always-approve.`);
+  console.log(`Agent Mail Wake\n\nagent-mail-wake list\nagent-mail-wake pause|resume <listener-id>\nagent-mail-wake doctor\ncodex-mail [--project DIR] [--session ID] [--headless] [-- native flags]\ncodex-mail attach --session ID [--project DIR]\nclaude-mail [--project DIR] [--session ID] [-- native flags]\nkimi-mail [--project DIR] [--server URL --session ID]\ngrok-mail [--project DIR] [--session ID] [--model ID] [-- native Grok flags]\ngrok-mail --headless [--project DIR] [--session ID] [--model ID]\ngrok-mail --tui [--project DIR] [--session ID] [--model ID] [-- native Grok flags]\ngrok-mail tui [--project DIR] [--session ID] [--model ID] [-- native Grok flags]\nopencode-mail [--project DIR] [--session ID] [--model provider/model]\n\nOMP: automatically enabled in new interactive sessions; /mail-wake status|pause|resume\nCodex: SessionStart/PostToolUse/Stop hooks attach a mailbox and steer mail into ordinary \`codex\` sessions after the hook is trusted; \`codex-mail\` still owns a managed App Server.\nClaude: SessionStart/PostToolUse/Stop hooks register a mailbox and steer mail into ordinary \`claude\` turns. Start \`claude-mail\` only if you also want the Channel listener.\nGrok Build: native Grok TUI by default. Use \`grok-mail --headless\` for the managed ACP session, whose persistent listener auto-wakes on incoming mail.`);
 }
 export function refreshListenerTimestamp(file, now = new Date()) {
   const existing = readJson(file, {});
@@ -258,11 +275,16 @@ export async function main(args = process.argv.slice(2)) {
     const proc = child(binary, args, { stdio: 'inherit', cwd: process.cwd() });
     return once(proc, 'exit').then(([code]) => { process.exitCode = code ?? 0; });
   }
+  if (command === 'grok' && args[0] === 'tui') {
+    const options = parse(args.slice(1)); if (options.help) return usage();
+    if (grokLaunchMode(options) === 'headless') throw new Error('grok-mail tui cannot be combined with --headless');
+    return grokTuiMain(options);
+  }
   const options = parse(args); if (options.help) return usage();
   if (command === 'codex') return codexMain(options);
   if (command === 'claude') return claudeMain(options);
   if (command === 'kimi') return kimiMain(options);
-  if (command === 'grok') return grokMain(options);
+  if (command === 'grok') return grokLaunchMode(options) === 'tui' ? grokTuiMain(options) : grokMain(options);
   if (command === 'opencode') return opencodeMain(options);
   throw new Error(`Unknown command: ${command}`);
 }

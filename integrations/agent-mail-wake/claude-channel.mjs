@@ -88,7 +88,39 @@ export function extractRegisteredAgentName(event) {
 
 
 export function sessionId(event) {
-  return event?.session_id || event?.thread_id || event?.id || '';
+  return event?.session_id || event?.sessionId || event?.thread_id || event?.id || '';
+}
+
+const HOOK_EVENTS = {
+  pre_tool_use: 'PreToolUse',
+  post_tool_use: 'PostToolUse',
+  session_start: 'SessionStart',
+  session_end: 'SessionEnd',
+  stop: 'Stop',
+};
+
+// Grok's native stdin is camelCase (`sessionId`, `hookEventName: "stop"`,
+// `toolName`). Claude's is snake_case. Fold both onto the fields the handler
+// already reads, and tag a Grok-dispatched process so its mailbox is not
+// registered as claude-code.
+export function normalizeHookEvent(event) {
+  if (!event || typeof event !== 'object') return {};
+  const name = event.hook_event_name
+    || HOOK_EVENTS[event.hookEventName]
+    || (typeof event.hookEventName === 'string' && /^[A-Z]/.test(event.hookEventName) ? event.hookEventName : '');
+  return {
+    ...event,
+    hook_event_name: name,
+    session_id: event.session_id || event.sessionId || '',
+    cwd: event.cwd || event.workspaceRoot || '',
+    tool_name: event.tool_name || event.toolName || '',
+    tool_response: event.tool_response ?? event.toolResponse ?? event.toolResult,
+  };
+}
+
+export function hookHost(event, env = process.env) {
+  if (env.GROK_HOOK_EVENT || env.GROK_SESSION_ID || event?.hookEventName) return 'grok-build';
+  return 'claude-code';
 }
 
 export async function handleClaudeHook(raw, env = process.env, extras = {}) {
@@ -100,13 +132,15 @@ export async function handleClaudeHook(raw, env = process.env, extras = {}) {
   const dataRoot = env.AGENT_MAIL_WAKE_HOME || DATA_ROOT;
   const stateRoot = env.AGENT_MAIL_WAKE_STATE_DIR || path.join(dataRoot, 'state');
   const client = extras.client || new MailClient(env.AGENT_MAIL_URL, {}, { timeoutMs: 5000 });
+  const normalized = normalizeHookEvent(event);
+  const host = extras.host || hookHost(normalized, env);
   const resolveListener = () => ensureHookListener(id, {
-    host: 'claude-code', cwd: event.cwd, env, client, stateRoot, dataRoot,
-  }).then(listener => listener || findSessionListener(id, { host: 'claude-code', stateRoot, dataRoot })
+    host, cwd: normalized.cwd, env, client, stateRoot, dataRoot,
+  }).then(listener => listener || findSessionListener(id, { host, stateRoot, dataRoot })
     || findSessionListener(id, { stateRoot, dataRoot }));
 
-  if (event.hook_event_name === 'PreToolUse') {
-    const tool = event?.tool_name || '';
+  if (normalized.hook_event_name === 'PreToolUse') {
+    const tool = normalized.tool_name || '';
     if (/(?:^|_)register_agent$|(?:^|_)create_agent_identity$/.test(tool)) {
       try {
         const listener = await resolveListener();
@@ -125,7 +159,7 @@ export async function handleClaudeHook(raw, env = process.env, extras = {}) {
     }
     return { stdout: '{}\n' };
   }
-  if (event.hook_event_name === 'SessionStart') {
+  if (normalized.hook_event_name === 'SessionStart') {
     let identity = 'Incoming peer mail is steered into active turns at tool boundaries; use the listener mailbox identity, not a second mailbox.';
     let assignedAgent = '';
     try {
@@ -139,20 +173,20 @@ export async function handleClaudeHook(raw, env = process.env, extras = {}) {
       stdout: JSON.stringify({
         hookSpecificOutput: {
           hookEventName: 'SessionStart',
-          additionalContext: `Agent Mail auto-wake is enabled for this Claude session. ${identity} You are ALREADY registered in this project. When sending messages, directly set sender_name="${assignedAgent || 'assigned identity'}". Do NOT call register_agent or create_agent_identity.`,
+          additionalContext: `Agent Mail auto-wake is enabled for this ${host === 'grok-build' ? 'Grok' : 'Claude'} session. ${identity} You are ALREADY registered in this project. When sending messages, directly set sender_name="${assignedAgent || 'assigned identity'}". Do NOT call register_agent or create_agent_identity.`,
         },
       }) + '\n',
     };
   }
-  if (event.hook_event_name === 'SessionEnd') {
+  if (normalized.hook_event_name === 'SessionEnd') {
     return { stdout: '{}\n' };
   }
-  if (event.hook_event_name === 'PostToolUse') {
+  if (normalized.hook_event_name === 'PostToolUse') {
     try {
       const listener = await resolveListener();
       if (!listener?.file) return { stdout: '{}\n' };
       stampCodexTurn(listener.file, { active: true });
-      const newAgent = extractRegisteredAgentName(event);
+      const newAgent = extractRegisteredAgentName(normalized);
       if (newAgent && listener.state && listener.state.agent !== newAgent) {
         listener.state.agent = newAgent;
         listener.state.cursor = 0;
@@ -186,12 +220,12 @@ export async function handleClaudeHook(raw, env = process.env, extras = {}) {
       return { stdout: '{}\n' };
     }
   }
-  if (event.hook_event_name === 'Stop' || event.hookEventName === 'stop') {
+  if (normalized.hook_event_name === 'Stop' || normalized.hookEventName === 'stop') {
     try {
       const listener = await resolveListener();
       if (!listener?.file) return { stdout: '{}\n' };
       stampCodexTurn(listener.file, { active: false });
-      const claimed = await claimSteerBatch(listener.file, client, { timeoutMs: 1500 });
+      const claimed = await claimSteerBatch(listener.file, client, { timeoutMs: 1500, force: true });
       if (claimed?.batch?.messages?.length) {
         const prompt = batchPrompt(claimed.state, claimed.batch);
         await commitSteerBatch(listener.file, claimed.batch);
@@ -208,7 +242,7 @@ export async function handleClaudeHook(raw, env = process.env, extras = {}) {
       if (claimed?.batch) await commitSteerBatch(listener.file, claimed.batch);
       return { stdout: '{}\n' };
     } catch {
-      const listener = findSessionListener(id, { host: 'claude-code', stateRoot, dataRoot })
+      const listener = findSessionListener(id, { host, stateRoot, dataRoot })
         || findSessionListener(id, { stateRoot, dataRoot });
       if (listener?.file) stampCodexTurn(listener.file, { active: false });
       return { stdout: '{}\n' };
@@ -230,7 +264,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
   if (process.argv.includes('hook')) {
     process.on('SIGTERM', () => process.exit(0));
     process.on('SIGINT', () => process.exit(0));
-    const result = await handleClaudeHook(await readStdin());
+    const result = await handleClaudeHook(await readStdin(), process.env, { host: hookHost({}, process.env) });
     if (result.exitCode !== undefined && result.exitCode !== 0) {
       if (result.prompt) process.stderr.write(result.prompt + '\n');
       process.exit(result.exitCode);

@@ -109,7 +109,7 @@ export async function handleStop(event, env = process.env, extras = {}) {
       host: 'codex', cwd: event.cwd, env, client, stateRoot, dataRoot,
     }) || findCodexListener(id, { stateRoot, dataRoot });
     if (!listener?.file) return {};
-    const claimed = await claimSteerBatch(listener.file, client, { timeoutMs: 1500 });
+    const claimed = await claimSteerBatch(listener.file, client, { timeoutMs: 1500, force: true });
     if (!claimed?.batch?.messages?.length) {
       if (claimed?.batch) await commitSteerBatch(listener.file, claimed.batch);
       stampCodexTurn(listener.file, { active: false });
