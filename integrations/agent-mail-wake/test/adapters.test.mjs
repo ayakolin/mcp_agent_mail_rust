@@ -4,7 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CodexAdapter, CodexQueueAdapter, sessionHistoryHas, KimiAdapter } from '../rpc.mjs';
-import { isCodexTurnBusy, CODEX_STEER_WINDOW_MS } from '../common.mjs';
+import { isCodexTurnBusy, codexRolloutTurnState, CODEX_STEER_WINDOW_MS, CODEX_ROLLOUT_STALE_MS } from '../common.mjs';
 import { grokLaunchMode, grokTuiArgs } from '../cli.mjs';
 
 test('Grok TUI launcher uses the native UI and forwards session, model, and Grok flags', () => {
@@ -130,6 +130,83 @@ test('isCodexTurnBusy reports busy only while turn is active and lastToolAt is r
   fs.writeFileSync(file, JSON.stringify({ lastToolAt: new Date(now).toISOString() }));
   assert.equal(isCodexTurnBusy(file, now), false);
   assert.equal(isCodexTurnBusy(null, now), false);
+});
+
+// A plain `codex` turn routinely goes >12 s between tool calls (model thinking,
+// subagent waits, long builds). Judging "busy" from tool recency alone made the
+// idle queue listener hand mid-turn mail to `codex queue`, which Codex holds
+// until the turn ends (observed: queued 07:53:48Z, delivered 08:23:21Z).
+// The rollout's own turn markers are the authority.
+const SESSION = '01a1395e-c866-7070-bdfb-ff28eeb23fdd';
+function rolloutFixture(t, events, { mtimeMs } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-rollout-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dayDir = path.join(root, '2026', '10', '14');
+  fs.mkdirSync(dayDir, { recursive: true });
+  const file = path.join(dayDir, `rollout-2026-10-14T15-44-35-${SESSION}.jsonl`);
+  const lines = events.map(e => JSON.stringify(typeof e === 'string' ? { type: 'event_msg', payload: { type: e } } : e));
+  fs.writeFileSync(file, lines.join('\n') + '\n');
+  if (mtimeMs) fs.utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
+  return { root, file };
+}
+function stateFile(t, extra = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-busy-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'state.json');
+  fs.writeFileSync(file, JSON.stringify({ session: SESSION, ...extra }));
+  return file;
+}
+
+test('codexRolloutTurnState reads the last turn marker from the session rollout', t => {
+  const now = Date.now();
+  assert.equal(codexRolloutTurnState(SESSION, { sessionsRoot: rolloutFixture(t, ['task_started']).root, now }), 'active');
+  assert.equal(codexRolloutTurnState(SESSION, { sessionsRoot: rolloutFixture(t, ['task_started', 'task_complete']).root, now }), 'idle');
+  assert.equal(codexRolloutTurnState(SESSION, { sessionsRoot: rolloutFixture(t, ['task_started', 'turn_aborted']).root, now }), 'idle');
+  // A queued/steered follow-up opens a new turn after the previous one completed.
+  assert.equal(codexRolloutTurnState(SESSION, { sessionsRoot: rolloutFixture(t, ['task_started', 'task_complete', 'task_started']).root, now }), 'active');
+  assert.equal(codexRolloutTurnState(SESSION, { sessionsRoot: rolloutFixture(t, ['token_count']).root, now }), null);
+  assert.equal(codexRolloutTurnState('no-such-session', { sessionsRoot: rolloutFixture(t, ['task_started']).root, now }), null);
+  assert.equal(codexRolloutTurnState('', { sessionsRoot: rolloutFixture(t, ['task_started']).root, now }), null);
+});
+
+test('codexRolloutTurnState finds the marker behind a huge trailing event and ignores marker text inside tool output', t => {
+  const now = Date.now();
+  const huge = { type: 'response_item', payload: { type: 'custom_tool_call_output', output: 'x'.repeat(300_000) } };
+  assert.equal(codexRolloutTurnState(SESSION, { sessionsRoot: rolloutFixture(t, ['task_started', huge]).root, now }), 'active');
+  const quoted = { type: 'response_item', payload: { type: 'custom_tool_call_output',
+    output: '{"type":"event_msg","payload":{"type":"task_started"}}' } };
+  assert.equal(codexRolloutTurnState(SESSION, { sessionsRoot: rolloutFixture(t, ['task_started', 'task_complete', quoted]).root, now }), 'idle');
+});
+
+test('codexRolloutTurnState distrusts an open turn whose rollout went silent (crashed session)', t => {
+  const now = Date.now();
+  const { root } = rolloutFixture(t, ['task_started'], { mtimeMs: now - CODEX_ROLLOUT_STALE_MS - 1000 });
+  assert.equal(codexRolloutTurnState(SESSION, { sessionsRoot: root, now }), 'idle');
+});
+
+test('isCodexTurnBusy stays busy across a >12 s tool gap while the rollout turn is open', t => {
+  const now = Date.now();
+  const { root } = rolloutFixture(t, ['task_started']);
+  const file = stateFile(t, { turnActive: true, lastToolAt: new Date(now - CODEX_STEER_WINDOW_MS - 3000).toISOString() });
+  assert.equal(isCodexTurnBusy(file, now, { sessionsRoot: root }), true);
+  // Turn opened but no tool has run yet: hook state is empty, rollout still says active.
+  assert.equal(isCodexTurnBusy(stateFile(t), now, { sessionsRoot: root }), true);
+});
+
+test('isCodexTurnBusy lets the queue deliver once the rollout turn is closed, whatever the hook stamps say', t => {
+  const now = Date.now();
+  const fresh = { turnActive: true, lastToolAt: new Date(now - 1000).toISOString() };
+  assert.equal(isCodexTurnBusy(stateFile(t, fresh), now, { sessionsRoot: rolloutFixture(t, ['task_started', 'task_complete']).root }), false);
+  assert.equal(isCodexTurnBusy(stateFile(t, fresh), now, { sessionsRoot: rolloutFixture(t, ['task_started', 'turn_aborted']).root }), false);
+});
+
+test('isCodexTurnBusy falls back to the tool-recency heuristic when no rollout is readable', t => {
+  const now = Date.now();
+  const { root } = rolloutFixture(t, ['task_started']);
+  const recent = stateFile(t, { session: 'unknown-session', turnActive: true, lastToolAt: new Date(now - 1000).toISOString() });
+  const gap = stateFile(t, { session: 'unknown-session', turnActive: true, lastToolAt: new Date(now - CODEX_STEER_WINDOW_MS - 1000).toISOString() });
+  assert.equal(isCodexTurnBusy(recent, now, { sessionsRoot: root }), true);
+  assert.equal(isCodexTurnBusy(gap, now, { sessionsRoot: root }), false);
 });
 
 test('sessionHistoryHas scans rollout files for the delivery marker', t => {

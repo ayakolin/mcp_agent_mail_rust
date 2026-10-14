@@ -126,10 +126,17 @@ The hook integration now configures `PostToolUse` and `Stop` hooks in `config.to
   call, it claims the batch, commits it, and emits `{"decision": "block", "reason": <prompt>}`,
   forcing the model to continue the conversation with the incoming mail as feedback.
   It also clears `turnActive` so the session becomes unblocked.
-- Active-turn coordination: while `turnActive` is true and `lastToolAt` is within the
-  `CODEX_STEER_WINDOW_MS` (12 seconds), `isTurnBusy` defers background queue / channel delivery
-  so the steer hook can inject mid-turn without racing. A shared `.claim` lock prevents
-  duplicate batch creation and delivery races across processes.
+- Active-turn coordination: for Codex, `isCodexTurnBusy` defers background queue delivery for
+  as long as the session rollout's last turn marker (`task_started` / `task_complete` /
+  `turn_aborted`) says a turn is open, so the steer hook can inject mid-turn without racing.
+  Tool recency cannot be the signal: turns routinely go well over 12 seconds between tool calls,
+  and a queue-listener that judged the turn idle in such a gap handed the mail to `codex queue`,
+  which Codex holds until the turn ends (observed on a live plain `codex` session: queued
+  07:53:48Z, delivered 08:23:21Z, with PostToolUse boundaries in between finding an empty
+  mailbox). An open turn whose rollout has been silent for `CODEX_ROLLOUT_STALE_MS` (10 minutes)
+  is treated as a crashed session. Only when no rollout can be read does it fall back to
+  `turnActive` plus `lastToolAt` within `CODEX_STEER_WINDOW_MS` (12 seconds). A shared `.claim`
+  lock prevents duplicate batch creation and delivery races across processes.
 - When a turn finishes or no mail arrives during execution, the background listener wakes
   the client as soon as it goes idle (`codex queue` for Codex; MCP Channels for Claude Code).
 

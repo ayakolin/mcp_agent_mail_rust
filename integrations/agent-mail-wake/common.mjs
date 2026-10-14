@@ -136,9 +136,73 @@ export function steerPollDue(state, now = Date.now(), windowMs = steerPollWindow
   return !isRecentTimestamp(state?.lastSteerPollAt, windowMs, now);
 }
 
-export function isCodexTurnBusy(file, now = Date.now()) {
+// Codex writes task_started / task_complete / turn_aborted into the session
+// rollout as turns open and close, which is the only signal that does not
+// depend on how often the model happens to call a tool. A turn routinely goes
+// far longer than CODEX_STEER_WINDOW_MS between tool calls (model thinking,
+// subagent waits, builds), and judging "busy" from tool recency alone sent
+// mid-turn mail to `codex queue`, which Codex holds until the turn ends.
+export const CODEX_ROLLOUT_STALE_MS = 10 * 60_000;
+const ROLLOUT_TAIL_START_BYTES = 64 * 1024;
+const ROLLOUT_TAIL_MAX_BYTES = 8 * 1024 * 1024;
+const ROLLOUT_TURN_MARKERS = { task_started: 'active', task_complete: 'idle', turn_aborted: 'idle' };
+const rolloutPaths = new Map();
+
+function codexSessionsRoot() {
+  return path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions');
+}
+function findCodexRollout(session, root) {
+  const key = `${root}\0${session}`;
+  const cached = rolloutPaths.get(key);
+  if (cached && fs.existsSync(cached)) return cached;
+  rolloutPaths.delete(key);
+  const [match] = fs.globSync(`**/rollout-*-${session}.jsonl`, { cwd: root });
+  if (!match) return null;
+  const file = path.join(root, match);
+  rolloutPaths.set(key, file);
+  return file;
+}
+function lastRolloutTurnMarker(file) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const size = fs.fstatSync(fd).size;
+    // Tool output can make single rollout lines huge, so widen the tail until a marker shows up.
+    for (let span = ROLLOUT_TAIL_START_BYTES; ; span *= 4) {
+      const length = Math.min(size, span);
+      const buffer = Buffer.alloc(length);
+      fs.readSync(fd, buffer, 0, length, size - length);
+      const lines = buffer.toString('utf8').split('\n');
+      if (length < size) lines.shift(); // the first line may be cut mid-record
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (!/task_started|task_complete|turn_aborted/.test(lines[i])) continue;
+        try {
+          const event = JSON.parse(lines[i]);
+          const marker = event?.type === 'event_msg' ? ROLLOUT_TURN_MARKERS[event.payload?.type] : undefined;
+          if (marker) return marker;
+        } catch { /* partial or unrelated line */ }
+      }
+      if (length >= size || length >= ROLLOUT_TAIL_MAX_BYTES) return null;
+    }
+  } finally { fs.closeSync(fd); }
+}
+// 'active' | 'idle' | null (rollout missing or unreadable: caller decides).
+export function codexRolloutTurnState(session, { sessionsRoot = codexSessionsRoot(), now = Date.now() } = {}) {
+  if (!session || !/^[\w.-]+$/.test(session)) return null;
+  try {
+    const file = findCodexRollout(session, sessionsRoot);
+    if (!file) return null;
+    const marker = lastRolloutTurnMarker(file);
+    // An open turn keeps appending to its rollout; one that has been silent this
+    // long belongs to a crashed or abandoned session, not a turn still in flight.
+    if (marker === 'active' && now - fs.statSync(file).mtimeMs > CODEX_ROLLOUT_STALE_MS) return 'idle';
+    return marker;
+  } catch { return null; }
+}
+export function isCodexTurnBusy(file, now = Date.now(), { sessionsRoot } = {}) {
   if (!file) return false;
   const state = readJson(file, {});
+  const turn = codexRolloutTurnState(state?.session, { sessionsRoot, now });
+  if (turn) return turn === 'active';
   return Boolean(state?.turnActive && isRecentTimestamp(state?.lastToolAt, CODEX_STEER_WINDOW_MS, now));
 }
 export const isTurnBusy = isCodexTurnBusy;
