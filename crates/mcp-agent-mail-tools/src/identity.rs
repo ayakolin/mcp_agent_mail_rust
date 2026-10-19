@@ -1320,6 +1320,12 @@ pub struct HealthCheckResponse {
     /// disk sample) so diagnostic clients can always bind their database and
     /// archive probes to the mailbox the daemon is actually serving.
     pub storage_root: String,
+    /// Embedded Git commit SHA if built in a git workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_git_sha: Option<String>,
+    /// Embedded build or commit timestamp (ISO-8601).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_timestamp: Option<String>,
     pub semantic_readiness: SemanticReadinessResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_utilization: Option<PoolUtilizationResponse>,
@@ -2026,6 +2032,8 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         http_port: config.http_port,
         database_url: redact_database_url(&config.database_url),
         storage_root: config.storage_root.display().to_string(),
+        build_git_sha: mcp_agent_mail_core::am_version::build_git_sha().map(str::to_string),
+        build_timestamp: mcp_agent_mail_core::am_version::build_timestamp().map(str::to_string),
         semantic_readiness,
         pool_utilization: pool.as_ref().map(|_| PoolUtilizationResponse {
             active: metrics.db.pool_active_connections,
@@ -4151,6 +4159,8 @@ mod tests {
             http_port: 8765,
             database_url: "sqlite:///data/test.db".into(),
             storage_root: "/data".into(),
+            build_git_sha: Some("abc123456789".into()),
+            build_timestamp: Some("2026-10-19T15:30:00Z".into()),
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "aligned".into(),
@@ -4697,6 +4707,8 @@ mod tests {
             http_port: 8765,
             database_url: "sqlite:///:memory:".into(),
             storage_root: "/tmp/agent-mail-test".into(),
+            build_git_sha: None,
+            build_timestamp: None,
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "memory".into(),

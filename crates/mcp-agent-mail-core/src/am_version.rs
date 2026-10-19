@@ -103,6 +103,79 @@ impl std::fmt::Display for AmVersion {
     }
 }
 
+use std::process::Command;
+use std::sync::LazyLock;
+
+/// Embedded Git commit SHA of this build (if specified at compile time).
+pub const BUILD_GIT_SHA: Option<&'static str> = match option_env!("MCP_AGENT_MAIL_GIT_SHA") {
+    Some(s) if !s.is_empty() => Some(s),
+    _ => None,
+};
+
+/// Embedded build or commit timestamp (if specified at compile time).
+pub const BUILD_TIMESTAMP: Option<&'static str> =
+    match option_env!("MCP_AGENT_MAIL_BUILD_TIMESTAMP") {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => None,
+    };
+
+static RUNTIME_GIT_SHA: LazyLock<Option<String>> = LazyLock::new(|| {
+    if let Some(sha) = BUILD_GIT_SHA {
+        return Some(sha.to_string());
+    }
+    Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+});
+
+static RUNTIME_BUILD_TIMESTAMP: LazyLock<Option<String>> = LazyLock::new(|| {
+    if let Some(ts) = BUILD_TIMESTAMP {
+        return Some(ts.to_string());
+    }
+    Command::new("git")
+        .args(["log", "-1", "--format=%cI"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+});
+
+/// Return the embedded or detected Git commit SHA.
+#[must_use]
+pub fn build_git_sha() -> Option<&'static str> {
+    RUNTIME_GIT_SHA.as_deref()
+}
+
+/// Return the embedded or detected build/commit timestamp.
+#[must_use]
+pub fn build_timestamp() -> Option<&'static str> {
+    RUNTIME_BUILD_TIMESTAMP.as_deref()
+}
+
+/// Return a human-readable full version string including package version, short SHA, and timestamp.
+#[must_use]
+pub fn full_version_string() -> String {
+    let pkg = env!("CARGO_PKG_VERSION");
+    let sha = build_git_sha();
+    let ts = build_timestamp();
+    match (sha, ts) {
+        (Some(s), Some(t)) => {
+            let short_sha = if s.len() >= 8 { &s[..8] } else { s };
+            format!("{pkg} ({short_sha} {t})")
+        }
+        (Some(s), None) => {
+            let short_sha = if s.len() >= 8 { &s[..8] } else { s };
+            format!("{pkg} ({short_sha})")
+        }
+        _ => pkg.to_string(),
+    }
+}
+
 /// One catalog entry as loaded from the embedded JSON or a user override.
 /// Schema-identical to [`crate::git_binary::KnownBadEntry`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -473,5 +546,17 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn build_metadata_smoke() {
+        let sha = build_git_sha();
+        assert!(sha.is_some());
+        let sha_str = sha.unwrap();
+        assert_eq!(sha_str.len(), 40);
+        let ts = build_timestamp();
+        assert!(ts.is_some());
+        let full = full_version_string();
+        assert!(full.contains(env!("CARGO_PKG_VERSION")));
     }
 }

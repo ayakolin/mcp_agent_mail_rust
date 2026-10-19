@@ -33309,6 +33309,12 @@ pub(crate) fn runtime_identity_json(
         "version".to_string(),
         serde_json::json!(env!("CARGO_PKG_VERSION")),
     );
+    if let Some(sha) = mcp_agent_mail_core::am_version::build_git_sha() {
+        obj.insert("build_git_sha".to_string(), serde_json::json!(sha));
+    }
+    if let Some(ts) = mcp_agent_mail_core::am_version::build_timestamp() {
+        obj.insert("build_timestamp".to_string(), serde_json::json!(ts));
+    }
     obj.insert("pid".to_string(), serde_json::json!(std::process::id()));
     obj.insert(
         "storage_root".to_string(),

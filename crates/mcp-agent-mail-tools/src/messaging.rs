@@ -1332,19 +1332,15 @@ async fn enforce_cross_project_contacts(
     pool: &mcp_agent_mail_db::DbPool,
     sender: &mcp_agent_mail_db::AgentRow,
     recipients: &HashMap<String, mcp_agent_mail_db::AgentRow>,
+    target_project_key: &str,
+    ttl_seconds: i64,
+    sender_token: Option<&str>,
 ) -> McpResult<()> {
     if recipients
         .values()
         .any(|recipient| recipient.contact_policy.eq_ignore_ascii_case("block_all"))
     {
         return Err(contact_blocked_error());
-    }
-    if !recipients.values().any(|recipient| {
-        recipient
-            .contact_policy
-            .eq_ignore_ascii_case("contacts_only")
-    }) {
-        return Ok(());
     }
     let (outgoing, incoming) = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_contacts(
@@ -1357,10 +1353,6 @@ async fn enforce_cross_project_contacts(
     )?;
     let now = mcp_agent_mail_db::now_micros();
     for recipient in recipients.values() {
-        let policy = recipient.contact_policy.to_ascii_lowercase();
-        if policy != "contacts_only" {
-            continue;
-        }
         let recipient_id = recipient.id.unwrap_or(0);
         let approved = outgoing.iter().any(|link| {
             link.b_project_id == recipient.project_id
@@ -1373,7 +1365,12 @@ async fn enforce_cross_project_contacts(
                 && link.status == "approved"
                 && link.expires_ts.is_none_or(|ts| ts > now)
         });
-        if !approved {
+        if approved {
+            continue;
+        }
+
+        let policy = recipient.contact_policy.to_ascii_lowercase();
+        if policy == "contacts_only" {
             return Err(legacy_tool_error(
                 "CONTACT_REQUIRED",
                 format!(
@@ -1384,8 +1381,157 @@ async fn enforce_cross_project_contacts(
                 json!({"recipient": recipient.name, "to_project_id": recipient.project_id}),
             ));
         }
+
+        // Policy is "auto" or "open": automatically establish approved contact link
+        if let Ok(source_proj) = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_project_by_id(ctx.cx(), pool, sender.project_id).await,
+        ) {
+            match Box::pin(crate::macros::macro_contact_handshake(
+                ctx,
+                source_proj.human_key,
+                Some(sender.name.clone()),
+                Some(recipient.name.clone()),
+                None,
+                None,
+                Some(target_project_key.to_string()),
+                Some("cross-project auto-handshake by send_message".to_string()),
+                Some(true),
+                Some(ttl_seconds),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                sender_token.map(str::to_string),
+            ))
+            .await
+            {
+                Ok(_) => {
+                    tracing::info!(
+                        "Cross-project auto-handshake approved link established: {} -> {} ({})",
+                        sender.name,
+                        recipient.name,
+                        target_project_key
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Cross-project auto-handshake link creation skipped: {e}; proceeding as recipient policy is '{policy}'"
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Resolve a recipient alias against the destination project.
+/// Supports "", "latest", "lead", "@", or "@project" aliases by looking up the most
+/// recently active, non-retired agent in the project.
+async fn resolve_alias_recipient(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    project_slug: &str,
+    name: &str,
+) -> McpResult<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("latest")
+        || trimmed.eq_ignore_ascii_case("lead")
+        || trimmed.eq_ignore_ascii_case("@project")
+        || trimmed == "@"
+    {
+        let active = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_active_agents_bounded(
+                ctx.cx(),
+                pool,
+                project_id,
+                None,
+                Some(1),
+            )
+            .await,
+        )?;
+        if let Some(agent) = active.into_iter().next() {
+            tracing::info!(
+                "Resolved recipient alias '{trimmed}' to latest active agent '{}' in project '{project_slug}'",
+                agent.name
+            );
+            return Ok(agent.name);
+        }
+        return Err(legacy_tool_error(
+            "RECIPIENT_NOT_FOUND",
+            format!(
+                "No active agents found in project '{project_slug}' to resolve alias '{trimmed}'"
+            ),
+            true,
+            json!({
+                "alias": trimmed,
+                "project": project_slug,
+            }),
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// Check if a recipient agent is stale compared to the latest active agent in the project.
+async fn check_stale_recipient(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    project_slug: &str,
+    recipient_row: &mcp_agent_mail_db::AgentRow,
+) -> Option<StaleRecipientWarning> {
+    let active = mcp_agent_mail_db::queries::list_active_agents_bounded(
+        ctx.cx(),
+        pool,
+        project_id,
+        None,
+        Some(1),
+    )
+    .await
+    .into_result()
+    .ok()?;
+
+    let latest = active.into_iter().next()?;
+    if latest.id == recipient_row.id {
+        return None;
+    }
+
+    let recipient_active = recipient_row.last_active_ts;
+    let latest_active = latest.last_active_ts;
+
+    let is_stale = (latest.id.unwrap_or(0) > recipient_row.id.unwrap_or(0)
+        && latest.last_active_ts >= recipient_active)
+        || latest_active.saturating_sub(recipient_active) > 600_000_000;
+
+    if is_stale {
+        let warning = StaleRecipientWarning {
+            recipient: recipient_row.name.clone(),
+            project: project_slug.to_string(),
+            last_active_ts: if recipient_active > 0 {
+                Some(micros_to_iso(recipient_active))
+            } else {
+                None
+            },
+            latest_active_agent: latest.name.clone(),
+            latest_active_ts: if latest_active > 0 {
+                Some(micros_to_iso(latest_active))
+            } else {
+                None
+            },
+            message: format!(
+                "Recipient '{}' may be stale in project '{}'. The latest active agent is '{}'.",
+                recipient_row.name, project_slug, latest.name
+            ),
+        };
+        tracing::warn!("{}", warning.message);
+        Some(warning)
+    } else {
+        None
+    }
 }
 
 #[allow(dead_code, clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1656,11 +1802,28 @@ fn process_message_attachments(
     Ok((final_body, all_attachment_meta, all_attachment_rel_paths))
 }
 
+/// Diagnostic warning when a recipient may be stale in favor of a newer active agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StaleRecipientWarning {
+    pub recipient: String,
+    pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_ts: Option<String>,
+    pub latest_active_agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_active_ts: Option<String>,
+    pub message: String,
+}
+
 /// Message delivery result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryResult {
     pub project: String,
     pub payload: MessagePayload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_project: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals_emitted: Option<Vec<String>>,
 }
 
 /// Send message response
@@ -1675,6 +1838,14 @@ pub struct SendMessageResponse {
     ///
     /// If `sender_token` was provided but mismatched, the call is rejected with an error.
     pub verified_sender: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_project: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_project: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals_emitted: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale_recipient_warnings: Vec<StaleRecipientWarning>,
 }
 
 /// Message payload in responses
@@ -1932,6 +2103,14 @@ pub struct ReplyMessageResponse {
     pub count: usize,
     /// Whether the sender's identity was cryptographically verified via `sender_token`.
     pub verified_sender: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_project: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_project: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals_emitted: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale_recipient_warnings: Vec<StaleRecipientWarning>,
 }
 
 /// Send a message to one or more recipients.
@@ -2244,6 +2423,14 @@ effective_free_bytes={free}"
     if let Some(ref tid) = thread_id {
         validate_explicit_thread_id_for_send(ctx, &pool, project_id, tid).await?;
     }
+    // Resolve any recipient aliases (e.g. "", "latest", "lead", "@") against destination project
+    let mut alias_resolved_to = Vec::with_capacity(to.len());
+    for recipient in to {
+        let resolved =
+            resolve_alias_recipient(ctx, &pool, project_id, &project.slug, &recipient).await?;
+        alias_resolved_to.push(resolved);
+    }
+    let to = alias_resolved_to;
 
     // Self-send detection: warn if sender is sending to themselves (Python parity)
     {
@@ -2269,9 +2456,28 @@ effective_free_bytes={free}"
     }
 
     // Validate recipients
-    let cc_list = cc.unwrap_or_default();
-    let bcc_list = bcc.unwrap_or_default();
+    let raw_cc = cc.unwrap_or_default();
+    let raw_bcc = bcc.unwrap_or_default();
 
+    let mut alias_resolved_cc = Vec::with_capacity(raw_cc.len());
+    for recipient in raw_cc {
+        let name = recipient
+            .split_once('@')
+            .map_or(recipient.as_str(), |(n, _)| n);
+        let resolved = resolve_alias_recipient(ctx, &pool, project_id, &project.slug, name).await?;
+        alias_resolved_cc.push(resolved);
+    }
+    let cc_list = alias_resolved_cc;
+
+    let mut alias_resolved_bcc = Vec::with_capacity(raw_bcc.len());
+    for recipient in raw_bcc {
+        let name = recipient
+            .split_once('@')
+            .map_or(recipient.as_str(), |(n, _)| n);
+        let resolved = resolve_alias_recipient(ctx, &pool, project_id, &project.slug, name).await?;
+        alias_resolved_bcc.push(resolved);
+    }
+    let bcc_list = alias_resolved_bcc;
     if !has_any_recipients(&to, &cc_list, &bcc_list) {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
@@ -2424,6 +2630,14 @@ effective_free_bytes={free}"
             Some(&cross_project_hints),
         ));
     }
+    let mut stale_recipient_warnings = Vec::new();
+    for agent_row in recipient_map.values() {
+        if let Some(warning) =
+            check_stale_recipient(ctx, &pool, project_id, &project.slug, agent_row).await
+        {
+            stale_recipient_warnings.push(warning);
+        }
+    }
 
     let embed_policy =
         mcp_agent_mail_storage::EmbedPolicy::from_str_policy(&sender.attachments_policy);
@@ -2441,8 +2655,20 @@ effective_free_bytes={free}"
         tracing::debug!("Auto contact if blocked: {}", auto_contact);
     }
 
+    let now_micros = mcp_agent_mail_db::now_micros();
+    let ttl_seconds = i64::try_from(config.contact_auto_ttl_seconds).unwrap_or(i64::MAX);
+
     if config.contact_enforcement_enabled && cross_project {
-        enforce_cross_project_contacts(ctx, &pool, &sender, &recipient_map).await?;
+        enforce_cross_project_contacts(
+            ctx,
+            &pool,
+            &sender,
+            &recipient_map,
+            &project.human_key,
+            ttl_seconds,
+            sender_token.as_deref(),
+        )
+        .await?;
     }
     // Same-project contact heuristics must never authorize a different
     // directory merely because names, thread IDs, or file patterns coincide.
@@ -2516,8 +2742,7 @@ effective_free_bytes={free}"
             }
         }
 
-        let now_micros = mcp_agent_mail_db::now_micros();
-        let ttl_seconds = i64::try_from(config.contact_auto_ttl_seconds).unwrap_or(i64::MAX);
+        // Re-use already computed now_micros and ttl_seconds
         let ttl_micros = ttl_seconds.saturating_mul(1_000_000);
         let since_ts = now_micros.saturating_sub(ttl_micros);
 
@@ -2810,6 +3035,7 @@ effective_free_bytes={free}"
     // On an idempotent replay, skip all one-time side effects (search indexing,
     // notification signals, git archive) — the original send already performed
     // them exactly once. This is the at-most-once archive-dispatch guarantee.
+    let mut signals_emitted_list = Vec::new();
     if !idempotent_replay {
         enqueue_message_semantic_index(project_id, message_id, &message.subject, &message.body_md);
         enqueue_message_lexical_index(pool.sqlite_path(), message_id);
@@ -2835,6 +3061,7 @@ effective_free_bytes={free}"
                     Some(&notification_meta),
                 ) {
                     mcp_agent_mail_storage::SignalEmitOutcome::Emitted => {
+                        signals_emitted_list.push(name.clone());
                         if let Some(recipient_id) = recipient_map
                             .get(&name.to_lowercase())
                             .and_then(|agent| agent.id)
@@ -2956,10 +3183,16 @@ effective_free_bytes={free}"
             deliveries: vec![DeliveryResult {
                 project: project.human_key.clone(),
                 payload,
+                cross_project: Some(cross_project),
+                signals_emitted: Some(signals_emitted_list.clone()),
             }],
             count: 1,
             attachments: attachment_paths_out,
             verified_sender,
+            cross_project: Some(cross_project),
+            resolved_project: Some(project.human_key.clone()),
+            signals_emitted: signals_emitted_list,
+            stale_recipient_warnings,
         })
     };
 
@@ -3368,10 +3601,39 @@ effective_free_bytes={free}"
     // Subject and total size limits (including attachments) are already
     // enforced by validate_message_size_limits above.
 
-    // Default to to original sender if not specified
-    let to_names = to.unwrap_or_else(|| vec![original_sender.name.clone()]);
-    let cc_names = cc.unwrap_or_default();
-    let bcc_names = bcc.unwrap_or_default();
+    // Default to original sender if not specified
+    let raw_to_names = to.unwrap_or_else(|| vec![original_sender.name.clone()]);
+    let mut alias_resolved_to = Vec::with_capacity(raw_to_names.len());
+    for recipient in raw_to_names {
+        let name = recipient
+            .split_once('@')
+            .map_or(recipient.as_str(), |(n, _)| n);
+        let resolved = resolve_alias_recipient(ctx, &pool, project_id, &project.slug, name).await?;
+        alias_resolved_to.push(resolved);
+    }
+    let to_names = alias_resolved_to;
+
+    let raw_cc_names = cc.unwrap_or_default();
+    let mut alias_resolved_cc = Vec::with_capacity(raw_cc_names.len());
+    for recipient in raw_cc_names {
+        let name = recipient
+            .split_once('@')
+            .map_or(recipient.as_str(), |(n, _)| n);
+        let resolved = resolve_alias_recipient(ctx, &pool, project_id, &project.slug, name).await?;
+        alias_resolved_cc.push(resolved);
+    }
+    let cc_names = alias_resolved_cc;
+
+    let raw_bcc_names = bcc.unwrap_or_default();
+    let mut alias_resolved_bcc = Vec::with_capacity(raw_bcc_names.len());
+    for recipient in raw_bcc_names {
+        let name = recipient
+            .split_once('@')
+            .map_or(recipient.as_str(), |(n, _)| n);
+        let resolved = resolve_alias_recipient(ctx, &pool, project_id, &project.slug, name).await?;
+        alias_resolved_bcc.push(resolved);
+    }
+    let bcc_names = alias_resolved_bcc;
     if !has_any_recipients(&to_names, &cc_names, &bcc_names) {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
@@ -3525,8 +3787,27 @@ effective_free_bytes={free}"
         ));
     }
 
+    let mut stale_recipient_warnings = Vec::new();
+    for agent_row in recipient_map.values() {
+        if let Some(warning) =
+            check_stale_recipient(ctx, &pool, project_id, &project.slug, agent_row).await
+        {
+            stale_recipient_warnings.push(warning);
+        }
+    }
+
+    let ttl_seconds = i64::try_from(config.contact_auto_ttl_seconds).unwrap_or(604_800);
     if config.contact_enforcement_enabled && cross_project {
-        enforce_cross_project_contacts(ctx, &pool, &sender, &recipient_map).await?;
+        enforce_cross_project_contacts(
+            ctx,
+            &pool,
+            &sender,
+            &recipient_map,
+            &project.human_key,
+            ttl_seconds,
+            sender_token.as_deref(),
+        )
+        .await?;
     }
     if config.contact_enforcement_enabled && !cross_project {
         let mut auto_ok_names: HashSet<String> = HashSet::new();
@@ -3818,6 +4099,7 @@ effective_free_bytes={free}"
     // On an idempotent replay, skip all one-time side effects (search indexing,
     // notification signals, git archive) — the original reply performed them
     // exactly once (at-most-once archive dispatch).
+    let mut signals_emitted_list = Vec::new();
     if !idempotent_replay {
         enqueue_message_semantic_index(project_id, reply_id, &reply.subject, &reply.body_md);
         enqueue_message_lexical_index(pool.sqlite_path(), reply_id);
@@ -3840,6 +4122,7 @@ effective_free_bytes={free}"
                     Some(&notification_meta),
                 ) {
                     mcp_agent_mail_storage::SignalEmitOutcome::Emitted => {
+                        signals_emitted_list.push(name.clone());
                         if let Some(recipient_id) = recipient_map
                             .get(&name.to_lowercase())
                             .and_then(|agent| agent.id)
@@ -3979,9 +4262,15 @@ effective_free_bytes={free}"
             deliveries: vec![DeliveryResult {
                 project: project.human_key.clone(),
                 payload,
+                cross_project: Some(cross_project),
+                signals_emitted: Some(signals_emitted_list.clone()),
             }],
             count: 1,
             verified_sender,
+            cross_project: Some(cross_project),
+            resolved_project: Some(project.human_key.clone()),
+            signals_emitted: signals_emitted_list,
+            stale_recipient_warnings,
         })
     };
 
@@ -5638,6 +5927,132 @@ mod tests {
                     ));
                     mcp_agent_mail_storage::wbq_flush();
                     mcp_agent_mail_storage::flush_async_commits();
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn test_cross_project_alias_routing_auto_handshake_and_diagnostics() {
+        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("test tempdir");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&database_path);
+        let storage_root = temp.path().join("archive");
+        let signals_root = temp.path().join("signals");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root.to_str().unwrap()),
+                ("CONTACT_ENFORCEMENT_ENABLED", "1"),
+                ("NOTIFICATIONS_ENABLED", "1"),
+                ("NOTIFICATIONS_SIGNALS_DIR", signals_root.to_str().unwrap()),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let pool = get_db_pool().expect("pool");
+                    let source = ensure_project_row(&cx, &pool, "/cross-alias/source").await;
+                    let target = ensure_project_row(&cx, &pool, "/cross-alias/target").await;
+                    let source_id = source.id.unwrap();
+                    let target_id = target.id.unwrap();
+
+                    let sender = register_agent_row(&cx, &pool, source_id, "AlphaLead").await;
+                    let _old_agent = register_agent_row(&cx, &pool, target_id, "BetaOld").await;
+                    let new_agent = register_agent_row(&cx, &pool, target_id, "BetaNew").await;
+
+                    // 1. Send using project alias "@<target-slug>"
+                    let target_slug = target.slug.clone();
+                    let alias_recipient = format!("@{target_slug}");
+                    let send_res = send_message(
+                        &ctx,
+                        source.human_key.clone(),
+                        sender.name.clone(),
+                        vec![alias_recipient],
+                        "Alias routing test".into(),
+                        "Hello to the latest agent".into(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(false),
+                        None,
+                        None,
+                        None,
+                        Some(false),
+                        sender.registration_token.clone(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("send with project alias");
+
+                    let json: Value = serde_json::from_str(&send_res).unwrap();
+                    assert_eq!(json["cross_project"], true);
+                    assert_eq!(json["resolved_project"], target.human_key);
+                    assert_eq!(json["deliveries"][0]["payload"]["to"][0], "BetaNew");
+                    assert!(
+                        json["signals_emitted"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|s| s == "BetaNew")
+                    );
+
+                    // Verify auto-handshake established an approved link in agent_links
+                    let (outgoing, _) =
+                        queries::list_contacts(&cx, &pool, source_id, sender.id.unwrap())
+                            .await
+                            .into_result()
+                            .expect("list contacts");
+                    let has_approved_link = outgoing.iter().any(|link| {
+                        link.b_project_id == target_id
+                            && link.b_agent_id == new_agent.id.unwrap()
+                            && link.status == "approved"
+                    });
+                    assert!(
+                        has_approved_link,
+                        "auto-handshake must create approved link in agent_links"
+                    );
+
+                    // 2. Send to BetaOld explicitly to test stale recipient warning
+                    let stale_res = send_message(
+                        &ctx,
+                        source.human_key.clone(),
+                        sender.name.clone(),
+                        vec![format!("BetaOld@{target_slug}")],
+                        "Stale recipient test".into(),
+                        "Hello to BetaOld".into(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(false),
+                        None,
+                        None,
+                        None,
+                        Some(false),
+                        sender.registration_token.clone(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("send to stale recipient");
+
+                    let stale_json: Value = serde_json::from_str(&stale_res).unwrap();
+                    let warnings = stale_json["stale_recipient_warnings"]
+                        .as_array()
+                        .expect("warnings array");
+                    assert!(!warnings.is_empty(), "must carry stale_recipient_warnings");
+                    assert_eq!(warnings[0]["recipient"], "BetaOld");
+                    assert_eq!(warnings[0]["latest_active_agent"], "BetaNew");
                 });
             },
         );
@@ -7326,6 +7741,10 @@ mod tests {
             count: 0,
             attachments: vec![],
             verified_sender: false,
+            cross_project: None,
+            resolved_project: None,
+            signals_emitted: vec![],
+            stale_recipient_warnings: vec![],
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
@@ -7698,6 +8117,10 @@ mod tests {
             deliveries: vec![],
             count: 1,
             verified_sender: false,
+            cross_project: None,
+            resolved_project: None,
+            signals_emitted: vec![],
+            stale_recipient_warnings: vec![],
         };
         let json_str = serde_json::to_string(&original).unwrap();
         let deserialized: ReplyMessageResponse = serde_json::from_str(&json_str).unwrap();
@@ -8571,6 +8994,8 @@ mod tests {
                 cc: vec![],
                 bcc: vec![],
             },
+            cross_project: None,
+            signals_emitted: None,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
