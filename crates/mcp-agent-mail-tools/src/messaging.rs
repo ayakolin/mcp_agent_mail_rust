@@ -407,19 +407,46 @@ fn recipient_not_found_error(
     sender: &mcp_agent_mail_db::AgentRow,
     missing_local: &[String],
     suggestions_map: Option<&HashMap<String, Vec<Value>>>,
+    cross_project_hints: Option<
+        &HashMap<String, Vec<mcp_agent_mail_db::models::AgentProjectMatchRow>>,
+    >,
 ) -> McpError {
     let mut missing_sorted = missing_local.to_vec();
     missing_sorted.sort_unstable();
     missing_sorted.dedup();
 
-    let hint = format!(
-        "Use resource://agents/{project_slug} to list registered agents or register new identities."
-    );
+    let mut cross_project_msg_parts = Vec::new();
+    if let Some(hints) = cross_project_hints {
+        for name in &missing_sorted {
+            if let Some(matches) = hints.get(name)
+                && !matches.is_empty()
+            {
+                let projects = matches
+                    .iter()
+                    .map(|m| format!("'{}' ({})", m.project_slug, m.project_human_key))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                cross_project_msg_parts.push(format!(
+                    "Agent '{name}' was found in other project(s): {projects}. To message them across projects, specify `to_project='<project_slug>'` or use `locate_agent(agent_name='{name}')`."
+                ));
+            }
+        }
+    }
+
+    let hint = if cross_project_msg_parts.is_empty() {
+        format!(
+            "Use resource://agents/{project_slug} to list registered agents, or locate_agent(agent_name='...') to find agents in other projects."
+        )
+    } else {
+        format!(
+            "{}. Use resource://agents/{project_slug} to list local registered agents.",
+            cross_project_msg_parts.join(" ")
+        )
+    };
     let message = format!(
         "Unable to send message — local recipients {} are not registered in project '{project_human_key}'; {hint}",
         missing_sorted.join(", "),
     );
-
     let suggested_tool_calls: Vec<Value> = missing_sorted
         .iter()
         .take(5)
@@ -441,6 +468,31 @@ fn recipient_not_found_error(
         "unknown_local": missing_sorted,
         "hint": hint,
     });
+    if let Some(hints) = cross_project_hints
+        && !hints.is_empty()
+    {
+        let mut found_elsewhere = serde_json::Map::new();
+        for (name, matches) in hints {
+            let list: Vec<Value> = matches
+                .iter()
+                .map(|m| {
+                    json!({
+                        "project_slug": m.project_slug,
+                        "project_key": m.project_human_key,
+                        "program": m.program,
+                        "model": m.model,
+                    })
+                })
+                .collect();
+            found_elsewhere.insert(name.clone(), Value::Array(list));
+        }
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert(
+                "found_in_other_projects".to_string(),
+                Value::Object(found_elsewhere),
+            );
+        }
+    }
     if let Some(obj) = data.as_object_mut() {
         if !suggested_tool_calls.is_empty() {
             obj.insert(
@@ -451,7 +503,6 @@ fn recipient_not_found_error(
         if let Some(map) = suggestions_map
             && !map.is_empty()
         {
-            // Flatten map to JSON object
             let mut sug_json = serde_json::Map::new();
             for (k, v) in map {
                 sug_json.insert(k.clone(), Value::Array(v.clone()));
@@ -586,13 +637,23 @@ async fn resolve_or_register_agent(
             if config.messaging_auto_register_recipients
                 && !config.messaging_fail_closed_send_profile =>
         {
-            // Proof gate (fail-closed): auto-registering an unknown recipient
-            // here cannot carry a signed `registration_proof` bundle, so when
-            // the gate is enabled we refuse instead of minting an unproven
-            // identity (program/model="unknown"). Without this, `send_message`
-            // to a non-existent recipient was a side door around the gate.
-            // Disabled gate = no-op, so default auto-register behavior is
-            // preserved exactly.
+            // If this agent already exists in other project(s), do NOT auto-register
+            // a dummy phantom agent in this project! Doing so hijacks the identity
+            // and silently routes cross-project messages into the void.
+            if let Outcome::Ok(other_matches) = &mcp_agent_mail_db::queries::find_agent_projects(
+                ctx.cx(),
+                pool,
+                &agent_name_norm,
+                1,
+            )
+            .await
+                && !other_matches.is_empty()
+            {
+                return Err(db_error_to_mcp_error(DbError::NotFound {
+                    entity: "Agent",
+                    identifier: agent_name_norm,
+                }));
+            }
             crate::proof_gate::reject_auto_registration_if_enabled(
                 "send_message auto-registration of recipient",
             )?;
@@ -2103,9 +2164,70 @@ effective_free_bytes={free}"
         config.messaging_fail_closed_send_profile,
     )?;
 
+    // Recipient email syntax parsing: e.g. "WildFinch@empw-datacenter"
+    let mut resolved_to = Vec::with_capacity(to.len());
+    let mut parsed_to_project = to_project.clone();
+    for recipient in &to {
+        if let Some((name, proj)) = recipient.split_once('@') {
+            if parsed_to_project.is_none() && !proj.trim().is_empty() {
+                parsed_to_project = Some(proj.trim().to_string());
+            }
+            resolved_to.push(name.trim().to_string());
+        } else {
+            resolved_to.push(recipient.clone());
+        }
+    }
+    let to = resolved_to;
+
+    // Cross-project auto-discovery when to_project is omitted:
+    // If to_project is None, check if all recipients in `to` do not exist in source_project,
+    // but all exist in the same target project!
+    let mut auto_inferred_to_project = None;
+    if parsed_to_project.is_none() && !to.is_empty() {
+        let mut target_project_slugs = HashSet::new();
+        let mut all_missing_locally = true;
+        for recipient in &to {
+            let local_exists = mcp_agent_mail_db::queries::get_agent(
+                ctx.cx(),
+                &pool,
+                source_project_id,
+                recipient,
+            )
+            .await;
+            if matches!(local_exists, Outcome::Ok(_)) {
+                all_missing_locally = false;
+                break;
+            }
+            if let Outcome::Ok(matches) =
+                mcp_agent_mail_db::queries::find_agent_projects(ctx.cx(), &pool, recipient, 5).await
+            {
+                let distinct_projects: HashSet<String> =
+                    matches.into_iter().map(|m| m.project_slug).collect();
+                if distinct_projects.len() == 1 {
+                    target_project_slugs.extend(distinct_projects);
+                } else {
+                    all_missing_locally = false;
+                    break;
+                }
+            } else {
+                all_missing_locally = false;
+                break;
+            }
+        }
+        if all_missing_locally && target_project_slugs.len() == 1 {
+            auto_inferred_to_project = target_project_slugs.into_iter().next();
+            tracing::info!(
+                "Auto-routed message to target project '{:?}' based on recipient cross-project lookup",
+                auto_inferred_to_project
+            );
+        }
+    }
+
+    let effective_to_project = parsed_to_project.or(auto_inferred_to_project);
+
     // Resolve the destination only after verifying the source identity. An
     // explicit destination must already exist: a typo must never mint a mailbox.
-    let project = match to_project.as_deref() {
+    let project = match effective_to_project.as_deref() {
         Some(key) if key.trim().is_empty() => {
             return Err(legacy_tool_error(
                 "INVALID_ARGUMENT",
@@ -2281,6 +2403,17 @@ effective_free_bytes={free}"
                 suggestions_map.insert(name.clone(), sug.clone());
             }
         }
+        let mut cross_project_hints = HashMap::new();
+        for name in &missing_local {
+            if let Ok(matches) =
+                mcp_agent_mail_db::queries::find_agent_projects(ctx.cx(), &pool, name, 5)
+                    .await
+                    .into_result()
+                && !matches.is_empty()
+            {
+                cross_project_hints.insert(name.clone(), matches);
+            }
+        }
 
         return Err(recipient_not_found_error(
             &project.human_key,
@@ -2288,6 +2421,7 @@ effective_free_bytes={free}"
             &sender,
             &missing_local,
             Some(&suggestions_map),
+            Some(&cross_project_hints),
         ));
     }
 
@@ -3369,6 +3503,17 @@ effective_free_bytes={free}"
                 suggestions_map.insert(name.clone(), sug.clone());
             }
         }
+        let mut cross_project_hints = HashMap::new();
+        for name in &missing_local {
+            if let Ok(matches) =
+                mcp_agent_mail_db::queries::find_agent_projects(ctx.cx(), &pool, name, 5)
+                    .await
+                    .into_result()
+                && !matches.is_empty()
+            {
+                cross_project_hints.insert(name.clone(), matches);
+            }
+        }
 
         return Err(recipient_not_found_error(
             &project.human_key,
@@ -3376,6 +3521,7 @@ effective_free_bytes={free}"
             &sender,
             &missing_local,
             Some(&suggestions_map),
+            Some(&cross_project_hints),
         ));
     }
 
@@ -3929,6 +4075,27 @@ pub async fn fetch_inbox(
     phase.set_include_bodies(include_body);
     phase.mark("argument_validation");
 
+    // Parse since_ts if provided (ISO-8601 to micros)
+    let since_micros: Option<i64> = if let Some(ts) = &since_ts {
+        Some(mcp_agent_mail_db::iso_to_micros(ts).ok_or_else(|| {
+            legacy_tool_error(
+                "INVALID_TIMESTAMP",
+                format!(
+                    "Invalid since_ts format: '{ts}'. \
+                     Expected ISO-8601 format like '2025-01-15T10:30:00+00:00' or '2025-01-15T10:30:00Z'. \
+                     Common mistakes: missing timezone (add +00:00 or Z), using slashes instead of dashes, \
+                     or using 12-hour format without AM/PM."
+                ),
+                true,
+                json!({
+                    "provided": ts,
+                    "expected_format": "YYYY-MM-DDTHH:MM:SS+HH:MM",
+                }),
+            )
+        })?)
+    } else {
+        None
+    };
     // Keep healthy reads on the live query-only lane without waiting for
     // archive reconstruction or the coalescer. If that pool cannot open,
     // reuse the verified archive fallback so retained mail stays readable.
@@ -3952,6 +4119,54 @@ pub async fn fetch_inbox(
             crate::tool_util::get_read_db_pool(ctx.cx()).await?
         }
     };
+    let is_all_projects =
+        project_key.trim() == "*" || project_key.trim().eq_ignore_ascii_case("all");
+    if is_all_projects {
+        let global_rows = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::fetch_inbox_global(
+                ctx.cx(),
+                &read_pool,
+                &agent_name,
+                urgent,
+                since_micros,
+                msg_limit,
+            )
+            .await,
+        )?;
+        let messages: Vec<serde_json::Value> = global_rows
+            .into_iter()
+            .map(|row| {
+                let attachments = parse_attachment_metadata_json(&row.message.attachments);
+                let recipients = parse_recipients_lists(&row.message.recipients_json);
+                json!({
+                    "id": row.message.id.unwrap_or(0),
+                    "project_id": row.message.project_id,
+                    "project_slug": row.project_slug,
+                    "sender_id": row.message.sender_id,
+                    "thread_id": row.message.thread_id,
+                    "topic": row.message.topic,
+                    "subject": row.message.subject,
+                    "importance": row.message.importance,
+                    "ack_required": row.message.ack_required != 0,
+                    "from": row.sender_name,
+                    "to": recipients.to,
+                    "cc": recipients.cc,
+                    "bcc": Vec::<String>::new(),
+                    "created_ts": micros_to_iso(row.message.created_ts),
+                    "ack_ts": row.ack_ts.map(micros_to_iso),
+                    "kind": row.kind,
+                    "attachments": attachments,
+                    "body_md": if include_body {
+                        Some(row.message.body_md)
+                    } else {
+                        None
+                    },
+                })
+            })
+            .collect();
+        return serde_json::to_string(&messages)
+            .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
+    }
     let project = resolve_existing_project(ctx, &read_pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -3966,28 +4181,6 @@ pub async fn fetch_inbox(
     .await?;
     let agent_id = agent.id.unwrap_or(0);
     phase.mark("scope_resolution");
-
-    // Parse since_ts if provided (ISO-8601 to micros)
-    let since_micros: Option<i64> = if let Some(ts) = &since_ts {
-        Some(mcp_agent_mail_db::iso_to_micros(ts).ok_or_else(|| {
-            legacy_tool_error(
-                "INVALID_TIMESTAMP",
-                format!(
-                    "Invalid since_ts format: '{ts}'. \
-                     Expected ISO-8601 format like '2025-01-15T10:30:00+00:00' or '2025-01-15T10:30:00Z'. \
-                     Common mistakes: missing timezone (add +00:00 or Z), using slashes instead of dashes, \
-                     or using 12-hour format without AM/PM."
-                ),
-                true,
-                json!({
-                    "provided": ts,
-                    "expected_format": "YYYY-MM-DDTHH:MM:SS+HH:MM",
-                }),
-            )
-        })?)
-    } else {
-        None
-    };
 
     let ack_overdue_before =
         ack_overdue.then(|| mcp_agent_mail_db::now_micros() - FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US);
@@ -6309,11 +6502,12 @@ mod tests {
             &sender,
             &["Zulu".to_string(), "Alpha".to_string(), "Zulu".to_string()],
             None,
+            None,
         );
 
-        assert_eq!(
-            err.message,
-            "Unable to send message — local recipients Alpha, Zulu are not registered in project '/tmp/proj'; Use resource://agents/proj-slug to list registered agents or register new identities."
+        assert!(
+            err.message
+                .contains("local recipients Alpha, Zulu are not registered in project '/tmp/proj'")
         );
 
         let data = err

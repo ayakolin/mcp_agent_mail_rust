@@ -6379,16 +6379,34 @@ pub async fn find_agent_projects(
     };
     let tracked = tracked(&*conn);
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let sql = "SELECT p.id, p.slug, p.human_key, a.id, a.name, a.program, a.model, \
-               a.task_description, a.inception_ts, a.last_active_ts, a.retired_at, \
-               (SELECT d.deregistered_at FROM agent_deregistrations d \
-                WHERE d.agent_id = a.id LIMIT 1) AS deregistered_at \
-               FROM agents AS a \
-               JOIN projects AS p ON p.id = a.project_id \
-               WHERE a.name = ? COLLATE NOCASE \
-               ORDER BY a.last_active_ts DESC, a.id DESC \
-               LIMIT ?";
-    let params = [Value::Text(agent_name.to_string()), Value::BigInt(limit)];
+    let trimmed = agent_name.trim();
+    let is_wildcard = trimmed == "*" || trimmed.eq_ignore_ascii_case("all");
+    let (sql, params) = if is_wildcard {
+        (
+            "SELECT p.id, p.slug, p.human_key, a.id, a.name, a.program, a.model, \
+             a.task_description, a.inception_ts, a.last_active_ts, a.retired_at, \
+             (SELECT d.deregistered_at FROM agent_deregistrations d \
+              WHERE d.agent_id = a.id LIMIT 1) AS deregistered_at \
+             FROM agents AS a \
+             JOIN projects AS p ON p.id = a.project_id \
+             ORDER BY a.last_active_ts DESC, a.id DESC \
+             LIMIT ?",
+            vec![Value::BigInt(limit)],
+        )
+    } else {
+        (
+            "SELECT p.id, p.slug, p.human_key, a.id, a.name, a.program, a.model, \
+             a.task_description, a.inception_ts, a.last_active_ts, a.retired_at, \
+             (SELECT d.deregistered_at FROM agent_deregistrations d \
+              WHERE d.agent_id = a.id LIMIT 1) AS deregistered_at \
+             FROM agents AS a \
+             JOIN projects AS p ON p.id = a.project_id \
+             WHERE a.name = ? COLLATE NOCASE \
+             ORDER BY a.last_active_ts DESC, a.id DESC \
+             LIMIT ?",
+            vec![Value::Text(agent_name.to_string()), Value::BigInt(limit)],
+        )
+    };
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
         Outcome::Ok(rows) => {

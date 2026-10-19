@@ -3089,6 +3089,9 @@ pub enum RobotSubcommand {
         /// Show only active agents.
         #[arg(long)]
         active: bool,
+        /// Show agents across all projects.
+        #[arg(long)]
+        all: bool,
         /// Include health summary for all agents, or drill into one named agent.
         #[arg(long, num_args = 0..=1, default_missing_value = "__all__", value_name = "AGENT")]
         health: Option<String>,
@@ -16097,65 +16100,124 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         }
         RobotSubcommand::Agents {
             active,
+            all,
             health,
             threshold,
             sort,
         } => {
-            let scope = resolve_robot_scope(args.project.as_deref(), None)?;
-            let mut sort = parse_agent_sort_field(sort.as_deref())?;
-            let threshold = parse_agent_health_threshold(threshold.as_deref())?;
-            if (health.is_some() || threshold.is_some()) && sort.is_none() {
-                sort = Some("health".to_string());
-            }
-            let agents = build_agents_with_snapshot_cache(
-                scope.conn(),
-                scope.project_id,
-                active,
-                sort.as_deref(),
-                health.as_deref(),
-                threshold,
-            )?;
-            let project_human_key = project_human_key_sync(scope.conn(), scope.project_id)?
-                .unwrap_or_else(|| scope.project_slug.clone());
-            let diagnostics = build_agent_lifecycle_diagnostics(
-                scope.conn(),
-                scope.project_id,
-                &scope.project_slug,
-                &project_human_key,
-                &mcp_agent_mail_core::Config::get().storage_root,
-            )?;
-
-            #[derive(Serialize)]
-            struct AgentsData {
-                count: usize,
-                agents: Vec<AgentRow>,
-                #[serde(skip_serializing_if = "Vec::is_empty")]
-                diagnostics: Vec<AgentLifecycleDiagnostic>,
-            }
-
-            let count = agents.len();
-            let mut env = RobotEnvelope::new(
-                cmd_name,
-                format,
-                AgentsData {
-                    count,
-                    agents,
-                    diagnostics: diagnostics.clone(),
-                },
-            );
-            env._meta.project = Some(scope.project_slug);
-            let mut actions = HashSet::new();
-            for diagnostic in diagnostics {
-                env = env.with_alert(
-                    &diagnostic.severity,
-                    format!("{}: {}", diagnostic.reason_code, diagnostic.summary),
-                    Some(diagnostic.safe_command.clone()),
-                );
-                if actions.insert(diagnostic.safe_command.clone()) {
-                    env = env.with_action(diagnostic.safe_command);
+            if all {
+                let conn = crate::open_db_sync_robot()?;
+                let sql = "SELECT p.slug, a.name, a.program, a.model, a.last_active_ts, a.retired_at, \
+                           (SELECT d.deregistered_at FROM agent_deregistrations d WHERE d.agent_id = a.id LIMIT 1) AS deregistered_at \
+                           FROM agents a \
+                           JOIN projects p ON p.id = a.project_id \
+                           ORDER BY a.last_active_ts DESC, a.id DESC \
+                           LIMIT 250";
+                let rows = conn
+                    .query_sync(sql, &[])
+                    .map_err(|e| CliError::Other(format!("all agents query failed: {e}")))?;
+                let now = mcp_agent_mail_core::timestamps::now_micros();
+                let mut agents: Vec<AgentRow> = Vec::new();
+                for row in &rows {
+                    let name: String = row.get_named("name").unwrap_or_default();
+                    let program: String = row.get_named("program").unwrap_or_default();
+                    let model: String = row.get_named("model").unwrap_or_default();
+                    let last_active_ts: i64 = row.get_named("last_active_ts").unwrap_or_default();
+                    let retired_at: Option<i64> = row.get_named("retired_at").ok().flatten();
+                    let deregistered_at: Option<i64> =
+                        row.get_named("deregistered_at").ok().flatten();
+                    let is_active = retired_at.is_none()
+                        && deregistered_at.is_none()
+                        && (now.saturating_sub(last_active_ts) < 7 * 86_400 * 1_000_000);
+                    if active && !is_active {
+                        continue;
+                    }
+                    let status = if deregistered_at.is_some() {
+                        "deregistered".to_string()
+                    } else if retired_at.is_some() {
+                        "retired".to_string()
+                    } else if is_active {
+                        "active".to_string()
+                    } else {
+                        "inactive".to_string()
+                    };
+                    let last_active = format_age(now.saturating_sub(last_active_ts) / 1_000_000);
+                    let project_slug: String = row.get_named("slug").unwrap_or_default();
+                    agents.push(AgentRow {
+                        name: format!("{name} ({project_slug})"),
+                        program,
+                        model,
+                        last_active,
+                        msg_count: 0,
+                        status,
+                        health: None,
+                    });
                 }
+                #[derive(Serialize)]
+                struct AgentsData {
+                    count: usize,
+                    agents: Vec<AgentRow>,
+                }
+                let count = agents.len();
+                let env = RobotEnvelope::new(cmd_name, format, AgentsData { count, agents });
+                format_output(&env, format)?
+            } else {
+                let scope = resolve_robot_scope(args.project.as_deref(), None)?;
+                let mut sort = parse_agent_sort_field(sort.as_deref())?;
+                let threshold = parse_agent_health_threshold(threshold.as_deref())?;
+                if (health.is_some() || threshold.is_some()) && sort.is_none() {
+                    sort = Some("health".to_string());
+                }
+                let agents = build_agents_with_snapshot_cache(
+                    scope.conn(),
+                    scope.project_id,
+                    active,
+                    sort.as_deref(),
+                    health.as_deref(),
+                    threshold,
+                )?;
+                let project_human_key = project_human_key_sync(scope.conn(), scope.project_id)?
+                    .unwrap_or_else(|| scope.project_slug.clone());
+                let diagnostics = build_agent_lifecycle_diagnostics(
+                    scope.conn(),
+                    scope.project_id,
+                    &scope.project_slug,
+                    &project_human_key,
+                    &mcp_agent_mail_core::Config::get().storage_root,
+                )?;
+
+                #[derive(Serialize)]
+                struct AgentsData {
+                    count: usize,
+                    agents: Vec<AgentRow>,
+                    #[serde(skip_serializing_if = "Vec::is_empty")]
+                    diagnostics: Vec<AgentLifecycleDiagnostic>,
+                }
+
+                let count = agents.len();
+                let mut env = RobotEnvelope::new(
+                    cmd_name,
+                    format,
+                    AgentsData {
+                        count,
+                        agents,
+                        diagnostics: diagnostics.clone(),
+                    },
+                );
+                env._meta.project = Some(scope.project_slug);
+                let mut actions = HashSet::new();
+                for diagnostic in diagnostics {
+                    env = env.with_alert(
+                        &diagnostic.severity,
+                        format!("{}: {}", diagnostic.reason_code, diagnostic.summary),
+                        Some(diagnostic.safe_command.clone()),
+                    );
+                    if actions.insert(diagnostic.safe_command.clone()) {
+                        env = env.with_action(diagnostic.safe_command);
+                    }
+                }
+                format_output(&env, format)?
             }
-            format_output(&env, format)?
         }
         RobotSubcommand::Contacts => {
             let scope = resolve_robot_project_scope(args.project.as_deref())?;

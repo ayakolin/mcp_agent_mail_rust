@@ -3106,7 +3106,7 @@ pub enum AgentsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// List agents registered in a project.
+    /// List agents registered in a project, or across all projects (--all).
     List {
         /// Project key (slug or human_key / absolute path). Positional
         /// alternative to -p/--project; defaults to the current directory
@@ -3116,6 +3116,24 @@ pub enum AgentsCommand {
         /// Project key (slug or human_key / absolute path).
         #[arg(long = "project", short = 'p')]
         project_key: Option<String>,
+        /// List agents across all projects.
+        #[arg(long = "all", short = 'a', default_value_t = false)]
+        all: bool,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Locate an agent across projects by name, or list all agents across projects (* / all).
+    Locate {
+        /// Agent name to look up (or * / all to list across all projects).
+        #[arg(value_name = "AGENT_NAME")]
+        agent: String,
+        /// Maximum number of results to return (default: 50).
+        #[arg(long, short = 'l')]
+        limit: Option<u32>,
         /// Output format: table, json, or toon (default: auto-detect).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -39007,10 +39025,20 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
         AgentsCommand::List {
             positional_project,
             project_key,
+            all,
             format,
             json,
         } => {
-            let project_key = resolve_agents_project_key(project_key, positional_project)?;
+            let is_all = all
+                || positional_project.as_deref() == Some("*")
+                || positional_project.as_deref() == Some("all")
+                || project_key.as_deref() == Some("*")
+                || project_key.as_deref() == Some("all");
+            let project_key = if is_all {
+                "*".to_string()
+            } else {
+                resolve_agents_project_key(project_key, positional_project)?
+            };
             let fmt = output::CliOutputFormat::resolve(format, json);
             match try_call_server_tool(
                 &server_url,
@@ -39043,6 +39071,29 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
 
             let ctx = context::AsyncCliContext::open()?;
             let cx = asupersync::Cx::for_request();
+            if is_all {
+                let matches = outcome_to_result(
+                    mcp_agent_mail_db::queries::find_agent_projects(&cx, &ctx.pool, "*", 250).await,
+                )?;
+                let data: Vec<serde_json::Value> = matches
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "name": m.name,
+                            "program": m.program,
+                            "model": m.model,
+                            "task_description": m.task_description,
+                            "inception_ts": mcp_agent_mail_core::timestamps::micros_to_iso(m.inception_ts),
+                            "last_active_ts": mcp_agent_mail_core::timestamps::micros_to_iso(m.last_active_ts),
+                            "project_slug": m.project_slug,
+                            "project_key": m.project_human_key,
+                        })
+                    })
+                    .collect();
+                render_agent_list_payload(&serde_json::Value::Array(data), fmt);
+                return Ok(());
+            }
+
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
             let agents = match mcp_agent_mail_db::queries::list_active_agents_bounded(
@@ -39067,6 +39118,77 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             };
 
             let data: Vec<serde_json::Value> = agents.iter().map(agent_row_to_json).collect();
+            render_agent_list_payload(&serde_json::Value::Array(data), fmt);
+            Ok(())
+        }
+
+        AgentsCommand::Locate {
+            agent,
+            limit,
+            format,
+            json,
+        } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
+            let mut args = serde_json::json!({ "agent_name": agent });
+            if let Some(l) = limit {
+                args["limit"] = serde_json::json!(l);
+            }
+            match try_call_server_tool(&server_url, bearer.as_deref(), "locate_agent", args).await {
+                ServerToolCall::Success(result) => {
+                    let payload = coerce_tool_result_json_or_error("locate_agent", result)?;
+                    render_agent_list_payload(&payload, fmt);
+                    return Ok(());
+                }
+                ServerToolCall::Unavailable(message) => {
+                    reject_local_fallback_if_mailbox_owned(
+                        "agents locate",
+                        &server_url,
+                        &message,
+                        &database_url,
+                        server_config.storage_root.as_path(),
+                    )?;
+                }
+                ServerToolCall::Rejected(message) => {
+                    return Err(CliError::Other(format!(
+                        "locate_agent via server failed: {message}"
+                    )));
+                }
+            }
+
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
+            let effective_limit = limit.unwrap_or(50) as usize;
+            let matches = outcome_to_result(
+                mcp_agent_mail_db::queries::find_agent_projects(
+                    &cx,
+                    &ctx.pool,
+                    &agent,
+                    effective_limit,
+                )
+                .await,
+            )?;
+            let data: Vec<serde_json::Value> = matches
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "name": m.name,
+                        "program": m.program,
+                        "model": m.model,
+                        "task_description": m.task_description,
+                        "inception_ts": mcp_agent_mail_core::timestamps::micros_to_iso(m.inception_ts),
+                        "last_active_ts": mcp_agent_mail_core::timestamps::micros_to_iso(m.last_active_ts),
+                        "project_slug": m.project_slug,
+                        "project_key": m.project_human_key,
+                        "status": if m.deregistered_at.is_some() {
+                            "deregistered"
+                        } else if m.retired_at.is_some() {
+                            "retired"
+                        } else {
+                            "active"
+                        },
+                    })
+                })
+                .collect();
             render_agent_list_payload(&serde_json::Value::Array(data), fmt);
             Ok(())
         }
@@ -39605,17 +39727,44 @@ fn render_agent_list_payload(payload: &serde_json::Value, format: output::CliOut
         return;
     }
 
+    let has_project = agents.iter().any(|a| a.get("project_slug").is_some());
     output::emit_output(&agents, format, || {
-        let mut table =
-            output::CliTable::new(vec!["NAME", "PROGRAM", "MODEL", "TASK", "LAST_ACTIVE"]);
+        let headers = if has_project {
+            vec![
+                "PROJECT",
+                "NAME",
+                "PROGRAM",
+                "MODEL",
+                "STATUS",
+                "LAST_ACTIVE",
+            ]
+        } else {
+            vec!["NAME", "PROGRAM", "MODEL", "TASK", "LAST_ACTIVE"]
+        };
+        let mut table = output::CliTable::new(headers);
         for agent in &agents {
-            table.add_row(vec![
-                agent_payload_string(agent, "name"),
-                agent_payload_string(agent, "program"),
-                agent_payload_string(agent, "model"),
-                truncate_str(&agent_payload_string(agent, "task_description"), 40),
-                agent_payload_string(agent, "last_active_ts"),
-            ]);
+            if has_project {
+                table.add_row(vec![
+                    agent_payload_string(agent, "project_slug"),
+                    agent_payload_string(agent, "name"),
+                    agent_payload_string(agent, "program"),
+                    agent_payload_string(agent, "model"),
+                    if agent.get("status").is_some() {
+                        agent_payload_string(agent, "status")
+                    } else {
+                        "active".to_string()
+                    },
+                    agent_payload_string(agent, "last_active_ts"),
+                ]);
+            } else {
+                table.add_row(vec![
+                    agent_payload_string(agent, "name"),
+                    agent_payload_string(agent, "program"),
+                    agent_payload_string(agent, "model"),
+                    truncate_str(&agent_payload_string(agent, "task_description"), 40),
+                    agent_payload_string(agent, "last_active_ts"),
+                ]);
+            }
         }
         table.render();
     });
@@ -67179,12 +67328,14 @@ startup_timeout_sec = 42
                     AgentsCommand::List {
                         positional_project,
                         project_key,
+                        all,
                         format,
                         json,
                     },
             } => {
                 assert_eq!(project_key.as_deref(), Some("my-proj"));
                 assert_eq!(positional_project, None);
+                assert!(!all);
                 assert_eq!(format, Some(output::CliOutputFormat::Toon));
                 assert!(!json);
             }

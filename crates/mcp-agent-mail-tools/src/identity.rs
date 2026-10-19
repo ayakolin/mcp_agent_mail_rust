@@ -3445,9 +3445,50 @@ pub async fn list_agents(
     active_within_days: Option<u32>,
 ) -> McpResult<String> {
     let pool = get_coalescer_bypass_read_db_pool()?;
+    let is_all = project_key.trim() == "*" || project_key.trim().eq_ignore_ascii_case("all");
+    if is_all {
+        let effective_limit = limit
+            .map_or(LIST_AGENTS_DEFAULT_MAX, |n| {
+                usize::try_from(n).unwrap_or(LIST_AGENTS_DEFAULT_MAX)
+            })
+            .clamp(1, LIST_AGENTS_DEFAULT_MAX);
+
+        let min_last_active_ts = active_within_days.and_then(|days| {
+            let now = mcp_agent_mail_core::timestamps::now_micros();
+            let window_us = i64::from(days)
+                .checked_mul(86_400)?
+                .checked_mul(1_000_000)?;
+            Some(now.saturating_sub(window_us))
+        });
+
+        let matches = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::find_agent_projects(ctx.cx(), &pool, "*", effective_limit)
+                .await,
+        )?;
+
+        let entries: Vec<serde_json::Value> = matches
+            .into_iter()
+            .filter(|m| min_last_active_ts.is_none_or(|floor| m.last_active_ts >= floor))
+            .map(|m| {
+                json!({
+                    "name": m.name,
+                    "program": m.program,
+                    "model": m.model,
+                    "task_description": m.task_description,
+                    "inception_ts": micros_to_iso(m.inception_ts),
+                    "last_active_ts": micros_to_iso(m.last_active_ts),
+                    "project_slug": m.project_slug,
+                    "project_key": m.project_human_key,
+                })
+            })
+            .collect();
+
+        return serde_json::to_string(&entries)
+            .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")));
+    }
+
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
-
     // Bound the response. A caller-supplied limit is honored but clamped to the
     // safety cap; an omitted limit defaults to the cap.
     let effective_limit = limit
@@ -3521,12 +3562,18 @@ pub async fn locate_agent(
     agent_name: String,
     limit: Option<u32>,
 ) -> McpResult<String> {
-    let agent_name =
-        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
-    if agent_name.trim().is_empty() {
+    let trimmed = agent_name.trim();
+    let is_wildcard = trimmed == "*" || trimmed.eq_ignore_ascii_case("all");
+    let agent_name = if is_wildcard {
+        trimmed.to_string()
+    } else {
+        mcp_agent_mail_core::models::normalize_agent_name(trimmed)
+            .unwrap_or_else(|| trimmed.to_string())
+    };
+    if !is_wildcard && agent_name.trim().is_empty() {
         return Err(legacy_tool_error(
             "MISSING_AGENT_NAME",
-            "agent_name must be a non-empty agent name (adjective+noun format).",
+            "agent_name must be a non-empty agent name (adjective+noun format), or '*' / 'all' to list across all projects.",
             false,
             json!({}),
         ));
@@ -5449,6 +5496,24 @@ body
 
                     // A blank name is a usage error, not a full-table scan.
                     assert!(locate_agent(&ctx, "   ".to_string(), None).await.is_err());
+
+                    // Wildcard * or 'all' lists all agents across projects.
+                    let all_raw = locate_agent(&ctx, "*".to_string(), None)
+                        .await
+                        .expect("locate_agent wildcard");
+                    let all_entries: Vec<serde_json::Value> =
+                        serde_json::from_str(&all_raw).expect("parse locate_agent wildcard");
+                    assert_eq!(all_entries.len(), 2);
+
+                    // list_agents with '*' lists all active agents across projects.
+                    let list_all_raw = list_agents(&ctx, "*".to_string(), None, None)
+                        .await
+                        .expect("list_agents wildcard");
+                    let list_all_entries: Vec<serde_json::Value> =
+                        serde_json::from_str(&list_all_raw).expect("parse list_agents wildcard");
+                    assert_eq!(list_all_entries.len(), 2);
+                    assert!(list_all_entries[0]["project_slug"].as_str().is_some());
+                    assert!(list_all_entries[0]["project_key"].as_str().is_some());
                 });
             },
         );
